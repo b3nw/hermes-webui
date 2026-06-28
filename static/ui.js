@@ -12030,10 +12030,11 @@ function renderMessages(options){
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
-    const isEditableUser=isUser;
+    const isReadOnly = !!(S.session && S.session.read_only);
+    const isEditableUser = isUser && !isReadOnly;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
-    const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
-    const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
+    const undoBtn  = (isLastAssistant && !isReadOnly) ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
+    const retryBtn = (isLastAssistant && !isReadOnly) ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
     const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
@@ -14113,13 +14114,15 @@ function autoResizeTextarea(ta) {
 
 async function submitEdit(msgIdx, newText) {
   if(!S.session || S.busy) return;
+  if(S.session.read_only) return;
   const initialSid = S.session.session_id;
   const absoluteKeepCount = _oldestIdx + msgIdx;
-  if(typeof _ensureAllMessagesLoaded==='function'){
-    await _ensureAllMessagesLoaded();
-  }
-  if(!S.session || S.session.session_id !== initialSid) return;
+  setBusy(true);
   try {
+    if(typeof _ensureAllMessagesLoaded==='function'){
+      await _ensureAllMessagesLoaded();
+    }
+    if(!S.session || S.session.session_id !== initialSid) { setBusy(false); return; }
     await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
       session_id: initialSid,
       keep_count: absoluteKeepCount
@@ -14128,27 +14131,29 @@ async function submitEdit(msgIdx, newText) {
     renderMessages();
     $('msg').value = newText;
     await send();
-  } catch(e) { setStatus(t('edit_failed') + e.message); }
+  } catch(e) { setStatus(t('edit_failed') + e.message); setBusy(false); }
 }
 
 async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
+  if(S.session.read_only) return;
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const assistantIdx = parseInt(row.dataset.msgIdx, 10);
   const absoluteKeepCount = _oldestIdx + assistantIdx;
   const initialSid = S.session.session_id;
-  let lastUserText = '';
-  for(let i = assistantIdx - 1; i >= 0; i--) {
-    const m = S.messages[i];
-    if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
-  }
-  if(!lastUserText) return;
-  if(typeof _ensureAllMessagesLoaded==='function'){
-    await _ensureAllMessagesLoaded();
-  }
-  if(!S.session || S.session.session_id !== initialSid) return;
+  setBusy(true);
   try {
+    if(typeof _ensureAllMessagesLoaded==='function'){
+      await _ensureAllMessagesLoaded();
+    }
+    if(!S.session || S.session.session_id !== initialSid) { setBusy(false); return; }
+    let lastUserText = '';
+    for(let i = absoluteKeepCount - 1; i >= 0; i--) {
+      const m = S.messages[i];
+      if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
+    }
+    if(!lastUserText) { setBusy(false); return; }
     await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
       session_id: initialSid,
       keep_count: absoluteKeepCount
@@ -14157,7 +14162,7 @@ async function regenerateResponse(btn) {
     renderMessages();
     $('msg').value = lastUserText;
     await send();
-  } catch(e) { setStatus(t('regen_failed') + e.message); }
+  } catch(e) { setStatus(t('regen_failed') + e.message); setBusy(false); }
 }
 
 function postProcessRenderedMessages(container) {

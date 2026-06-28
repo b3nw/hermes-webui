@@ -12252,6 +12252,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        if getattr(s, "read_only", False):
+            return bad(handler, "Session is read-only", 403)
         # Validate keep_count before it reaches the destructive `messages[:keep]`
         # slice. A non-numeric value would raise ValueError and surface as a
         # confusing 500; a NEGATIVE value slices as `messages[:-N]`, which

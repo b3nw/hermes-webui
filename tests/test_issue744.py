@@ -7,7 +7,7 @@ UI = pathlib.Path("static/ui.js").read_text(encoding="utf-8")
 
 
 def test_any_user_message_gets_edit_button():
-    assert "const isEditableUser=isUser;" in UI
+    assert "const isEditableUser = isUser && !isReadOnly" in UI
     assert "const isEditableUser=isUser&&rawIdx===lastUserRawIdx;" not in UI
     assert "const editBtn  = isEditableUser ?" in UI
 
