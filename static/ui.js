@@ -8787,7 +8787,7 @@ function _showUpdateError(target,res){
     showToast(msg);
   }
   // Show "Force update" button when the error is recoverable by a hard reset
-  if(forceBtn&&(res.conflict||res.diverged)){
+  if(forceBtn&&(res.conflict||res.diverged||res.lock_conflict)){
     forceBtn.dataset.target=target;
     forceBtn.style.display='inline-block';
   }

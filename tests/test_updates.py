@@ -1,5 +1,9 @@
 """Tests for self-update diagnostics (api/updates.py)."""
+import os
+import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import api.updates as updates
 
@@ -892,4 +896,152 @@ def test_select_apply_compare_ref_falls_through_when_latest_tag_is_not_ff_reacha
         ref = updates._select_apply_compare_ref(tmp_path)
 
     assert ref == 'origin/main'
+
+
+# ── _is_git_lock_error unit tests ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize('output', [
+    "fatal: Unable to create '/app/.git/index.lock': File exists.",
+    "fatal: Unable to create '.git/index.lock': File exists.",
+    "another git process seems to be running in this repository",
+    "fatal: Unable to create '.git/FETCH_HEAD.lock': File exists.",
+    "fatal: Unable to create '.git/refs/heads/main.lock': File exists.",
+    "could not open lock file",
+    "error: something about a lock file here",
+])
+def test_is_git_lock_error_detects_lock_error(output):
+    assert updates._is_git_lock_error(output) is True
+
+
+@pytest.mark.parametrize('output', [
+    '',
+    None,
+    "fatal: cannot lock ref 'refs/tags/v0.51.106': is at 123 but expected 456",
+    "fatal: unable to access 'https://github.com/nesquena/hermes-webui.git/': Could not resolve host",
+    "fatal: Not a git repository",
+    "error: failed to push some refs",
+])
+def test_is_git_lock_error_returns_false_for_non_lock(output):
+    """Non-lock git errors must NOT be classified as lock_conflict."""
+    assert updates._is_git_lock_error(output) is False
+
+
+# ── _apply_update_inner lock detection tests ────────────────────────────────
+
+
+_MODULE = 'api.updates'
+
+
+def _assert_lock_conflict_result(result):
+    assert result['ok'] is False
+    assert result.get('lock_conflict') is True
+    assert 'repository lock' in result['message']
+
+
+def test_apply_update_fetch_lock_error_returns_lock_conflict(tmp_path):
+    """Fetch failure caused by .git/index.lock returns lock_conflict: True."""
+    (tmp_path / '.git').mkdir()
+    from api import updates as mod
+    with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
+         patch(f'{_MODULE}._run_git') as mock_run_git:
+        mock_run_git.side_effect = [
+            ("fatal: Unable to create '/app/.git/index.lock': File exists.", False),
+        ]
+        result = mod._apply_update_inner('webui')
+    _assert_lock_conflict_result(result)
+
+
+def test_apply_update_fetch_lock_error_does_not_attempt_pull(tmp_path):
+    """If fetch fails with a lock error, no further git calls are made."""
+    (tmp_path / '.git').mkdir()
+    from api import updates as mod
+    with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
+         patch(f'{_MODULE}._run_git') as mock_run_git:
+        mock_run_git.side_effect = [
+            ("fatal: Unable to create '.git/index.lock': File exists.", False),
+        ]
+        mod._apply_update_inner('webui')
+    assert mock_run_git.call_count == 1
+
+
+def test_apply_update_status_lock_error_returns_lock_conflict(tmp_path):
+    """Status failure caused by .git/index.lock returns lock_conflict: True."""
+    (tmp_path / '.git').mkdir()
+    from api import updates as mod
+    with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
+         patch(f'{_MODULE}._select_apply_compare_ref', return_value='origin/main'), \
+         patch(f'{_MODULE}._run_git') as mock_run_git:
+        mock_run_git.side_effect = [
+            ('', True),   # fetch succeeds
+            ("fatal: Unable to create '.git/index.lock': File exists.", False),  # status fails
+        ]
+        result = mod._apply_update_inner('webui')
+    _assert_lock_conflict_result(result)
+
+
+def test_apply_update_pull_lock_error_returns_lock_conflict(tmp_path):
+    """Pull failure caused by .git/index.lock returns lock_conflict: True."""
+    (tmp_path / '.git').mkdir()
+    from api import updates as mod
+    with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
+         patch(f'{_MODULE}._select_apply_compare_ref', return_value='origin/main'), \
+         patch(f'{_MODULE}.STREAMS', {}), \
+         patch(f'{_MODULE}._run_git') as mock_run_git:
+        mock_run_git.side_effect = [
+            ('', True),    # fetch succeeds
+            ('', True),    # status --porcelain (clean)
+            ("fatal: Unable to create '.git/index.lock': File exists.", False),  # pull fails
+        ]
+        result = mod._apply_update_inner('webui')
+    _assert_lock_conflict_result(result)
+
+
+def test_apply_update_non_lock_fetch_failure_does_not_include_lock_conflict(tmp_path):
+    """A non-lock fetch failure does NOT return lock_conflict."""
+    (tmp_path / '.git').mkdir()
+    from api import updates as mod
+    with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
+         patch(f'{_MODULE}._run_git') as mock_run_git:
+        mock_run_git.side_effect = [
+            ("fatal: unable to access 'https://github.com/repo.git/': Could not resolve host", False),
+        ]
+        result = mod._apply_update_inner('webui')
+    assert result['ok'] is False
+    assert result.get('lock_conflict') is None
+
+
+# ── apply_force_update lock cleanup tests ────────────────────────────────────
+
+
+def test_apply_force_update_removes_stale_lock_files(tmp_path):
+    """apply_force_update removes lock files older than 30 seconds."""
+    (tmp_path / '.git').mkdir()
+    stale_lock = tmp_path / '.git' / 'index.lock'
+    stale_lock.write_text('')
+    old_mtime = time.time() - 60
+    os.utime(stale_lock, (old_mtime, old_mtime))
+
+    with patch.object(updates, '_run_git', return_value=('', True)), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        updates.apply_force_update('webui')
+
+    assert not stale_lock.exists(), "Stale lock file should have been removed"
+
+
+def test_apply_force_update_skips_recent_lock_file(tmp_path):
+    """apply_force_update does NOT remove lock files younger than 30 seconds."""
+    (tmp_path / '.git').mkdir()
+    recent_lock = tmp_path / '.git' / 'index.lock'
+    recent_lock.write_text('')
+    recent_mtime = time.time() - 5
+    os.utime(recent_lock, (recent_mtime, recent_mtime))
+
+    with patch.object(updates, '_run_git', return_value=('', True)), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}):
+        updates.apply_force_update('webui')
+
+    assert recent_lock.exists(), "Recent lock file should NOT have been removed"
 

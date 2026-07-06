@@ -214,6 +214,21 @@ def _run_git(args, cwd, timeout=10):
         return f'git failed to start: {exc}', False
 
 
+_GIT_LOCK_SIGNATURES = (
+    "index.lock': file exists",
+    "another git process seems to be running",
+    ".lock': file exists",
+    "lock file",
+)
+
+
+def _is_git_lock_error(output: str) -> bool:
+    if not output:
+        return False
+    lower_out = output.lower()
+    return any(sig in lower_out for sig in _GIT_LOCK_SIGNATURES)
+
+
 def _windows_git_from_registry():
     """Best-effort resolve git.exe from the Git-for-Windows registry key.
 
@@ -1363,6 +1378,28 @@ def apply_force_update(target: str) -> dict:
         if path is None or not (path / '.git').exists():
             return {'ok': False, 'message': 'Not a git repository'}
 
+        # Clean up stale git lock files that are likely orphaned (older than
+        # 30 seconds). Live locks held by a concurrent git process are recent,
+        # so we skip those to avoid corrupting an active operation.
+        _LOCK_STALE_SECS = 30
+        git_dir = path / '.git'
+        if git_dir.exists():
+            for lock_path in git_dir.rglob('*.lock'):
+                if not lock_path.is_file():
+                    continue
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    continue
+                if age < _LOCK_STALE_SECS:
+                    logger.warning(f"Skipping recent lock file (age={age:.1f}s): {lock_path}")
+                    continue
+                try:
+                    os.remove(lock_path)
+                    logger.info(f"Removed stale lock file (age={age:.1f}s): {lock_path}")
+                except OSError as e:
+                    logger.error(f"Failed to remove stale lock file {lock_path}: {e}")
+
         # --force so a remote re-tag (e.g. squash-merge that re-points an
         # existing release tag) doesn't jam the apply path with "would clobber
         # existing tag". See #2756.
@@ -1460,6 +1497,12 @@ def _apply_update_inner(target):
     # --force so a remote re-tag doesn't block the update path (see #2756).
     fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
+        if _is_git_lock_error(fetch_out):
+            return {
+                'ok': False,
+                'message': f'Fetch failed due to a repository lock: {fetch_out.strip()}',
+                'lock_conflict': True,
+            }
         return {
             'ok': False,
             'message': _apply_fetch_failure_message(
@@ -1476,6 +1519,12 @@ def _apply_update_inner(target):
         ['status', '--porcelain', '--untracked-files=no'], path
     )
     if not status_ok:
+        if _is_git_lock_error(status_out):
+            return {
+                'ok': False,
+                'message': f'Failed to inspect repo status due to a repository lock: {status_out.strip()}',
+                'lock_conflict': True,
+            }
         return {'ok': False, 'message': f'Failed to inspect repo status: {status_out[:200]}'}
     # Fail early on unresolved merge conflicts
     if any(line[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
@@ -1508,6 +1557,12 @@ def _apply_update_inner(target):
         pull_args.extend(['origin', compare_ref])
     pull_out, pull_ok = _run_git(pull_args, path, timeout=30)
     if not pull_ok:
+        if _is_git_lock_error(pull_out):
+            return {
+                'ok': False,
+                'message': f'Pull failed due to a repository lock: {pull_out.strip()}',
+                'lock_conflict': True,
+            }
         pull_lower = pull_out.lower()
         detail = pull_out.strip()[:300] if pull_out.strip() else '(no output from git)'
         untracked_collision = (
