@@ -1242,7 +1242,8 @@ async function newSession(flash, options={}){
       const _dirP=loadDir('.');
       if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
-    // don't call renderSessionList here - callers do it when needed
+    // Refresh sidebar to include the newly created session (#3874).
+    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session')).catch(()=>{})}
   })();
   try{
     return await _newSessionInFlight;

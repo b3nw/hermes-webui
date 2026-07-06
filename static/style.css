@@ -3384,7 +3384,16 @@ body.tts-enabled .msg-tts-btn{display:inline-flex;align-items:center;}
 .preview-path{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow:hidden;min-width:0;}
 .preview-path #previewPathText{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .preview-path #previewBadge{flex-shrink:0;white-space:nowrap;}
-.preview-path #btnDownloadFile,.preview-path #btnEditFile,.preview-path #btnRenderMarkdownAnyway{flex-shrink:0;white-space:nowrap;}
+.preview-path #btnCopyPreviewRelPath,.preview-path #btnDownloadFile,.preview-path #btnEditFile,.preview-path #btnRenderMarkdownAnyway{flex-shrink:0;white-space:nowrap;}
+/* #5548: keep the preview-header action buttons from crushing the path / clipping
+   Download+Edit on a narrow preview pane (worst with long RU/DE labels). The path
+   text keeps priority (ellipsis above); the newest button (Copy relative path) drops
+   its text label to icon-only when the RIGHT PANEL (not the viewport) is narrow —
+   .rightpanel is a named inline-size container, so this fires on pane resize too,
+   staying accessible via the button's title + aria-label. */
+@container rightpanel (max-width:520px){
+  .preview-path #btnCopyPreviewRelPath .preview-btn-label{display:none;}
+}
 
 /* Preview badge typography */
 .preview-badge{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;}
@@ -4848,15 +4857,57 @@ main.main > #mainPlugin{display:none;}
 #mainSettings .settings-field > div[style*="color: var(--muted)"]{font-size:12px;color:var(--muted);line-height:1.5;}
 
 .model-advanced-row{
+  position:relative;
   display:grid;
   grid-template-columns:minmax(0,1fr) 34px;
   gap:8px;
   align-items:center;
 }
 .model-advanced-row #settingsModel{
+  display:none;
   width:100%!important;
   min-width:0;
   box-sizing:border-box;
+}
+.settings-model-chip{
+  width:100%;
+  min-width:0;
+  box-sizing:border-box;
+  padding:8px 10px;
+  border:1px solid var(--border2);
+  border-radius:6px;
+  background:var(--code-bg);
+  color:var(--text);
+  font:inherit;
+  font-size:13px;
+  text-align:left;
+  cursor:pointer;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.settings-model-chip:hover,.settings-model-chip.active,.settings-model-chip:focus-visible{
+  border-color:var(--accent);
+  outline:none;
+}
+.settings-model-dropdown{
+  top:calc(100% + 4px);
+  bottom:auto;
+  left:0;
+  width:calc(100% - 42px);
+  min-width:min(360px,100%);
+  max-width:100%;
+  max-height:360px;
+  z-index:260;
+  /* This picker opens DOWNWARD (top:100%), unlike the composer picker which opens
+     upward; override the inherited upward shadow so it casts down toward the list. */
+  box-shadow:0 4px 24px rgba(0,0,0,.4);
+}
+.settings-model-dropdown .model-search-row{
+  position:sticky;
+  top:0;
+  background:var(--surface);
+  z-index:1;
 }
 .model-advanced-btn{
   width:32px;
@@ -5786,6 +5837,16 @@ main.main > #mainPlugin{display:none;}
 .status-card-label{color:var(--muted);font-weight:550;background:rgba(0,0,0,.015);}
 .status-card-value{color:var(--text);word-break:break-word;font-family:var(--font-mono);}
 @media (max-width:700px){.status-card{margin-left:0;}.status-card-head{flex-direction:column;}.status-card-session-copy{max-width:100%;}.status-card-grid{grid-template-columns:1fr;}.status-card-label{padding-bottom:2px;border-top:1px solid var(--border-subtle);}.status-card-value{padding-top:2px;border-top:0;}}
+.compression-recovery-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:12px 0 4px;padding:14px 16px;border:1px solid var(--border-subtle);border-radius:var(--radius-card);background:var(--surface-subtle);box-shadow:0 8px 20px rgba(0,0,0,.04);}
+.compression-recovery-copy{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.compression-recovery-title{color:var(--text);font-size:14px;font-weight:650;line-height:1.35;}
+.compression-recovery-summary{color:var(--muted);font-size:12px;line-height:1.45;}
+.compression-recovery-action{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:32px;padding:6px 11px;border:1px solid var(--accent-bg-strong);border-radius:7px;background:var(--accent-bg);color:var(--accent-text);font:inherit;font-size:12px;font-weight:650;white-space:nowrap;cursor:pointer;}
+.compression-recovery-action:hover{background:var(--accent-bg-strong);color:var(--accent-text);}
+.compression-recovery-action:disabled{opacity:.65;cursor:progress;}
+.compression-recovery-card[data-compression-recovery-consumed="1"]{opacity:.6;}
+.compression-recovery-card[data-compression-recovery-consumed="1"] .compression-recovery-action{opacity:.55;cursor:default;pointer-events:none;}
+@media (max-width:700px){.compression-recovery-card{flex-direction:column;align-items:stretch;margin-left:0;}.compression-recovery-action{width:100%;}}
 .assistant-segment-anchor { display: none; }
 
 /* ── Classic conversation layout: user right, half-width; assistant left ── */
@@ -6844,8 +6905,8 @@ main.main.showing-logs > #mainLogs{display:flex;}
 /* OpenWebUI-style streaming word fade (opt-in via Settings → Preferences).
    Opacity-only fade with JS-paced word/paragraph reveal. */
 .stream-fade-active .stream-fade-word{display:inline;}
-.stream-fade-word.is-new{animation:stream-fade-word-in var(--stream-fade-ms,240ms) cubic-bezier(.2,.7,.2,1) both;will-change:opacity;}
-@keyframes stream-fade-word-in{0%{opacity:0;}45%{opacity:.45;}100%{opacity:1;}}
+.stream-fade-word.is-new{animation:stream-fade-word-in var(--stream-fade-ms,620ms) cubic-bezier(.16,.84,.32,1) both;will-change:opacity;}
+@keyframes stream-fade-word-in{0%{opacity:0;}35%{opacity:.18;}70%{opacity:.72;}100%{opacity:1;}}
 @media (prefers-reduced-motion: reduce){.stream-fade-word.is-new{animation:none;will-change:auto;}}
 [data-live-assistant="1"]:last-child .msg-body.stream-fade-active > :last-child::after,
 [data-live-assistant="1"]:last-child .msg-body.stream-fade-active:not(:has(> *))::after{display:none;content:none;}
