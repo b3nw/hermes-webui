@@ -17212,7 +17212,13 @@ if(!S._expandedDirs) S._expandedDirs=new Set();
 if(!S._dirCache) S._dirCache={};
 
 function renderFileTree(){
-  const box=$('fileTree');box.innerHTML='';
+  const box=$('fileTree');
+  // #5657: capture scrollTop before wiping the container. innerHTML='' collapses
+  // scrollHeight so the browser clamps scrollTop to 0; we restore it after the
+  // re-paint. Expand/collapse only adds/removes children below the clicked row,
+  // so the previous offset stays valid (no row anchor / rect math needed).
+  const prevScrollTop=box?box.scrollTop:0;
+  box.innerHTML='';
   // Cache current dir entries
   S._dirCache[S.currentDir||'.']=S.entries;
   // Show empty-state when no workspace is set or the directory is empty (#703)
@@ -17231,6 +17237,7 @@ function renderFileTree(){
     return;
   }
   _renderTreeItems(box, visibleEntries, 0);
+  if(box) box.scrollTop=prevScrollTop;
 }
 
 let _wsActiveDragPath=null;
