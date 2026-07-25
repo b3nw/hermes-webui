@@ -1220,7 +1220,11 @@ def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) 
         return {}
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        # Pure read of the live, WAL state.db — use the module's read-only opener
+        # for the same reason the other projections here do (#5455): a
+        # write-capable handle adds needless checkpoint/lock surface while the
+        # agent is streaming into it.
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -1292,9 +1296,20 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
       timestamp, i.e. genuinely per-turn.
     * ``_turnUsage``    — session token/cache/cost totals, and ONLY when they
       provably describe a single turn (``api_call_count == 1`` and exactly one
-      assistant message). ``messages.token_count`` is not populated for these
-      sessions, so there is no way to split totals across turns; showing
+      settled assistant message). ``messages.token_count`` is not populated for
+      these sessions, so there is no way to split totals across turns; showing
       session-wide figures inside a per-turn footer would misattribute them.
+
+    Only *settled* assistant rows are stamped — an assistant row carrying
+    ``tool_calls`` is an intermediate segment of a still-running turn, not its
+    answer. `get_state_db_session_messages` preserves `tool_calls` for imported
+    transcripts, so a tool-using turn arrives as
+    ``user -> assistant(tool_calls) -> tool -> assistant``; stamping both
+    assistant rows would put a premature elapsed time on the tool-call segment
+    and render two footers for one turn. This matches the in-process path, which
+    walks ``reversed(s.messages)`` and stamps exactly one assistant per turn, and
+    the frontend contract that settled metadata belongs on the last
+    metadata-bearing assistant row of a multi-segment turn.
 
     Bails out entirely unless the transcript length matches the session's own
     message count. ``get_state_db_session_messages`` stitches compression /
@@ -1315,10 +1330,7 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
     if not isinstance(own_count, int) or own_count != len(msgs):
         return msgs
 
-    assistant_idxs = [
-        i for i, m in enumerate(msgs)
-        if isinstance(m, dict) and _safe_lower(m.get('role')) == 'assistant'
-    ]
+    assistant_idxs = [i for i, m in enumerate(msgs) if _is_settled_assistant(m)]
     if not assistant_idxs:
         return msgs
 
@@ -1360,6 +1372,19 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
             msg['_turnUsage'] = dict(usage)
 
     return msgs
+
+
+def _is_settled_assistant(message) -> bool:
+    """Return True for an assistant row that is a turn's answer, not a tool call.
+
+    An assistant row with ``tool_calls`` is an intermediate segment: the turn is
+    still running and its elapsed time is not yet meaningful.
+    """
+    return (
+        isinstance(message, dict)
+        and _safe_lower(message.get('role')) == 'assistant'
+        and not message.get('tool_calls')
+    )
 
 
 def _turn_duration_from_preceding_user(msgs: list, assistant_idx: int) -> float | None:

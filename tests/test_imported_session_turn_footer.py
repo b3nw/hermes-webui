@@ -8,6 +8,7 @@ row instead.
 """
 
 import sqlite3
+from unittest.mock import patch
 
 import api.agent_sessions as agent_sessions
 
@@ -128,6 +129,101 @@ def test_multi_call_session_gets_model_and_duration_but_no_token_totals(tmp_path
     assert [m["_usedModel"] for m in assistants] == ["x-ai/grok-4.5", "x-ai/grok-4.5"]
     assert [m["_turnDuration"] for m in assistants] == [6.404, 10.574]
     assert all("_turnUsage" not in m for m in assistants)
+
+
+def test_tool_using_turn_stamps_only_the_settled_assistant(tmp_path):
+    """An assistant row that requests tools is not the turn's answer.
+
+    `get_state_db_session_messages` preserves `tool_calls`, so an imported
+    tool-using turn arrives as user -> assistant(tool_calls) -> tool ->
+    assistant. Stamping both assistant rows would put a premature elapsed time
+    on the tool-call segment and render two footers for one logical turn; the
+    frontend contract puts settled metadata on the last metadata-bearing
+    assistant row. The final answer must carry the full user-to-completion
+    duration.
+    """
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        # A tool-using turn is at least two API calls, so usage is withheld
+        # regardless; this test is about model/duration ownership.
+        _add_session(conn, "sub_tools", api_calls=2)
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("t_u1", "sub_tools", "user", "do the thing", 1000.0),
+                ("t_a1", "sub_tools", "assistant", "", 1002.0),
+                ("t_r1", "sub_tools", "tool", "tool output", 1003.0),
+                ("t_a2", "sub_tools", "assistant", "done", 1008.5),
+            ],
+        )
+        conn.commit()
+        msgs = _transcript(conn, "sub_tools")
+    finally:
+        conn.close()
+
+    # The reader parses tool_calls onto the intermediate assistant row.
+    msgs[1]["tool_calls"] = [{"id": "call_1", "function": {"name": "read_file"}}]
+
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "sub_tools")
+    agent_sessions.stamp_imported_turn_footers(msgs, stats)
+
+    intermediate, final = msgs[1], msgs[3]
+    assert "_usedModel" not in intermediate
+    assert "_turnDuration" not in intermediate
+    assert "_turnUsage" not in intermediate
+    assert final["_usedModel"] == "x-ai/grok-4.5"
+    # Full user -> final answer, not user -> tool-call segment (which would be 2.0).
+    assert final["_turnDuration"] == 8.5
+    assert "_turnUsage" not in final
+
+
+def test_single_call_turn_without_tool_calls_is_the_direct_control(tmp_path):
+    """Control for the tool-using case: a plain turn still gets full metadata."""
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        _add_session(conn, "sub_plain", api_calls=1)
+        _add_turn(conn, "sub_plain", 1, user_ts=1000.0, assistant_ts=1003.0)
+        msgs = _transcript(conn, "sub_plain")
+    finally:
+        conn.close()
+
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "sub_plain")
+    agent_sessions.stamp_imported_turn_footers(msgs, stats)
+
+    assistant = msgs[-1]
+    assert assistant["_usedModel"] == "x-ai/grok-4.5"
+    assert assistant["_turnDuration"] == 3.0
+    assert assistant["_turnUsage"]["input_tokens"] == 10189
+
+
+def test_footer_stats_read_state_db_through_the_read_only_opener(tmp_path):
+    """A pure-read projection must not take a write-capable handle on state.db.
+
+    Mirrors the module's existing rule (#5455): the live WAL state.db is opened
+    via ``open_state_db_readonly`` so a read never adds checkpoint/lock surface.
+    """
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        _add_session(conn, "ro_check")
+        _add_turn(conn, "ro_check", 1, user_ts=1.0, assistant_ts=2.0)
+    finally:
+        conn.close()
+
+    calls = []
+    real_opener = agent_sessions.open_state_db_readonly
+
+    def _spy(path, *args, **kwargs):
+        calls.append(str(path))
+        return real_opener(path, *args, **kwargs)
+
+    with patch.object(agent_sessions, "open_state_db_readonly", side_effect=_spy):
+        stats = agent_sessions.read_agent_session_turn_footer_stats(db, "ro_check")
+
+    assert calls == [str(db)], "stats read did not go through open_state_db_readonly"
+    assert stats["model"] == "x-ai/grok-4.5"
 
 
 def test_stitched_transcript_is_not_stamped_with_one_segments_stats(tmp_path):
