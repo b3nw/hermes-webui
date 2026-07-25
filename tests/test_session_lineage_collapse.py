@@ -499,6 +499,141 @@ console.log(JSON.stringify(rows));
     assert "_orphan_child_session" not in rows[0]["_child_sessions"][0]
 
 
+def test_cross_surface_subagent_child_stacks_under_gateway_api_server_parent():
+    """A gateway-backed WebUI parent is not an external surface (#5305 follow-up).
+
+    With HERMES_WEBUI_CHAT_BACKEND=gateway the parent conversation is mirrored
+    into state.db as source='api_server' (session_source='api'), not 'webui'.
+    The parentSourceMarker allowlist only knows webui/subagent/other/fork, so
+    that marker classified the parent as external and every delegate_task child
+    was pushed back out to a top-level "Subagent Session" orphan. Uses the real
+    source-classification helpers so the marker path is actually exercised.
+    """
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback']);
+eval(extractFunc('_isMessagingSession'));
+eval(extractFunc('_isWebUiSourceSession'));
+eval(extractFunc('_isExternalSession'));
+eval(extractFunc('_isChildSession'));
+eval(extractFunc('_isForkWithResolvableParent'));
+eval(extractFunc('_sidebarLineageKeyForRow'));
+eval(extractFunc('_attachChildSessionsToSidebarRows'));
+const collapsed = [{{
+  session_id:'gateway_parent',
+  title:'Call the delegate_task TOOL directly',
+  source:'api_server',
+  raw_source:'api_server',
+  source_tag:'api_server',
+  session_source:'api',
+  source_label:'API',
+  is_cli_session:false,
+  message_count:4,
+}}];
+const raw = [
+  collapsed[0],
+  {{
+    session_id:'subagent_a',
+    title:'Subagent Session',
+    parent_session_id:'gateway_parent',
+    relationship_type:'child_session',
+    raw_source:'subagent',
+    source_tag:'subagent',
+    session_source:'other',
+    source_label:'Subagent',
+    parent_source:'api_server',
+    _parent_lineage_root_id:'gateway_parent',
+    _cross_surface_child_session:true,
+  }},
+  {{
+    session_id:'subagent_b',
+    title:'Subagent Session',
+    parent_session_id:'gateway_parent',
+    relationship_type:'child_session',
+    raw_source:'subagent',
+    source_tag:'subagent',
+    session_source:'other',
+    source_label:'Subagent',
+    parent_source:'api_server',
+    _parent_lineage_root_id:'gateway_parent',
+    _cross_surface_child_session:true,
+  }},
+];
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+console.log(JSON.stringify(rows));
+"""
+    rows = json.loads(_run_node(source))
+    assert [row["session_id"] for row in rows] == ["gateway_parent"]
+    assert rows[0]["_child_session_count"] == 2
+    assert sorted(child["session_id"] for child in rows[0]["_child_sessions"]) == [
+        "subagent_a",
+        "subagent_b",
+    ]
+
+
+def test_delegated_subagent_child_without_visible_parent_stays_suppressed():
+    """The #5305 out-of-scope suppression must survive the api_server nesting fix.
+
+    Nesting a subagent under a gateway-backed parent must not be implemented by
+    dropping ``_cross_surface_child_session``: that flag is also what keeps a
+    delegated child from becoming a contextless top-level orphan when its parent
+    is filtered out of the current render.
+    """
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback']);
+eval(extractFunc('_isMessagingSession'));
+eval(extractFunc('_isWebUiSourceSession'));
+eval(extractFunc('_isExternalSession'));
+eval(extractFunc('_isChildSession'));
+eval(extractFunc('_isForkWithResolvableParent'));
+eval(extractFunc('_sidebarLineageKeyForRow'));
+eval(extractFunc('_attachChildSessionsToSidebarRows'));
+const child = {{
+  session_id:'subagent_a',
+  title:'Subagent Session',
+  parent_session_id:'out_of_scope_parent',
+  relationship_type:'child_session',
+  raw_source:'subagent',
+  source_tag:'subagent',
+  session_source:'other',
+  source_label:'Subagent',
+  parent_source:'api_server',
+  _cross_surface_child_session:true,
+}};
+const rows = _attachChildSessionsToSidebarRows([], [child]);
+console.log(JSON.stringify(rows));
+"""
+    assert json.loads(_run_node(source)) == []
+
 
 def test_cross_surface_subagent_child_stacks_under_visible_fork_parent():
     """Forked WebUI conversations can still own subagent child rows."""

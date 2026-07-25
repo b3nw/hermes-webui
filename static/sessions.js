@@ -7021,7 +7021,24 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       parentRow.session_source==='messaging'||
       (parentSourceMarker&&parentSourceMarker!=='webui'&&parentSourceMarker!=='subagent'&&parentSourceMarker!=='other'&&parentSourceMarker!=='fork')
     );
-    if(parentRow&&child._cross_surface_child_session&&parentIsExternal){
+    // #5305 follow-up: a delegated subagent row is not a surface continuation.
+    // It has no sidebar surface of its own and always belongs under whichever
+    // conversation spawned it, however that parent happens to be recorded.
+    // The parentSourceMarker allowlist above only recognises WebUI-owned
+    // parents as `webui`, but a gateway-backed WebUI chat
+    // (HERMES_WEBUI_CHAT_BACKEND=gateway) is mirrored into state.db as
+    // source='api_server' -> session_source='api'. That marker fell through to
+    // "external", so every delegate_task child of a gateway-backed WebUI
+    // conversation was pushed back out to a contextless top-level "Subagent
+    // Session" orphan — the exact pollution #5244 removed for the direct-backend
+    // case. Classify on the child instead of guessing every parent surface.
+    // The flag itself stays set, so the no-visible-parent branch below still
+    // suppresses these rows when the parent is out of scope.
+    const childSourceMarker=String(child&&(
+      child.raw_source||child.source_tag||child.source
+    )||'').toLowerCase();
+    const childIsDelegatedSubagent=childSourceMarker==='subagent';
+    if(parentRow&&child._cross_surface_child_session&&parentIsExternal&&!childIsDelegatedSubagent){
       if(childRenderable) orphans.push({...child,_orphan_child_session:true});
       continue;
     }
