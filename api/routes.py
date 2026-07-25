@@ -44,7 +44,9 @@ from api.agent_sessions import (
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    read_agent_session_turn_footer_stats,
     read_session_lineage_report,
+    stamp_imported_turn_footers,
 )
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
@@ -13058,6 +13060,16 @@ def handle_get(handler, parsed) -> bool:
                 "messages": msgs,
                 "tool_calls": [],
             }
+            # Imported agent transcripts (delegated subagents, CLI, cron, ...)
+            # are not run by the WebUI, so no per-turn footer metadata was ever
+            # stamped and they render with an empty footer — no model, no
+            # duration, no tokens. Populate it from the session row here, on the
+            # response path only, so nothing display-only reaches the reader
+            # that feeds model context.
+            stamp_imported_turn_footers(
+                msgs,
+                read_agent_session_turn_footer_stats(_active_state_db_path(), sid),
+            )
             attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
             return j(handler, {"session": redact_session_data(sess)})

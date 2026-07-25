@@ -1192,3 +1192,193 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             entry['_compression_segment_count'] = max(segment_count, tip_depth)
 
     return metadata
+
+
+def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) -> dict:
+    """Return per-turn footer stats for one state.db-backed session.
+
+    Imported agent sessions (delegated subagents, CLI, TUI, cron, messaging)
+    are not executed by the WebUI, so nothing ever stamps the per-turn footer
+    metadata that ``_run_agent_streaming`` writes for in-process turns. Their
+    transcripts therefore render with no footer at all — no model, no duration,
+    no tokens — which makes it impossible to confirm, for example, that a
+    ``delegate_task`` per-task model override actually took effect.
+
+    Everything the footer needs except TTFT is already recorded on the session
+    row, so read it here and let the existing renderer do its job.
+    ``own_message_count`` is returned so the caller can verify the transcript it
+    is about to stamp really belongs to this one session (see
+    ``stamp_imported_turn_footers``).
+
+    Returns ``{}`` on a missing db, an older schema, or an unknown session.
+    """
+    sid = str(session_id or '').strip()
+    if not sid:
+        return {}
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {row[1] for row in cur.fetchall()}
+            if 'id' not in session_cols:
+                return {}
+
+            model_expr = _optional_col('model', session_cols)
+            input_expr = _optional_col('input_tokens', session_cols, '0')
+            output_expr = _optional_col('output_tokens', session_cols, '0')
+            cache_read_expr = _optional_col('cache_read_tokens', session_cols, '0')
+            cache_write_expr = _optional_col('cache_write_tokens', session_cols, '0')
+            cost_expr = _optional_col('estimated_cost_usd', session_cols)
+            calls_expr = _optional_col('api_call_count', session_cols, '0')
+
+            cur.execute(
+                f"""
+                SELECT s.id,
+                       {model_expr},
+                       {input_expr},
+                       {output_expr},
+                       {cache_read_expr},
+                       {cache_write_expr},
+                       {cost_expr},
+                       {calls_expr}
+                FROM sessions s
+                WHERE s.id = ?
+                """,
+                (sid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            stats = dict(row)
+
+            cur.execute("PRAGMA table_info(messages)")
+            message_cols = {r[1] for r in cur.fetchall()}
+            own_count = None
+            if 'session_id' in message_cols:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
+                    (sid,),
+                )
+                count_row = cur.fetchone()
+                own_count = int((count_row['c'] if count_row else 0) or 0)
+    except Exception:
+        return {}
+
+    return {
+        'model': str(stats.get('model') or '').strip(),
+        'input_tokens': _as_positive_int(stats.get('input_tokens')),
+        'output_tokens': _as_positive_int(stats.get('output_tokens')),
+        'cache_read_tokens': _as_positive_int(stats.get('cache_read_tokens')),
+        'cache_write_tokens': _as_positive_int(stats.get('cache_write_tokens')),
+        'estimated_cost': stats.get('estimated_cost_usd'),
+        'api_call_count': _as_positive_int(stats.get('api_call_count')),
+        'own_message_count': own_count,
+    }
+
+
+def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
+    """Add display-only per-turn footer fields to an imported transcript.
+
+    Writes the same message keys the in-process streaming path writes, so the
+    existing footer renderer picks them up with no frontend change:
+
+    * ``_usedModel``    — from the session's recorded model.
+    * ``_turnDuration`` — assistant timestamp minus the preceding user
+      timestamp, i.e. genuinely per-turn.
+    * ``_turnUsage``    — session token/cache/cost totals, and ONLY when they
+      provably describe a single turn (``api_call_count == 1`` and exactly one
+      assistant message). ``messages.token_count`` is not populated for these
+      sessions, so there is no way to split totals across turns; showing
+      session-wide figures inside a per-turn footer would misattribute them.
+
+    Bails out entirely unless the transcript length matches the session's own
+    message count. ``get_state_db_session_messages`` stitches compression /
+    cli-close continuation segments together, and those segments are separate
+    session rows with their own models and totals — stamping this session's
+    stats across a stitched chain would attribute the wrong model to earlier
+    segments. Single-segment sessions (every delegated subagent) are unaffected.
+
+    TTFT is absent by design: the agent does not record a first-token time for
+    these runs, so there is nothing to surface.
+
+    Mutates and returns ``msgs``.
+    """
+    if not isinstance(msgs, list) or not msgs or not isinstance(stats, dict) or not stats:
+        return msgs
+
+    own_count = stats.get('own_message_count')
+    if not isinstance(own_count, int) or own_count != len(msgs):
+        return msgs
+
+    assistant_idxs = [
+        i for i, m in enumerate(msgs)
+        if isinstance(m, dict) and _safe_lower(m.get('role')) == 'assistant'
+    ]
+    if not assistant_idxs:
+        return msgs
+
+    model = str(stats.get('model') or '').strip()
+    single_turn = len(assistant_idxs) == 1 and stats.get('api_call_count') == 1
+
+    usage = None
+    if single_turn:
+        try:
+            from api.usage import prompt_cache_hit_percent
+        except Exception:
+            prompt_cache_hit_percent = None
+        input_tokens = stats.get('input_tokens') or 0
+        cache_read = stats.get('cache_read_tokens') or 0
+        cache_write = stats.get('cache_write_tokens') or 0
+        cache_hit_percent = None
+        if prompt_cache_hit_percent is not None:
+            # Match the in-process path: the denominator is the FULL prompt
+            # total (ordinary input + cache reads + cache writes).
+            cache_hit_percent = prompt_cache_hit_percent(
+                cache_read, input_tokens + cache_read + cache_write
+            )
+        usage = {
+            'input_tokens': input_tokens,
+            'output_tokens': stats.get('output_tokens') or 0,
+            'estimated_cost': stats.get('estimated_cost'),
+            'cache_hit_percent': cache_hit_percent,
+        }
+
+    for idx in assistant_idxs:
+        msg = msgs[idx]
+        if model and not msg.get('_usedModel'):
+            msg['_usedModel'] = model
+        if msg.get('_turnDuration') is None:
+            duration = _turn_duration_from_preceding_user(msgs, idx)
+            if duration is not None:
+                msg['_turnDuration'] = duration
+        if usage is not None and not msg.get('_turnUsage'):
+            msg['_turnUsage'] = dict(usage)
+
+    return msgs
+
+
+def _turn_duration_from_preceding_user(msgs: list, assistant_idx: int) -> float | None:
+    """Seconds from the user message that opened this turn to its reply."""
+    try:
+        end = float(msgs[assistant_idx].get('timestamp'))
+    except (TypeError, ValueError):
+        return None
+    for i in range(assistant_idx - 1, -1, -1):
+        candidate = msgs[i]
+        if not isinstance(candidate, dict):
+            continue
+        if _safe_lower(candidate.get('role')) != 'user':
+            continue
+        try:
+            start = float(candidate.get('timestamp'))
+        except (TypeError, ValueError):
+            return None
+        if end < start:
+            return None
+        return round(end - start, 3)
+    return None
