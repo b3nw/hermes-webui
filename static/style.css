@@ -5670,6 +5670,20 @@ main.main > #mainPlugin{display:none;}
 .session-child-session-fork.swipe-committed,.session-child-session-fork.swipe-removing{transition:background .15s,color .15s,transform .5s cubic-bezier(.22,.61,.36,1),box-shadow .15s ease;will-change:transform;}
 .session-child-session-fork.swipe-removing{overflow:hidden;}
 .session-child-session-fork.swipe-committed .session-swipe-affordance{transition:opacity .18s ease,transform .18s ease;}
+/* Guarantee >=44px mobile touch targets for the delegated-child disclosure and
+   the rows it reveals (#6510 gate finding). Nesting makes the disclosure the only
+   route to a child, so both it and the child rows must clear the 44px floor. The
+   pill keeps its compact 16px visual — the hit area is a transparent overlay
+   spanning only the pill's own width, so the sidebar row does not grow and the
+   absolutely-positioned .session-actions (z-index:1) still sits above it. Mirrors
+   the #6350 review finding 3 pattern. */
+@media(max-width:700px){
+  .session-child-count{position:relative;}
+  .session-child-count::after{content:'';position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:44px;}
+  .session-child-session{min-height:44px;}
+  .session-child-session-fork{min-height:44px;}
+  .session-child-session-fork .session-child-session-main{min-height:44px;}
+}
 .session-tree-children{margin-left:16px;border-left:1px solid var(--border,rgba(255,255,255,.1));padding-left:4px;}
 .session-tree-child.session-item{font-size:12px;opacity:.85;border-radius:6px;padding:6px 8px;}
 .session-tree-child.session-item:hover{opacity:1;}

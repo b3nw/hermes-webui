@@ -8111,13 +8111,25 @@ function renderSessionListFromCache(){
       const childLabel=t('session_meta_children', childCount);
       childCountEl.textContent=childLabel;
       childCountEl.title=_sessionChildBadgeTooltip(childLabel);
+      // This disclosure is the ONLY route to a nested child row, so it must carry
+      // complete button semantics — same contract as the lineage disclosure just
+      // above. Without them keyboard users cannot reveal delegated children at
+      // all (#6510 gate finding).
+      const childKey=_sidebarLineageKeyForRow(s);
+      childCountEl.setAttribute('role','button');
+      childCountEl.setAttribute('tabindex','0');
+      childCountEl.setAttribute('aria-expanded',_expandedChildSessionKeys.has(childKey)?'true':'false');
       ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
-      childCountEl.onclick=(e)=>{
+      const toggleChildSessions=(e)=>{
+        e.preventDefault();
         e.stopPropagation();
-        const key=_sidebarLineageKeyForRow(s);
-        if(_expandedChildSessionKeys.has(key)) _expandedChildSessionKeys.delete(key);
-        else _expandedChildSessionKeys.add(key);
+        if(_expandedChildSessionKeys.has(childKey)) _expandedChildSessionKeys.delete(childKey);
+        else _expandedChildSessionKeys.add(childKey);
         renderSessionListFromCache();
+      };
+      childCountEl.onclick=toggleChildSessions;
+      childCountEl.onkeydown=(e)=>{
+        if(e.key==='Enter'||e.key===' '){toggleChildSessions(e);}
       };
       titleRow.appendChild(childCountEl);
     }
