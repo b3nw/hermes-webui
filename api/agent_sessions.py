@@ -1194,7 +1194,12 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
     return metadata
 
 
-def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) -> dict:
+def read_agent_session_turn_footer_stats(
+    db_path: Path,
+    session_id: str | None,
+    *,
+    include_inactive: bool = False,
+) -> dict:
     """Return per-turn footer stats for one state.db-backed session.
 
     Imported agent sessions (delegated subagents, CLI, TUI, cron, messaging)
@@ -1208,7 +1213,10 @@ def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) 
     row, so read it here and let the existing renderer do its job.
     ``own_message_count`` is returned so the caller can verify the transcript it
     is about to stamp really belongs to this one session (see
-    ``stamp_imported_turn_footers``).
+    ``stamp_imported_turn_footers``). It is counted under the SAME visibility
+    predicate ``get_state_db_session_messages`` applies, so ``include_inactive``
+    must mirror whatever that reader was called with — otherwise the count and
+    the transcript it is compared against are in different coordinate spaces.
 
     Returns ``{}`` on a missing db, an older schema, or an unknown session.
     """
@@ -1264,16 +1272,29 @@ def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) 
             message_cols = {r[1] for r in cur.fetchall()}
             own_count = None
             if 'session_id' in message_cols:
+                # Mirror get_state_db_session_messages' active predicate exactly
+                # (api/models.py). That reader excludes ``active = 0`` rows —
+                # compacted/archived pre-compression history — by default, so
+                # counting every row here would report more messages than the
+                # transcript can ever contain for a compressed session. The
+                # ownership guard in stamp_imported_turn_footers would then read
+                # that mismatch as a stitched lineage and suppress the footer on
+                # a perfectly ordinary single-segment session.
+                active_clause = ""
+                if 'active' in message_cols and not include_inactive:
+                    active_clause = " AND (active IS NULL OR active != 0)"
                 cur.execute(
-                    "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
+                    "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?" + active_clause,
                     (sid,),
                 )
                 count_row = cur.fetchone()
                 own_count = int((count_row['c'] if count_row else 0) or 0)
+            has_tool_calls_col = 'tool_calls' in message_cols
     except Exception:
         return {}
 
     return {
+        'tool_calls_column_present': has_tool_calls_col,
         'model': str(stats.get('model') or '').strip(),
         'input_tokens': _as_positive_int(stats.get('input_tokens')),
         'output_tokens': _as_positive_int(stats.get('output_tokens')),
@@ -1285,7 +1306,7 @@ def read_agent_session_turn_footer_stats(db_path: Path, session_id: str | None) 
     }
 
 
-def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
+def stamp_imported_turn_footers(msgs: list, stats: dict, *, detach: bool = False) -> list:
     """Add display-only per-turn footer fields to an imported transcript.
 
     Writes the same message keys the in-process streaming path writes, so the
@@ -1309,7 +1330,23 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
     and render two footers for one turn. This matches the in-process path, which
     walks ``reversed(s.messages)`` and stamps exactly one assistant per turn, and
     the frontend contract that settled metadata belongs on the last
-    metadata-bearing assistant row of a multi-segment turn.
+    metadata-bearing assistant row of a multi-segment turn. On a legacy schema
+    with no ``tool_calls`` column that key is absent from every row and cannot
+    discriminate; ``_is_settled_assistant`` degrades to a content check there
+    rather than admitting both rows.
+
+    ``msgs`` must be the FULL visible segment for the session, not a paginated
+    slice of it: the ownership guard below compares transcript length against the
+    session's own message count, and a window would never match. Stamp first,
+    then slice.
+
+    With ``detach=True`` neither ``msgs`` nor any dict inside it is mutated — the
+    return value is a new list in which only the stamped rows are replaced by
+    copies. Response paths must use it. The messages reaching this function are
+    the same dicts the sidecar holds and the same ones that feed model-context
+    reconstruction, and display-only keys have no business in either; mutating in
+    place would put them there. Untouched rows are shared by reference, so the
+    copy cost is one dict per settled turn rather than per transcript row.
 
     Bails out entirely unless the transcript length matches the session's own
     message count. ``get_state_db_session_messages`` stitches compression /
@@ -1321,7 +1358,8 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
     TTFT is absent by design: the agent does not record a first-token time for
     these runs, so there is nothing to surface.
 
-    Mutates and returns ``msgs``.
+    Returns the transcript to render. Mutates ``msgs`` in place unless
+    ``detach=True``.
     """
     if not isinstance(msgs, list) or not msgs or not isinstance(stats, dict) or not stats:
         return msgs
@@ -1330,7 +1368,11 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
     if not isinstance(own_count, int) or own_count != len(msgs):
         return msgs
 
-    assistant_idxs = [i for i, m in enumerate(msgs) if _is_settled_assistant(m)]
+    has_tool_calls_col = bool(stats.get('tool_calls_column_present'))
+    assistant_idxs = [
+        i for i, m in enumerate(msgs)
+        if _is_settled_assistant(m, tool_calls_column_present=has_tool_calls_col)
+    ]
     if not assistant_idxs:
         return msgs
 
@@ -1360,31 +1402,55 @@ def stamp_imported_turn_footers(msgs: list, stats: dict) -> list:
             'cache_hit_percent': cache_hit_percent,
         }
 
+    out = list(msgs) if detach else msgs
     for idx in assistant_idxs:
-        msg = msgs[idx]
+        msg = dict(msgs[idx]) if detach else msgs[idx]
         if model and not msg.get('_usedModel'):
             msg['_usedModel'] = model
         if msg.get('_turnDuration') is None:
+            # Read the preceding user row off the ORIGINAL list: only assistant
+            # rows are copied, so timestamps are identical either way, and this
+            # keeps the lookup independent of how far the copying has progressed.
             duration = _turn_duration_from_preceding_user(msgs, idx)
             if duration is not None:
                 msg['_turnDuration'] = duration
         if usage is not None and not msg.get('_turnUsage'):
             msg['_turnUsage'] = dict(usage)
+        out[idx] = msg
 
-    return msgs
+    return out
 
 
-def _is_settled_assistant(message) -> bool:
+def _is_settled_assistant(message, *, tool_calls_column_present: bool = False) -> bool:
     """Return True for an assistant row that is a turn's answer, not a tool call.
 
     An assistant row with ``tool_calls`` is an intermediate segment: the turn is
     still running and its elapsed time is not yet meaningful.
+
+    That key is the discriminator only when the ``messages`` table HAS a
+    ``tool_calls`` column. Without it ``get_state_db_session_messages`` omits the
+    key from every row, so a tool-call segment is byte-identical to an answer by
+    key presence and the check silently admits both — putting a premature elapsed
+    time on the segment and rendering two footers for one turn, exactly the
+    ownership bug this predicate exists to prevent.
+
+    On such a schema fall back to the one signal that survives: the agent writes
+    tool-call segments with empty content and answers with content. A
+    blank-content assistant row is then refused rather than guessed at, which
+    also covers a turn aborted before its tool results were recorded. Defaults to
+    the strict fallback so a caller that did not get the flag from
+    ``read_agent_session_turn_footer_stats`` cannot accidentally opt into the
+    stronger claim.
     """
-    return (
-        isinstance(message, dict)
-        and _safe_lower(message.get('role')) == 'assistant'
-        and not message.get('tool_calls')
-    )
+    if not isinstance(message, dict):
+        return False
+    if _safe_lower(message.get('role')) != 'assistant':
+        return False
+    if message.get('tool_calls'):
+        return False
+    if not tool_calls_column_present:
+        return bool(str(message.get('content') or '').strip())
+    return True
 
 
 def _turn_duration_from_preceding_user(msgs: list, assistant_idx: int) -> float | None:

@@ -9168,6 +9168,82 @@ def _session_source_is_webui(session: dict) -> bool:
     return False
 
 
+def _session_ran_outside_webui(session, cli_meta) -> bool:
+    """Return True when this session's turns were executed by another surface.
+
+    Ownership gate for imported per-turn footer backfill. The question is the
+    same one ``_session_requires_cli_metadata_lookup`` already answers for
+    metadata — an imported/foreign row carries source markers, a WebUI-native
+    session carries none — so reuse it rather than invent a second notion of
+    foreign. ``_session_source_is_webui`` then subtracts the one case that gate
+    admits but must not be stamped: a WebUI-origin session later touched through
+    another surface (Gateway API server) has a state.db row and source markers,
+    yet the WebUI ran its turns and already stamped their footers itself.
+
+    Both arguments are consulted because neither alone is authoritative — a
+    legacy sidecar can predate the source fields while the state.db row has them,
+    and a synthesized session has them before any sidecar exists. A ``webui``
+    marker on EITHER wins: they are checked separately rather than merged, so a
+    foreign marker on one cannot mask a ``webui`` marker on the other.
+    """
+    for candidate in (session, cli_meta):
+        if candidate is None:
+            continue
+        markers = {
+            key: (
+                candidate.get(key) if isinstance(candidate, dict)
+                else getattr(candidate, key, None)
+            )
+            for key in ("source_tag", "raw_source", "session_source", "source")
+        }
+        if _session_source_is_webui(markers):
+            return False
+    return bool(
+        _session_requires_cli_metadata_lookup(session)
+        or _session_requires_cli_metadata_lookup(cli_meta)
+    )
+
+
+def _imported_session_response_messages(sid, msgs, *, session=None, cli_meta=None) -> list:
+    """Return the transcript to serialize for an imported session's response.
+
+    Single entry point for per-turn footer backfill, shared by both /api/session
+    branches — the persisted-sidecar path and the no-sidecar synthesized path —
+    so a CLI/TUI/cron session does not lose its footer the moment a sidecar
+    exists for it.
+
+    Call this with the FULL visible segment, BEFORE any pagination slice.
+    ``stamp_imported_turn_footers`` proves transcript ownership by length against
+    the session's own message count, which a window can never satisfy; stamping
+    first also lets a windowed assistant row still resolve the user row that
+    opened its turn even when that row sits outside the window. The stamps
+    survive slicing because ``_messages_for_limited_payload`` and
+    ``_hydrate_anchor_activity_scenes`` copy rows rather than rebuild them.
+
+    Nothing is mutated: ``detach=True`` means the caller receives a new list
+    whose stamped rows are copies, so these display-only keys never reach the
+    persisted sidecar or the reader that feeds model context.
+
+    Returns ``msgs`` unchanged for WebUI-native sessions, an unreadable or
+    older-schema state.db, or a stitched lineage.
+    """
+    if not isinstance(msgs, list) or not msgs:
+        return msgs
+    if not _session_ran_outside_webui(session, cli_meta):
+        return msgs
+    try:
+        # _active_state_db_path() is the right db without threading profile
+        # through: /api/session rejects any session whose profile does not match
+        # the active one before reaching here, so the session's state.db IS the
+        # active profile's.
+        stats = read_agent_session_turn_footer_stats(_active_state_db_path(), sid)
+    except Exception:
+        return msgs
+    if not stats:
+        return msgs
+    return stamp_imported_turn_footers(msgs, stats, detach=True)
+
+
 def _normalized_source_marker(value) -> str:
     marker = str(value or "").strip().lower()
     if marker.endswith(" session"):
@@ -12740,6 +12816,18 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             if load_messages:
+                # Imported agent transcripts (delegated subagents, CLI, TUI,
+                # cron, messaging) are not run by the WebUI, so no per-turn
+                # footer metadata was ever stamped and they render with no model,
+                # duration, or token information at all. Backfill it from the
+                # session row here — on the full visible segment, before the
+                # pagination slice below, because the ownership check is a length
+                # comparison and a window would never match. Returns a detached
+                # list, so nothing display-only reaches the sidecar or the reader
+                # that feeds model context. No-op for WebUI-native sessions.
+                _all_msgs = _imported_session_response_messages(
+                    sid, _all_msgs, session=s, cli_meta=cli_meta,
+                )
                 _truncated_msgs, _messages_offset = _message_window_for_display(
                     _all_msgs,
                     msg_limit=msg_limit,
@@ -13018,6 +13106,14 @@ def handle_get(handler, parsed) -> bool:
             # the wire shape stays byte-equivalent to the previous inline
             # synthesis (the frontend has been reading these exact keys).
             msgs = list(synth.messages or [])
+            # Same per-turn footer backfill the persisted-sidecar branch above
+            # applies, through the same helper: whether an imported session has a
+            # WebUI sidecar yet must not decide whether its transcript shows a
+            # model, a duration, or token counts. This branch is never paginated,
+            # so the synthesized list is already the full visible segment.
+            msgs = _imported_session_response_messages(
+                sid, msgs, session=synth, cli_meta=cli_meta,
+            )
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
@@ -13060,16 +13156,6 @@ def handle_get(handler, parsed) -> bool:
                 "messages": msgs,
                 "tool_calls": [],
             }
-            # Imported agent transcripts (delegated subagents, CLI, cron, ...)
-            # are not run by the WebUI, so no per-turn footer metadata was ever
-            # stamped and they render with an empty footer — no model, no
-            # duration, no tokens. Populate it from the session row here, on the
-            # response path only, so nothing display-only reaches the reader
-            # that feeds model context.
-            stamp_imported_turn_footers(
-                msgs,
-                read_agent_session_turn_footer_stats(_active_state_db_path(), sid),
-            )
             attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
             return j(handler, {"session": redact_session_data(sess)})
