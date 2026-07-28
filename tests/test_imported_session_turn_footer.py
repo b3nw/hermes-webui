@@ -945,6 +945,107 @@ def test_aborted_turn_with_no_final_answer_stamps_nothing(
 
 
 @pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+@pytest.mark.parametrize("blank", ["", "  \n\t  "], ids=["empty", "whitespace"])
+def test_blank_terminal_assistant_stamps_nothing(tmp_path, tool_calls_column, blank):
+    """A blank terminal row is not proof an answer settled.
+
+    With tool metadata untrustworthy, ``user -> assistant(content="")`` can be
+    an incomplete or aborted tool segment just as well as an empty answer. The
+    aborted-turn matrix above always appends a tool row after the blank
+    assistant, so it exits through the trailing-tool rejection; here the blank
+    row TERMINATES the turn, reaching the append the matrix never exercises.
+    Fail closed: no footer.
+    """
+    db = tmp_path / "state.db"
+    _seed_shape(
+        db,
+        "blank_terminal",
+        [
+            ("user", "find the config", 1000.0),
+            ("assistant", blank, 1002.0),
+        ],
+        tool_calls_column=tool_calls_column,
+    )
+
+    msgs = _read_real_transcript(db, "blank_terminal")
+    assert all(not m.get("tool_calls") for m in msgs), (
+        "fixture must reproduce a shape where tool_calls cannot discriminate"
+    )
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "blank_terminal")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    assert all("_usedModel" not in m for m in stamped), (
+        "a blank terminal row with unreliable tool metadata was stamped"
+    )
+    assert all("_turnDuration" not in m for m in stamped)
+    assert all("_turnUsage" not in m for m in stamped)
+
+
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+def test_blank_terminal_assistant_does_not_block_later_turns(tmp_path, tool_calls_column):
+    """The blank refusal is per-turn: a later plain answer keeps its footer.
+
+    user -> blank assistant -> next user -> plain answer. The first turn fails
+    closed; the second is an ordinary settled turn and must still be stamped,
+    proving the refusal does not leak across the user delimiter.
+    """
+    db = tmp_path / "state.db"
+    _seed_shape(
+        db,
+        "blank_then_plain",
+        [
+            ("user", "find the config", 1000.0),
+            ("assistant", "", 1002.0),
+            ("user", "never mind, just tell me", 1010.0),
+            ("assistant", "It lives in config.json", 1014.0),
+        ],
+        tool_calls_column=tool_calls_column,
+    )
+
+    msgs = _read_real_transcript(db, "blank_then_plain")
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "blank_then_plain")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    assert "_usedModel" not in stamped[1], "blank terminal row was stamped"
+    assert "_turnDuration" not in stamped[1]
+    assert stamped[3]["_usedModel"] == "openai/gpt-5"
+    assert stamped[3]["_turnDuration"] == 4.0
+
+
+def test_explicit_empty_tool_calls_list_keeps_blank_answer_stampable(tmp_path):
+    """An explicitly parsed empty tool_calls list is reliable metadata.
+
+    The blank refusal exists only for rows whose tool metadata cannot be
+    trusted. A current-schema row recording ``'[]'`` says "requested no tools"
+    positively, so a blank answer there is a settled (if empty) answer and
+    keeps its footer.
+    """
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        _add_session(conn, "explicit_empty", api_calls=1)
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("ee_u1", "explicit_empty", "user", "quiet ok?", 1000.0, None),
+                ("ee_a1", "explicit_empty", "assistant", "", 1003.0, "[]"),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    msgs = _read_real_transcript(db, "explicit_empty")
+    assert msgs[1].get("tool_calls") == [], "reader should parse the empty list"
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "explicit_empty")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    assert stamped[1]["_usedModel"] == "x-ai/grok-4.5"
+    assert stamped[1]["_turnDuration"] == 3.0
+
+
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
 def test_plain_answer_control_keeps_its_footer(tmp_path, tool_calls_column):
     """Control: hardening ownership must not cost ordinary turns their footer."""
     db = tmp_path / "state.db"

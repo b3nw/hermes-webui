@@ -1430,22 +1430,30 @@ def _settled_assistant_indices(msgs: list) -> list[int]:
     per turn, and the frontend contract that settled metadata belongs on the last
     metadata-bearing assistant row of a multi-segment tool turn.
 
-    Two shapes yield no settled row for the turn, so nothing is stamped:
+    Three shapes yield no settled row for the turn, so nothing is stamped:
 
     * the last assistant carries explicit ``tool_calls`` — it is a request, not
       an answer;
     * a ``tool`` row follows the last assistant — the turn was aborted or is
-      still running, and its elapsed time is not yet meaningful.
+      still running, and its elapsed time is not yet meaningful;
+    * the last assistant is blank AND its tool metadata is unreliable — the
+      ``tool_calls`` key absent (legacy schema) or NULL (migrated schema). An
+      empty terminal row is then indistinguishable from an incomplete or
+      aborted tool segment, so this fails closed rather than stamping it. An
+      explicitly parsed empty ``tool_calls`` list is reliable "requested no
+      tools" metadata and does not trip this refusal.
 
     Failing closed on those is deliberate: a premature footer asserts a duration
     and a model for a turn that never finished.
 
     Known residual, only on the metadata-less shapes: a turn whose LAST assistant
-    requested a tool and was then interrupted by the user's next message — no tool
-    row ever recorded — is indistinguishable from an answer by structure alone,
-    and is stamped. With ``tool_calls`` populated (every current Agent write) the
-    explicit check above rejects it, so this is confined to legacy/migrated rows
-    where the metadata was never recorded in the first place.
+    requested a tool, narrated the request, and was then interrupted by the
+    user's next message — no tool row ever recorded — is indistinguishable from
+    an answer by structure alone, and is stamped. With ``tool_calls`` populated
+    (every current Agent write) the explicit check above rejects it, and the
+    blank refusal above removes the silent variant, so this is confined to
+    narrated legacy/migrated rows where the metadata was never recorded in the
+    first place.
     """
     if not isinstance(msgs, list):
         return []
@@ -1479,7 +1487,19 @@ def _settled_assistant_indices(msgs: list) -> list[int]:
             continue
         if tool_follows_last_assistant:
             continue
-        if msgs[last_assistant].get('tool_calls'):
+        candidate = msgs[last_assistant]
+        if candidate.get('tool_calls'):
+            continue
+        # Fail closed on a blank terminal row whose tool metadata cannot be
+        # trusted: with no tool_calls key (legacy schema) or a NULL one
+        # (migrated schema), an empty answer is indistinguishable from an
+        # incomplete/aborted tool segment that never recorded its tool row.
+        # ``.get()`` returning None covers both unreliable shapes; an explicitly
+        # parsed empty list IS reliable "no tools" metadata and is not refused.
+        if (
+            candidate.get('tool_calls') is None
+            and not str(candidate.get('content') or '').strip()
+        ):
             continue
         settled.append(last_assistant)
     return settled
