@@ -9168,6 +9168,29 @@ def _session_source_is_webui(session: dict) -> bool:
     return False
 
 
+def _footer_gate_source_markers(candidate) -> set[str]:
+    """Normalized source markers from one metadata authority.
+
+    Deliberately the SAME key set the canonical ``is_cli_session_row()``
+    classifier reads, ``source_label`` included, and normalized through
+    ``_normalized_source_marker`` so ``"WebUI"`` and ``"WebUI Session"`` both
+    reduce to ``webui``. Accepts either a sidecar/Session object or a state.db
+    metadata dict.
+    """
+    if candidate is None:
+        return set()
+    markers = set()
+    for key in ("source_tag", "raw_source", "session_source", "source", "source_label"):
+        value = (
+            candidate.get(key) if isinstance(candidate, dict)
+            else getattr(candidate, key, None)
+        )
+        marker = _normalized_source_marker(value)
+        if marker:
+            markers.add(marker)
+    return markers
+
+
 def _session_ran_outside_webui(session, cli_meta) -> bool:
     """Return True when this session's turns were executed by another surface.
 
@@ -9175,28 +9198,30 @@ def _session_ran_outside_webui(session, cli_meta) -> bool:
     same one ``_session_requires_cli_metadata_lookup`` already answers for
     metadata — an imported/foreign row carries source markers, a WebUI-native
     session carries none — so reuse it rather than invent a second notion of
-    foreign. ``_session_source_is_webui`` then subtracts the one case that gate
-    admits but must not be stamped: a WebUI-origin session later touched through
-    another surface (Gateway API server) has a state.db row and source markers,
-    yet the WebUI ran its turns and already stamped their footers itself.
+    foreign. The veto below then subtracts the case that gate admits but must not
+    be stamped: a WebUI-origin session later touched through another surface
+    (Gateway API server) has a state.db row and source markers, yet the WebUI ran
+    its turns and already stamped their footers itself.
 
-    Both arguments are consulted because neither alone is authoritative — a
+    The veto reads the FULL marker set rather than ``_session_source_is_webui``,
+    which omits ``source_label``. ``_session_requires_cli_metadata_lookup``
+    accepts ``source_label`` as a source marker and ``is_cli_session_row``
+    accepts ``source_label == "webui"`` as native authority, so a narrower veto
+    lets a native row whose only surviving native marker is
+    ``source_label="WebUI"`` through the gate — and same-ID session totals then
+    get stamped onto a WebUI transcript as false model/duration/token
+    attribution. ``_session_source_is_webui`` itself is left alone: five other
+    callers depend on its current semantics.
+
+    Both authorities are consulted because neither alone is authoritative — a
     legacy sidecar can predate the source fields while the state.db row has them,
     and a synthesized session has them before any sidecar exists. A ``webui``
-    marker on EITHER wins: they are checked separately rather than merged, so a
-    foreign marker on one cannot mask a ``webui`` marker on the other.
+    marker on EITHER denies backfill, checked per-authority rather than on a
+    merged set, so a foreign marker on one cannot mask a ``webui`` marker on the
+    other.
     """
     for candidate in (session, cli_meta):
-        if candidate is None:
-            continue
-        markers = {
-            key: (
-                candidate.get(key) if isinstance(candidate, dict)
-                else getattr(candidate, key, None)
-            )
-            for key in ("source_tag", "raw_source", "session_source", "source")
-        }
-        if _session_source_is_webui(markers):
+        if "webui" in _footer_gate_source_markers(candidate):
             return False
     return bool(
         _session_requires_cli_metadata_lookup(session)

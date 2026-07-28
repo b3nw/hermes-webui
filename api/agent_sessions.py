@@ -1289,12 +1289,10 @@ def read_agent_session_turn_footer_stats(
                 )
                 count_row = cur.fetchone()
                 own_count = int((count_row['c'] if count_row else 0) or 0)
-            has_tool_calls_col = 'tool_calls' in message_cols
     except Exception:
         return {}
 
     return {
-        'tool_calls_column_present': has_tool_calls_col,
         'model': str(stats.get('model') or '').strip(),
         'input_tokens': _as_positive_int(stats.get('input_tokens')),
         'output_tokens': _as_positive_int(stats.get('output_tokens')),
@@ -1321,19 +1319,13 @@ def stamp_imported_turn_footers(msgs: list, stats: dict, *, detach: bool = False
       these sessions, so there is no way to split totals across turns; showing
       session-wide figures inside a per-turn footer would misattribute them.
 
-    Only *settled* assistant rows are stamped — an assistant row carrying
-    ``tool_calls`` is an intermediate segment of a still-running turn, not its
-    answer. `get_state_db_session_messages` preserves `tool_calls` for imported
-    transcripts, so a tool-using turn arrives as
-    ``user -> assistant(tool_calls) -> tool -> assistant``; stamping both
+    Only *settled* assistant rows are stamped — the row that is a turn's answer,
+    not one of the tool-call segments leading up to it. A tool-using turn arrives
+    as ``user -> assistant(tool_calls) -> tool -> assistant``, and stamping both
     assistant rows would put a premature elapsed time on the tool-call segment
-    and render two footers for one turn. This matches the in-process path, which
-    walks ``reversed(s.messages)`` and stamps exactly one assistant per turn, and
-    the frontend contract that settled metadata belongs on the last
-    metadata-bearing assistant row of a multi-segment turn. On a legacy schema
-    with no ``tool_calls`` column that key is absent from every row and cannot
-    discriminate; ``_is_settled_assistant`` degrades to a content check there
-    rather than admitting both rows.
+    and render two footers for one turn. ``_settled_assistant_indices`` decides
+    this from transcript structure rather than from the ``tool_calls`` key, which
+    is absent on a legacy schema and NULL on a migrated one; see its docstring.
 
     ``msgs`` must be the FULL visible segment for the session, not a paginated
     slice of it: the ownership guard below compares transcript length against the
@@ -1368,11 +1360,7 @@ def stamp_imported_turn_footers(msgs: list, stats: dict, *, detach: bool = False
     if not isinstance(own_count, int) or own_count != len(msgs):
         return msgs
 
-    has_tool_calls_col = bool(stats.get('tool_calls_column_present'))
-    assistant_idxs = [
-        i for i, m in enumerate(msgs)
-        if _is_settled_assistant(m, tool_calls_column_present=has_tool_calls_col)
-    ]
+    assistant_idxs = _settled_assistant_indices(msgs)
     if not assistant_idxs:
         return msgs
 
@@ -1421,36 +1409,80 @@ def stamp_imported_turn_footers(msgs: list, stats: dict, *, detach: bool = False
     return out
 
 
-def _is_settled_assistant(message, *, tool_calls_column_present: bool = False) -> bool:
-    """Return True for an assistant row that is a turn's answer, not a tool call.
+def _settled_assistant_indices(msgs: list) -> list[int]:
+    """Indices of the assistant rows that are their turn's final answer.
 
-    An assistant row with ``tool_calls`` is an intermediate segment: the turn is
-    still running and its elapsed time is not yet meaningful.
+    Derived from transcript STRUCTURE rather than from schema column presence or
+    content truthiness, because neither of those is a reliable discriminator:
 
-    That key is the discriminator only when the ``messages`` table HAS a
-    ``tool_calls`` column. Without it ``get_state_db_session_messages`` omits the
-    key from every row, so a tool-call segment is byte-identical to an answer by
-    key presence and the check silently admits both — putting a premature elapsed
-    time on the segment and rendering two footers for one turn, exactly the
-    ownership bug this predicate exists to prevent.
+    * A ``tool_calls`` column may be missing entirely on a legacy database, in
+      which case ``get_state_db_session_messages`` omits the key from every row.
+    * Agent startup back-fills missing message columns, so a migrated database
+      can have the column PRESENT but NULL on all historical rows — which looks
+      identical to "this assistant requested no tools".
+    * Content is not a discriminator either: real CLI transcripts record narrated
+      tool-call assistants with non-empty content ("Let me search") ahead of the
+      tool row, so a nonblank assistant is not necessarily an answer.
 
-    On such a schema fall back to the one signal that survives: the agent writes
-    tool-call segments with empty content and answers with content. A
-    blank-content assistant row is then refused rather than guessed at, which
-    also covers a turn aborted before its tool results were recorded. Defaults to
-    the strict fallback so a caller that did not get the flag from
-    ``read_agent_session_turn_footer_stats`` cannot accidentally opt into the
-    stronger claim.
+    The structure survives all three. Turns are delimited by ``user`` rows, and
+    within a turn the answer is the LAST assistant row — matching the in-process
+    path, which walks ``reversed(s.messages)`` and stamps exactly one assistant
+    per turn, and the frontend contract that settled metadata belongs on the last
+    metadata-bearing assistant row of a multi-segment tool turn.
+
+    Two shapes yield no settled row for the turn, so nothing is stamped:
+
+    * the last assistant carries explicit ``tool_calls`` — it is a request, not
+      an answer;
+    * a ``tool`` row follows the last assistant — the turn was aborted or is
+      still running, and its elapsed time is not yet meaningful.
+
+    Failing closed on those is deliberate: a premature footer asserts a duration
+    and a model for a turn that never finished.
+
+    Known residual, only on the metadata-less shapes: a turn whose LAST assistant
+    requested a tool and was then interrupted by the user's next message — no tool
+    row ever recorded — is indistinguishable from an answer by structure alone,
+    and is stamped. With ``tool_calls`` populated (every current Agent write) the
+    explicit check above rejects it, so this is confined to legacy/migrated rows
+    where the metadata was never recorded in the first place.
     """
-    if not isinstance(message, dict):
-        return False
-    if _safe_lower(message.get('role')) != 'assistant':
-        return False
-    if message.get('tool_calls'):
-        return False
-    if not tool_calls_column_present:
-        return bool(str(message.get('content') or '').strip())
-    return True
+    if not isinstance(msgs, list):
+        return []
+
+    total = len(msgs)
+    turn_starts = [
+        i for i, m in enumerate(msgs)
+        if isinstance(m, dict) and _safe_lower(m.get('role')) == 'user'
+    ]
+    # A transcript can open with assistant/system rows before any user row (a
+    # replayed or seeded segment); treat that leading run as its own turn.
+    if not turn_starts or turn_starts[0] != 0:
+        turn_starts.insert(0, 0)
+
+    settled: list[int] = []
+    for position, start in enumerate(turn_starts):
+        end = turn_starts[position + 1] if position + 1 < len(turn_starts) else total
+        last_assistant = None
+        tool_follows_last_assistant = False
+        for i in range(start, end):
+            message = msgs[i]
+            if not isinstance(message, dict):
+                continue
+            role = _safe_lower(message.get('role'))
+            if role == 'assistant':
+                last_assistant = i
+                tool_follows_last_assistant = False
+            elif role == 'tool' and last_assistant is not None:
+                tool_follows_last_assistant = True
+        if last_assistant is None:
+            continue
+        if tool_follows_last_assistant:
+            continue
+        if msgs[last_assistant].get('tool_calls'):
+            continue
+        settled.append(last_assistant)
+    return settled
 
 
 def _turn_duration_from_preceding_user(msgs: list, assistant_idx: int) -> float | None:

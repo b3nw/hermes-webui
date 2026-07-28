@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
 
+import pytest
+
 import api.agent_sessions as agent_sessions
 
 
@@ -515,7 +517,7 @@ class _NativeWebuiSidecar(_ImportedSidecar):
         self.platform = None
 
 
-def _get_api_session(db, sid, *, session, cli_meta, query="", synth=None):
+def _get_api_session(db, sid, *, session, cli_meta, query="", synth=None, spy_stats=False):
     """Drive GET /api/session against a purpose-built state.db.
 
     The real ``get_state_db_session_messages`` reads the transcript so the
@@ -550,10 +552,24 @@ def _get_api_session(db, sid, *, session, cli_meta, query="", synth=None):
         stack.append(
             patch.object(routes, "_claim_or_synthesize_cli_session", return_value=(synth, "")),
         )
+    stats_reads = []
+    if spy_stats:
+        real_reader = routes.read_agent_session_turn_footer_stats
+
+        def _spy_reader(*args, **kwargs):
+            stats_reads.append(args[:2])
+            return real_reader(*args, **kwargs)
+
+        stack.append(
+            patch.object(
+                routes, "read_agent_session_turn_footer_stats", side_effect=_spy_reader
+            )
+        )
     with ExitStack() as es:
         for cm in stack:
             es.enter_context(cm)
         routes.handle_get(SimpleNamespace(), parsed)
+    captured["stats_reads"] = stats_reads
     return captured
 
 
@@ -776,19 +792,25 @@ def test_webui_origin_session_touched_by_another_surface_is_left_alone(tmp_path)
     )
 
 
+
+
 # --------------------------------------------------------------------------
-# Legacy schema with no tool_calls column
+# Turn ownership across schema shapes: absent, migrated-NULL, and populated
+# tool_calls metadata
 # --------------------------------------------------------------------------
 
 
-def _make_legacy_state_db(path):
-    """A ``messages`` table predating the ``tool_calls`` column.
+def _make_state_db_with_shape(path, *, tool_calls_column: bool):
+    """Build a state.db with or without the ``messages.tool_calls`` column.
 
-    ``get_state_db_session_messages`` only emits optional keys for columns that
-    exist, so on this schema NO row carries ``tool_calls`` — and the settled
-    check cannot use its absence to mean "this is an answer".
+    ``tool_calls_column=False`` is a legacy database predating the column.
+    ``True`` with NULL values is the *migrated* shape: Agent startup back-fills
+    missing message columns, so the column exists on an upgraded database while
+    every historical row leaves it NULL. Neither shape can be told apart from
+    "this assistant requested no tools" by looking at the key.
     """
     conn = sqlite3.connect(str(path))
+    tool_calls_ddl = "            tool_calls TEXT,\n" if tool_calls_column else ""
     conn.executescript(
         """
         CREATE TABLE sessions (
@@ -807,89 +829,292 @@ def _make_legacy_state_db(path):
             session_id TEXT,
             role TEXT,
             content TEXT,
-            timestamp REAL
+"""
+        + tool_calls_ddl
+        + """            timestamp REAL
         );
         """
     )
     return conn
 
 
-def test_legacy_schema_without_tool_calls_still_stamps_one_footer_per_turn(tmp_path):
-    """The round-one ownership fix must not be defeated by an older schema.
-
-    With no ``tool_calls`` column the discriminator is absent from every row, so
-    a key-presence check admits the intermediate segment as well and puts a
-    premature 2.0s elapsed time on it alongside a second footer for the same
-    turn. Only the final answer may be stamped.
-    """
+def _read_real_transcript(db, sid):
+    """Read through the production reader so the fixture cannot drift from it."""
     import api.models as models
 
-    db = tmp_path / "state.db"
-    conn = _make_legacy_state_db(db)
+    with patch.object(models, "_active_state_db_path", return_value=db):
+        return models.get_state_db_session_messages(sid)
+
+
+def _seed_shape(db, sid, rows, *, api_calls=2, tool_calls_column):
+    conn = _make_state_db_with_shape(db, tool_calls_column=tool_calls_column)
     try:
         conn.execute(
-            "INSERT INTO sessions VALUES ('legacy_tools', 'cli', 'openai/gpt-5', "
-            "100, 10, 0, 0, 0.001, 2)"
+            "INSERT INTO sessions VALUES (?, 'cli', 'openai/gpt-5', 100, 10, 0, 0, 0.001, ?)",
+            (sid, api_calls),
         )
         conn.executemany(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            [
-                ("legacy_tools", "user", "do the thing", 1000.0),
-                # Tool-call segment: the agent writes these with empty content.
-                ("legacy_tools", "assistant", "", 1002.0),
-                ("legacy_tools", "tool", "tool output", 1003.0),
-                ("legacy_tools", "assistant", "done", 1008.5),
-            ],
+            [(sid, role, content, ts) for role, content, ts in rows],
         )
         conn.commit()
     finally:
         conn.close()
 
-    with patch.object(models, "_active_state_db_path", return_value=db):
-        msgs = models.get_state_db_session_messages("legacy_tools")
 
-    assert all("tool_calls" not in m for m in msgs), (
-        "fixture must reproduce the schema where the discriminator is absent"
+# Both production shapes the review named. Neither leaves a usable tool_calls
+# value on the rows, so the settled-assistant decision cannot come from the key.
+_AMBIGUOUS_SHAPES = [
+    pytest.param(False, id="column-physically-absent"),
+    pytest.param(True, id="column-present-but-null"),
+]
+
+
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+def test_narrated_tool_segment_is_not_mistaken_for_the_answer(tmp_path, tool_calls_column):
+    """A tool-call assistant can carry real prose, so content is not a discriminator.
+
+    Real CLI transcripts record narrated tool-call assistants — "Let me search" —
+    ahead of the tool row. Treating any nonblank assistant as settled hands the
+    intermediate segment a premature 2.0s duration and renders two footers for
+    one turn. Only the final answer may be stamped, with the full
+    user-to-completion duration.
+    """
+    db = tmp_path / "state.db"
+    _seed_shape(
+        db,
+        "narrated",
+        [
+            ("user", "find the config", 1000.0),
+            ("assistant", "Let me search", 1002.0),
+            ("tool", "3 matches", 1003.0),
+            ("assistant", "It lives in config.json", 1008.5),
+        ],
+        tool_calls_column=tool_calls_column,
     )
-    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "legacy_tools")
-    assert stats["tool_calls_column_present"] is False
+
+    msgs = _read_real_transcript(db, "narrated")
+    assert all(not m.get("tool_calls") for m in msgs), (
+        "fixture must reproduce a shape where tool_calls cannot discriminate"
+    )
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "narrated")
     stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
 
-    intermediate, final = stamped[1], stamped[3]
-    assert "_usedModel" not in intermediate, "tool-call segment was stamped"
-    assert "_turnDuration" not in intermediate, "tool-call segment got a premature 2.0s"
+    narrated, final = stamped[1], stamped[3]
+    assert "_usedModel" not in narrated, "narrated tool segment was stamped"
+    assert "_turnDuration" not in narrated, "narrated tool segment got a premature 2.0s"
+    assert "_turnUsage" not in narrated
     assert final["_usedModel"] == "openai/gpt-5"
     assert final["_turnDuration"] == 8.5
 
 
-def test_legacy_schema_plain_turn_keeps_its_footer(tmp_path):
-    """Degrading the discriminator must not cost every legacy session its footer."""
-    import api.models as models
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+@pytest.mark.parametrize(
+    "narration", ["Let me search", ""], ids=["narrated", "blank"]
+)
+def test_aborted_turn_with_no_final_answer_stamps_nothing(
+    tmp_path, tool_calls_column, narration
+):
+    """Tool work outstanding and no answer recorded: fail closed.
 
+    A footer here would assert a duration and a model for a turn that never
+    finished. Covers both the narrated and the blank intermediate, since neither
+    content shape tells you an answer arrived.
+    """
     db = tmp_path / "state.db"
-    conn = _make_legacy_state_db(db)
+    _seed_shape(
+        db,
+        "aborted",
+        [
+            ("user", "find the config", 1000.0),
+            ("assistant", narration, 1002.0),
+            ("tool", "3 matches", 1003.0),
+        ],
+        tool_calls_column=tool_calls_column,
+    )
+
+    msgs = _read_real_transcript(db, "aborted")
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "aborted")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    assert all("_usedModel" not in m for m in stamped), (
+        "an unfinished turn was given a footer"
+    )
+    assert all("_turnDuration" not in m for m in stamped)
+    assert all("_turnUsage" not in m for m in stamped)
+
+
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+def test_plain_answer_control_keeps_its_footer(tmp_path, tool_calls_column):
+    """Control: hardening ownership must not cost ordinary turns their footer."""
+    db = tmp_path / "state.db"
+    _seed_shape(
+        db,
+        "plain",
+        [
+            ("user", "hello", 1000.0),
+            ("assistant", "hi there", 1003.0),
+        ],
+        api_calls=1,
+        tool_calls_column=tool_calls_column,
+    )
+
+    msgs = _read_real_transcript(db, "plain")
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "plain")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    assert stamped[-1]["_usedModel"] == "openai/gpt-5"
+    assert stamped[-1]["_turnDuration"] == 3.0
+    assert stamped[-1]["_turnUsage"]["output_tokens"] == 10
+
+
+@pytest.mark.parametrize("tool_calls_column", _AMBIGUOUS_SHAPES)
+def test_multi_round_tool_turn_stamps_only_the_last_answer(tmp_path, tool_calls_column):
+    """Several tool rounds inside one turn still yield exactly one footer."""
+    db = tmp_path / "state.db"
+    _seed_shape(
+        db,
+        "rounds",
+        [
+            ("user", "do it", 1000.0),
+            ("assistant", "Let me look", 1001.0),
+            ("tool", "partial", 1002.0),
+            ("assistant", "Now let me check the other file", 1003.0),
+            ("tool", "more", 1004.0),
+            ("assistant", "All set", 1009.0),
+        ],
+        tool_calls_column=tool_calls_column,
+    )
+
+    msgs = _read_real_transcript(db, "rounds")
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "rounds")
+    stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
+
+    stamped_idxs = [i for i, m in enumerate(stamped) if "_usedModel" in m]
+    assert stamped_idxs == [5], "exactly one footer belongs to a multi-round turn"
+    assert stamped[5]["_turnDuration"] == 9.0
+
+
+def test_populated_tool_calls_metadata_is_still_honoured(tmp_path):
+    """The explicit signal must keep working where the schema does supply it.
+
+    Structural inference is the fallback, not a replacement: an assistant that
+    declares tool_calls is intermediate even if nothing follows it yet.
+    """
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
     try:
-        conn.execute(
-            "INSERT INTO sessions VALUES ('legacy_plain', 'cli', 'openai/gpt-5', "
-            "512, 64, 0, 0, 0.002, 1)"
-        )
+        _add_session(conn, "explicit", api_calls=2)
         conn.executemany(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            "INSERT INTO messages (id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             [
-                ("legacy_plain", "user", "hello", 1000.0),
-                ("legacy_plain", "assistant", "hi there", 1003.0),
+                ("e_u1", "explicit", "user", "do it", 1000.0, None),
+                ("e_a1", "explicit", "assistant", "Let me search", 1002.0,
+                 '[{"id": "c1", "function": {"name": "grep"}}]'),
             ],
         )
         conn.commit()
     finally:
         conn.close()
 
-    with patch.object(models, "_active_state_db_path", return_value=db):
-        msgs = models.get_state_db_session_messages("legacy_plain")
-
-    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "legacy_plain")
+    msgs = _read_real_transcript(db, "explicit")
+    assert msgs[1].get("tool_calls"), "reader should have parsed the tool_calls column"
+    stats = agent_sessions.read_agent_session_turn_footer_stats(db, "explicit")
     stamped = agent_sessions.stamp_imported_turn_footers(msgs, stats, detach=True)
 
-    assert stamped[-1]["_usedModel"] == "openai/gpt-5"
-    assert stamped[-1]["_turnDuration"] == 3.0
-    assert stamped[-1]["_turnUsage"]["output_tokens"] == 64
+    assert all("_usedModel" not in m for m in stamped), (
+        "an assistant declaring tool_calls is a request, not an answer"
+    )
+
+
+@pytest.mark.parametrize("native_on", ["sidecar", "state_metadata"])
+def test_source_label_webui_alone_denies_backfill(tmp_path, native_on):
+    """``source_label="WebUI"`` is a native marker and must veto the backfill.
+
+    ``_session_requires_cli_metadata_lookup`` accepts ``source_label`` as a source
+    marker, and the canonical ``is_cli_session_row`` accepts
+    ``source_label == "webui"`` as native authority — but the narrower
+    ``_session_source_is_webui`` does not read that key at all. A native row whose
+    only surviving native marker is ``source_label`` therefore passed the foreign
+    gate, and same-ID session totals got stamped onto a WebUI transcript as false
+    model/duration/token attribution.
+
+    Parametrized over which authority carries the native marker, with the other
+    deliberately carrying a foreign one, so the veto is proven per-authority
+    rather than on a merged marker set.
+    """
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        _add_session(conn, "label_native", model="should-not-appear", api_calls=1)
+        _add_turn(conn, "label_native", 1, user_ts=1000.0, assistant_ts=1004.0)
+    finally:
+        conn.close()
+
+    mirror = [
+        {"role": "user", "content": "x", "timestamp": 1000.0},
+        {"role": "assistant", "content": "x", "timestamp": 1004.0},
+    ]
+    sidecar = _ImportedSidecar("label_native")
+    sidecar.messages = mirror
+    # Strip the markers the narrow veto would have caught, leaving source_label
+    # as the only native signal on whichever authority is under test.
+    sidecar.source_tag = None
+    sidecar.raw_source = None
+    sidecar.session_source = None
+    sidecar.source = None
+
+    if native_on == "sidecar":
+        sidecar.source_label = "WebUI"
+        cli_meta = {"session_id": "label_native", "source_tag": "cli", "raw_source": "cli"}
+    else:
+        sidecar.source_label = None
+        sidecar.is_cli_session = True  # foreign marker on the sidecar authority
+        cli_meta = {"session_id": "label_native", "source_label": "WebUI"}
+
+    captured = _get_api_session(
+        db, "label_native", session=sidecar, cli_meta=cli_meta, spy_stats=True
+    )
+
+    msgs = captured["data"]["session"]["messages"]
+    assert len(msgs) == 2, "the length guard must not be what blocks this case"
+    assert captured["stats_reads"] == [], (
+        "a WebUI marker must deny backfill BEFORE the state.db stats read"
+    )
+    assert all("_usedModel" not in m for m in msgs), (
+        "session totals were stamped onto a WebUI-native transcript"
+    )
+    assert all("_turnUsage" not in m for m in msgs)
+
+
+def test_source_label_foreign_value_still_allows_backfill(tmp_path):
+    """Control: widening the veto to source_label must not deny genuine imports."""
+    db = tmp_path / "state.db"
+    conn = _make_state_db(db)
+    try:
+        _add_session(conn, "label_cli", model="openai/gpt-5", api_calls=1)
+        _add_turn(conn, "label_cli", 1, user_ts=1000.0, assistant_ts=1005.5)
+    finally:
+        conn.close()
+
+    sidecar = _ImportedSidecar("label_cli")
+    sidecar.source_tag = None
+    sidecar.raw_source = None
+    sidecar.session_source = None
+    sidecar.source = None
+    sidecar.source_label = "CLI"
+
+    captured = _get_api_session(
+        db,
+        "label_cli",
+        session=sidecar,
+        cli_meta={"session_id": "label_cli", "source_label": "CLI"},
+        spy_stats=True,
+    )
+
+    msgs = captured["data"]["session"]["messages"]
+    assistant = [m for m in msgs if m.get("role") == "assistant"][-1]
+    assert captured["stats_reads"], "a genuine import should still read stats"
+    assert assistant["_usedModel"] == "openai/gpt-5"
+    assert assistant["_turnDuration"] == 5.5
