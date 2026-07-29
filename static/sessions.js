@@ -8106,18 +8106,17 @@ function renderSessionListFromCache(){
     }
     const childCount=typeof s._child_session_count==='number'?s._child_session_count:(Array.isArray(s._child_sessions)?s._child_sessions.length:0);
     if(childCount>0){
-      const childCountEl=document.createElement('span');
-      childCountEl.className='session-child-count';
+      const childCountEl=document.createElement('button');
+      childCountEl.type='button';
+      childCountEl.className='session-child-disclosure';
       const childLabel=t('session_meta_children', childCount);
-      childCountEl.textContent=childLabel;
+      const childCountVisual=document.createElement('span');
+      childCountVisual.className='session-child-count';
+      childCountVisual.textContent=childLabel;
+      childCountEl.appendChild(childCountVisual);
       childCountEl.title=_sessionChildBadgeTooltip(childLabel);
-      // This disclosure is the ONLY route to a nested child row, so it must carry
-      // complete button semantics — same contract as the lineage disclosure just
-      // above. Without them keyboard users cannot reveal delegated children at
-      // all (#6510 gate finding).
       const childKey=_sidebarLineageKeyForRow(s);
-      childCountEl.setAttribute('role','button');
-      childCountEl.setAttribute('tabindex','0');
+      childCountEl.dataset.childKey=String(childKey||'');
       childCountEl.setAttribute('aria-expanded',_expandedChildSessionKeys.has(childKey)?'true':'false');
       ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
       const toggleChildSessions=(e)=>{
@@ -8126,11 +8125,16 @@ function renderSessionListFromCache(){
         if(_expandedChildSessionKeys.has(childKey)) _expandedChildSessionKeys.delete(childKey);
         else _expandedChildSessionKeys.add(childKey);
         renderSessionListFromCache();
+        const controls=document.querySelectorAll('.session-child-disclosure');
+        for(const control of controls){
+          if(control.dataset.childKey===String(childKey||'')){
+            control.focus({preventScroll:true});
+            break;
+          }
+        }
       };
       childCountEl.onclick=toggleChildSessions;
-      childCountEl.onkeydown=(e)=>{
-        if(e.key==='Enter'||e.key===' '){toggleChildSessions(e);}
-      };
+      sessionText.classList.add('has-child-disclosure');
       titleRow.appendChild(childCountEl);
     }
     if(s.is_cli_session||_isMessagingSession(s)){

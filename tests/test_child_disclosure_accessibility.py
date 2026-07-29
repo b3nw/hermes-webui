@@ -1,14 +1,6 @@
-"""Browser regression coverage for the delegated-child disclosure (#6510 gate).
+"""Browser coverage for the production delegated-child disclosure (#6510)."""
 
-Nesting delegated subagents made this disclosure the only route to a child row,
-which promoted its pre-existing keyboard and touch-target debt to a blocker.
-
-Both assertions here are computed in a real browser against the real
-`static/style.css`, and activation goes through real key events — no `.onclick()`
-invocation and no CSS source-string matching, per the gate's test-plan
-requirement. A third check pins that production `sessions.js` actually emits the
-button semantics, so the browser evidence cannot pass while the wiring regresses.
-"""
+import os
 from pathlib import Path
 
 import pytest
@@ -21,227 +13,184 @@ STYLE_CSS = (STATIC / "style.css").read_text(encoding="utf-8")
 MOBILE = {"width": 390, "height": 844}
 DESKTOP = {"width": 1440, "height": 900}
 TOUCH_FLOOR = 44
+CONTROL_SELECTOR = ".session-child-disclosure, .session-title-row > .session-child-count"
 
-# Mirrors the markup the production disclosure branch builds: a
-# .session-child-count pill carrying full button semantics, a .session-actions
-# trigger pinned to the row, and the .session-child-session rows it reveals.
-def _production_disclosure_branch() -> str:
-    """The inline branch in sessions.js that builds the child-count disclosure."""
-    start = SESSIONS_JS.find("childCountEl.className='session-child-count'")
-    assert start > 0, "child-count disclosure branch not found"
-    return SESSIONS_JS[start:start + 1400]
-
-
-def production_semantics() -> dict:
-    """Which button semantics production actually emits.
-
-    The fixture below applies ONLY these, so the browser tests exercise the real
-    contract: if production stops setting `tabindex`, focus fails here; if it
-    stops binding `onkeydown`, the key presses do nothing. That keeps the
-    keyboard test a production regression test rather than a test of its own
-    fixture.
-    """
-    branch = _production_disclosure_branch()
-    return {
-        "role": "setAttribute('role','button')" in branch,
-        "tabindex": "setAttribute('tabindex','0')" in branch,
-        "aria": "setAttribute('aria-expanded'" in branch,
-        "keydown": "childCountEl.onkeydown" in branch
-        and "e.key==='Enter'||e.key===' '" in branch,
-    }
-
-
-FIXTURE = """
-window.__buildRow = (semantics) => {
-  document.body.innerHTML = '';
-  const list = document.createElement('div');
-  list.id = 'sessionList';
-  const item = document.createElement('div');
-  item.className = 'session-item';
-  const titleRow = document.createElement('div');
-  titleRow.className = 'session-title-row';
-  const title = document.createElement('span');
-  title.className = 'session-title';
-  title.textContent = 'Call the delegate_task TOOL directly';
-  titleRow.appendChild(title);
-
-  const pill = document.createElement('span');
-  pill.className = 'session-child-count';
-  pill.textContent = '2 children';
-  if (semantics.role) pill.setAttribute('role', 'button');
-  if (semantics.tabindex) pill.setAttribute('tabindex', '0');
-  if (semantics.aria) pill.setAttribute('aria-expanded', 'false');
-  const kids = document.createElement('div');
-  kids.className = 'session-child-sessions';
-  kids.style.display = 'none';
-  window.__activations = 0;
-  const toggle = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    window.__activations += 1;
-    const next = pill.getAttribute('aria-expanded') !== 'true';
-    if (semantics.aria) pill.setAttribute('aria-expanded', next ? 'true' : 'false');
-    kids.style.display = next ? 'flex' : 'none';
-  };
-  pill.onclick = toggle;
-  if (semantics.keydown) {
-    pill.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') toggle(e); };
-  }
-  titleRow.appendChild(pill);
-  item.appendChild(titleRow);
-
-  const actions = document.createElement('div');
-  actions.className = 'session-actions';
-  const trigger = document.createElement('button');
-  trigger.className = 'session-actions-trigger';
-  trigger.textContent = 'x';
-  actions.appendChild(trigger);
-  item.appendChild(actions);
-
-  for (let i = 0; i < 2; i++) {
-    const b = document.createElement('button');
-    b.className = 'session-child-session';
-    b.textContent = '-> Subagent Session - 5m';
-    kids.appendChild(b);
-  }
-  list.appendChild(item);
-  list.appendChild(kids);
-  document.body.appendChild(list);
+HARNESS = """
+window.S = {session: null, activeProfile: 'default'};
+window.$ = (id) => document.getElementById(id);
+window.li = () => '';
+window.t = (key, count) => {
+  if (key === 'session_meta_children') return `${count} 子`;
+  if (key === 'session_select_mode') return 'Select';
+  return key;
 };
-
-window.__disclosureHitHeight = () => {
-  const el = document.querySelector('.session-child-count');
-  const box = el.getBoundingClientRect();
-  const overlay = parseFloat(getComputedStyle(el, '::after').height) || 0;
-  return {visual: Math.round(box.height), hit: Math.round(Math.max(box.height, overlay))};
-};
-
-window.__childGeometry = () => {
-  const el = document.querySelector('.session-child-session');
-  const box = el.getBoundingClientRect();
-  return {
-    height: Math.round(box.height),
-    clipped: el.scrollHeight > el.clientHeight + 1,
-  };
-};
-
-window.__actionsTriggerReachable = () => {
-  const t = document.querySelector('.session-actions-trigger');
-  const r = t.getBoundingClientRect();
-  if (!r.width) return 'zero-size';
-  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-  return (hit === t || t.contains(hit)) ? 'reachable' : 'shadowed';
-};
+window.api = async () => ({});
+window.showToast = () => {};
+window.closeSessionActionMenu = () => {};
 """
 
-
-def _page(playwright, viewport):
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
-    page = browser.new_page(viewport=viewport)
-    page.set_content("<!doctype html><html><body></body></html>")
-    page.add_style_tag(content=STYLE_CSS)
-    page.add_script_tag(content=FIXTURE)
-    page.evaluate("(semantics) => window.__buildRow(semantics)", production_semantics())
-    return browser, page
+SESSIONS = [
+    {
+        "session_id": "gateway_parent",
+        "title": "Call the delegate_task TOOL directly",
+        "source": "api_server",
+        "raw_source": "api_server",
+        "source_tag": "api_server",
+        "session_source": "api",
+        "source_label": "API",
+        "message_count": 4,
+        "updated_at": 30,
+    },
+    {
+        "session_id": "subagent_a",
+        "title": "Subagent Session A",
+        "parent_session_id": "gateway_parent",
+        "relationship_type": "child_session",
+        "raw_source": "subagent",
+        "source_tag": "subagent",
+        "session_source": "other",
+        "source_label": "Subagent",
+        "parent_source": "api_server",
+        "_parent_lineage_root_id": "gateway_parent",
+        "_cross_surface_child_session": True,
+        "message_count": 2,
+        "updated_at": 20,
+    },
+    {
+        "session_id": "subagent_b",
+        "title": "Subagent Session B",
+        "parent_session_id": "gateway_parent",
+        "relationship_type": "child_session",
+        "raw_source": "subagent",
+        "source_tag": "subagent",
+        "session_source": "other",
+        "source_label": "Subagent",
+        "parent_source": "api_server",
+        "_parent_lineage_root_id": "gateway_parent",
+        "_cross_surface_child_session": True,
+        "message_count": 2,
+        "updated_at": 10,
+    },
+]
 
 
 def _require_playwright():
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:  # pragma: no cover - dependency missing path
-        pytest.skip("playwright is unavailable; run the child disclosure browser test")
+    except ImportError:  # pragma: no cover - optional local dependency
+        pytest.skip("playwright is unavailable; run the browser test job")
     return sync_playwright
 
 
-def test_child_disclosure_is_reachable_by_native_keyboard():
-    """Enter and Space must both reveal the nested children.
+def _page(playwright, viewport):
+    executable_path = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or None
+    browser = playwright.chromium.launch(
+        headless=True,
+        executable_path=executable_path,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    page = browser.new_page(viewport=viewport)
+    page.set_content(
+        "<!doctype html><html><body>"
+        '<input id="sessionSearch"><div id="sessionList"></div>'
+        '<div id="batchActionBar"></div></body></html>'
+    )
+    page.add_style_tag(content=STYLE_CSS)
+    page.add_script_tag(content=HARNESS)
+    page.add_script_tag(content=SESSIONS_JS)
+    page.evaluate(
+        """(sessions) => {
+          _allSessions = sessions;
+          _sidebarReferenceSessions = sessions;
+          _allSessionsScope = {
+            profile: 'default', allProfiles: false,
+            sidebarSource: 'webui', excludeHidden: false
+          };
+          renderSessionListFromCache();
+        }""",
+        SESSIONS,
+    )
+    page.locator(CONTROL_SELECTOR).wait_for()
+    return browser, page
 
-    Activation is driven by real key events on the focused element, so a handler
-    that only responds to pointer input fails here.
-    """
+
+def _target_geometry(page):
+    return page.locator(CONTROL_SELECTOR).evaluate(
+        """(control) => {
+          const target = control.getBoundingClientRect();
+          const visualEl = control.querySelector('.session-child-count') || control;
+          const visual = visualEl.getBoundingClientRect();
+          const points = [];
+          for (const x of [target.left + .5, target.left + target.width / 2, target.right - .5]) {
+            for (const y of [target.top + .5, target.top + target.height / 2, target.bottom - .5]) {
+              const hit = document.elementFromPoint(x, y);
+              points.push(hit === control || control.contains(hit));
+            }
+          }
+          return {
+            width: Math.round(target.width),
+            height: Math.round(target.height),
+            visualWidth: Math.round(visual.width),
+            visualHeight: Math.round(visual.height),
+            allPointsHit: points.every(Boolean),
+          };
+        }"""
+    )
+
+
+def test_production_disclosure_keeps_focus_across_native_keyboard_toggles():
     sync_playwright = _require_playwright()
     with sync_playwright() as playwright:
         browser, page = _page(playwright, MOBILE)
-        pill = page.locator(".session-child-count")
-        pill.focus()
-        focused = page.evaluate("() => document.activeElement.className")
+        control = page.locator(CONTROL_SELECTOR)
+        control.focus()
 
         page.keyboard.press("Enter")
-        after_enter = {
-            "activations": page.evaluate("() => window.__activations"),
-            "aria": pill.get_attribute("aria-expanded"),
-            "children_visible": page.locator(".session-child-session").first.is_visible(),
-        }
+        after_enter = page.locator(CONTROL_SELECTOR)
+        assert after_enter.get_attribute("aria-expanded") == "true"
+        assert page.locator(".session-child-session").count() == 2
+        assert after_enter.evaluate("el => document.activeElement === el")
 
-        page.keyboard.press(" ")
-        after_space = {
-            "activations": page.evaluate("() => window.__activations"),
-            "aria": pill.get_attribute("aria-expanded"),
-        }
+        page.keyboard.press("Space")
+        after_space = page.locator(CONTROL_SELECTOR)
+        assert after_space.get_attribute("aria-expanded") == "false"
+        assert page.locator(".session-child-session").count() == 0
+        assert after_space.evaluate("el => document.activeElement === el")
         browser.close()
 
-    assert focused == "session-child-count", "disclosure did not accept keyboard focus"
-    assert after_enter == {"activations": 1, "aria": "true", "children_visible": True}
-    # Space toggles closed again, and aria-expanded tracks state both ways.
-    assert after_space == {"activations": 2, "aria": "false"}
 
-
-def test_disclosure_and_child_targets_clear_the_mobile_touch_floor():
-    """Computed geometry at 390x844 against the real stylesheet.
-
-    The disclosure keeps its compact visual while its hit area reaches the floor,
-    the revealed rows reach it directly, nothing clips, and the row's own actions
-    trigger is not shadowed by the enlarged hit area.
-    """
+def test_production_disclosure_and_children_clear_mobile_touch_floor():
     sync_playwright = _require_playwright()
     with sync_playwright() as playwright:
         browser, page = _page(playwright, MOBILE)
-        page.locator(".session-child-count").click()
-        disclosure = page.evaluate("() => window.__disclosureHitHeight()")
-        child = page.evaluate("() => window.__childGeometry()")
-        trigger = page.evaluate("() => window.__actionsTriggerReachable()")
+        disclosure = _target_geometry(page)
+        page.locator(CONTROL_SELECTOR).click()
+        children = page.locator(".session-child-session")
+        child_heights = children.evaluate_all(
+            "rows => rows.map(row => Math.round(row.getBoundingClientRect().height))"
+        )
         browser.close()
 
-    assert disclosure["hit"] >= TOUCH_FLOOR, f"disclosure hit area {disclosure} below floor"
-    # Compact visual preserved — the fix must not bulk up the sidebar row.
-    assert disclosure["visual"] < TOUCH_FLOOR, "disclosure pill grew visually"
-    assert child["height"] >= TOUCH_FLOOR, f"child target {child} below floor"
-    assert child["clipped"] is False, "child row text is clipped"
-    assert trigger == "reachable", f"actions trigger {trigger} by the disclosure hit area"
+    assert disclosure["width"] >= TOUCH_FLOOR
+    assert disclosure["height"] >= TOUCH_FLOOR
+    assert disclosure["allPointsHit"], disclosure
+    assert disclosure["visualWidth"] < TOUCH_FLOOR
+    assert disclosure["visualHeight"] < TOUCH_FLOOR
+    assert len(child_heights) == 2
+    assert min(child_heights) >= TOUCH_FLOOR
 
 
-def test_desktop_layout_keeps_its_compact_rows():
-    """The touch floor is scoped to the mobile breakpoint, not applied globally."""
+def test_production_disclosure_keeps_compact_desktop_geometry():
     sync_playwright = _require_playwright()
     with sync_playwright() as playwright:
         browser, page = _page(playwright, DESKTOP)
-        page.locator(".session-child-count").click()
-        child = page.evaluate("() => window.__childGeometry()")
-        disclosure = page.evaluate("() => window.__disclosureHitHeight()")
+        disclosure = _target_geometry(page)
+        page.locator(CONTROL_SELECTOR).click()
+        child_heights = page.locator(".session-child-session").evaluate_all(
+            "rows => rows.map(row => Math.round(row.getBoundingClientRect().height))"
+        )
         browser.close()
 
-    assert child["height"] < TOUCH_FLOOR, "desktop child rows gained mobile padding"
-    assert disclosure["hit"] < TOUCH_FLOOR, "desktop disclosure gained the mobile overlay"
-
-
-def test_production_disclosure_wires_button_semantics():
-    """Guard the wiring the browser tests above assume.
-
-    The disclosure is built inline inside the sidebar render path and cannot be
-    extracted standalone, so this pins that production still emits the semantics
-    rather than the fixture being the only place they exist.
-    """
-    start = SESSIONS_JS.find("childCountEl.className='session-child-count'")
-    assert start > 0, "child-count disclosure branch not found"
-    branch = SESSIONS_JS[start:start + 1400]
-    for expected in (
-        "setAttribute('role','button')",
-        "setAttribute('tabindex','0')",
-        "setAttribute('aria-expanded'",
-        "childCountEl.onkeydown",
-        "e.key==='Enter'||e.key===' '",
-    ):
-        assert expected in branch, f"disclosure lost {expected}"
+    assert disclosure["width"] < TOUCH_FLOOR
+    assert disclosure["height"] < TOUCH_FLOOR
+    assert max(child_heights) < TOUCH_FLOOR

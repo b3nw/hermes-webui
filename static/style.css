@@ -5649,8 +5649,10 @@ main.main > #mainPlugin{display:none;}
 .session-lineage-segments{display:flex;flex-direction:column;gap:3px;margin-top:6px;margin-left:12px;padding-left:8px;border-left:1px dashed rgba(148,163,184,.22);}
 .session-lineage-segment{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;text-align:left;padding:3px 4px;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .session-lineage-segment:hover,.session-lineage-segment.active{background:rgba(148,163,184,.12);color:var(--text);}
-.session-child-count{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:rgba(99,179,237,.16);color:#63b3ed;margin-left:6px;flex-shrink:0;user-select:none;cursor:pointer;}
-.session-child-count:hover{background:rgba(99,179,237,.26);color:#90cdf4;}
+.session-child-disclosure{appearance:none;border:0;background:transparent;color:inherit;font:inherit;padding:0;margin:0 0 0 6px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;cursor:pointer;position:relative;z-index:2;}
+.session-child-count{display:inline-flex;align-items:center;justify-content:center;height:16px;font-size:10px;font-weight:600;padding:0 6px;border-radius:999px;background:rgba(99,179,237,.16);color:#63b3ed;user-select:none;pointer-events:none;}
+.session-child-disclosure:hover .session-child-count{background:rgba(99,179,237,.26);color:#90cdf4;}
+.session-child-disclosure:focus-visible{outline:2px solid var(--focus-ring);outline-offset:2px;border-radius:999px;}
 .session-child-sessions{display:flex;flex-direction:column;gap:3px;margin-top:6px;margin-left:12px;padding-left:8px;border-left:1px solid var(--border,rgba(255,255,255,.1));}
 .session-child-session{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;text-align:left;padding:3px 4px;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .session-child-session:hover,.session-child-session.active{background:rgba(255,255,255,.06);color:var(--text);}
@@ -5670,16 +5672,13 @@ main.main > #mainPlugin{display:none;}
 .session-child-session-fork.swipe-committed,.session-child-session-fork.swipe-removing{transition:background .15s,color .15s,transform .5s cubic-bezier(.22,.61,.36,1),box-shadow .15s ease;will-change:transform;}
 .session-child-session-fork.swipe-removing{overflow:hidden;}
 .session-child-session-fork.swipe-committed .session-swipe-affordance{transition:opacity .18s ease,transform .18s ease;}
-/* Guarantee >=44px mobile touch targets for the delegated-child disclosure and
-   the rows it reveals (#6510 gate finding). Nesting makes the disclosure the only
-   route to a child, so both it and the child rows must clear the 44px floor. The
-   pill keeps its compact 16px visual — the hit area is a transparent overlay
-   spanning only the pill's own width, so the sidebar row does not grow and the
-   absolutely-positioned .session-actions (z-index:1) still sits above it. Mirrors
-   the #6350 review finding 3 pattern. */
+/* The disclosure is the only route to delegated children. Its real button box,
+   not a pseudo-element, supplies the mobile hit target while negative block
+   margins preserve the compact 16px row geometry. The containing session-text
+   selectively allows that box to extend beyond the title row. */
 @media(max-width:700px){
-  .session-child-count{position:relative;}
-  .session-child-count::after{content:'';position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);height:44px;}
+  .session-text.has-child-disclosure{overflow:visible;}
+  .session-child-disclosure{width:44px;height:44px;margin-block:-14px;}
   .session-child-session{min-height:44px;}
   .session-child-session-fork{min-height:44px;}
   .session-child-session-fork .session-child-session-main{min-height:44px;}
