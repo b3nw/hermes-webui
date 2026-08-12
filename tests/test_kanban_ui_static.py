@@ -354,6 +354,22 @@ def test_kanban_card_has_copy_task_id_affordance():
     )
     assert "_copyText(taskId)" in copy_body
 
+    # Keyboard parity (maintainer review, PR #6956): the card <article> is
+    # tabindex="0" role="button" with its own Enter/Space onkeydown that opens
+    # detail. The .kanban-card-copy button is a focusable descendant, so its
+    # keydown bubbles to the article first and would open detail before (or
+    # instead of) copying. The article keydown must ignore events whose target
+    # is a nested control (event.target !== event.currentTarget), so the card
+    # only opens detail when it owns the event.
+    article_return = re.search(r'onkeydown="([^"]*event\.target!==event\.currentTarget[^"]*)"', card_body)
+    assert article_return, (
+        "card article onkeydown must ignore events from nested controls "
+        "(add 'if(event.target!==event.currentTarget) return;' before the key test)"
+    )
+    assert "event.key==='Enter'" in article_return.group(1), (
+        "card article must still handle Enter/Space to open detail when it owns the event"
+    )
+
 
 def test_kanban_edit_modal_id_row_shown_only_in_edit_mode():
     """Regression: the create/edit task modal had no way to see or copy a
@@ -759,7 +775,7 @@ def test_kanban_ui_parity_polish_adds_card_metadata_quick_actions_and_swimlanes(
         "kanban-card-assignee",
         "draggable=\"true\"",
         "ondrop=\"dropKanbanTask",
-        "onkeydown=\"if(event.key==='Enter'||event.key===' ')",
+        "onkeydown=\"if(event.target!==event.currentTarget) return; if(event.key==='Enter'||event.key===' ')",
     ):
         assert token in PANELS
     assert "target=\"_blank\" rel=\"noopener noreferrer\"" in PANELS
