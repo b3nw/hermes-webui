@@ -2970,7 +2970,34 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
             and provider_hint.lower() in _custom_endpoint_slugs_for_base_url(config_base_url)
         ):
             return _finalize(bare_model, config_provider, config_base_url)
-        return _finalize(bare_model, provider_hint, _get_provider_base_url(provider_hint))
+        # _get_provider_base_url() only reads `providers:` and the ACTIVE
+        # `model.base_url`, so a named custom provider registered solely in
+        # `custom_providers:` resolved to None there. Prefer that entry's own
+        # endpoint so a non-active @custom:<slug> hint routes to its own URL
+        # instead of falling back to the default endpoint (HTTP 400 "Invalid
+        # model format or no credentials for provider: <bare-model>").
+        #
+        # Match via _unique_custom_provider_entry on the module-level `cfg` list:
+        # it is pure and lock-safe, so it stays callable when resolve_model_provider()
+        # is invoked while the caller already holds the non-reentrant _cfg_lock —
+        # a get_config()-based resolver would self-deadlock there. It also does NOT
+        # guess: an unmatched slug (e.g. a host:port-derived one absent from
+        # custom_providers) keeps the prior None so no stale endpoint is persisted
+        # for it (#4728). A colliding slug still fails closed via the raise.
+        custom_base_url = None
+        if provider_hint.startswith("custom:"):
+            entry = _unique_custom_provider_entry(
+                cfg.get('custom_providers', []),
+                _custom_provider_slug_key(provider_hint),
+            )
+            if entry is not None:
+                custom_base_url = str(entry.get('base_url') or '').strip() or None
+        base_url = (
+            custom_base_url
+            if custom_base_url is not None
+            else _get_provider_base_url(provider_hint)
+        )
+        return _finalize(bare_model, provider_hint, base_url)
 
     if "/" in model_id:
         prefix, bare = model_id.split("/", 1)
@@ -5012,10 +5039,17 @@ def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | N
                 # (overlapping-id misroute, sibling of the resolve_model_provider
                 # fix). For a named custom:<slug> selection, look up that
                 # provider's OWN custom_providers[] entry directly. Note we do
-                # NOT route through model_with_provider_context here: the
-                # @custom:<slug>:model form resolves base_url to None (the
-                # @provider path doesn't carry a custom entry's base_url), which
-                # would drop the base_url entirely. Fall back to the bare resolve
+                # NOT route through model_with_provider_context here: its
+                # @custom:<slug>:model form re-resolves against the AMBIENT
+                # module-level `cfg`, while this path must read the in-lock
+                # `config_data` snapshot it is about to write. Those two can
+                # disagree whenever the cache is stale or the profile path
+                # changed, and ambient/global resolution while holding the
+                # non-reentrant _cfg_lock is exactly what the direct lookup below
+                # exists to avoid. (That qualified form DOES resolve a custom
+                # entry's own base_url as of the non-active #1806 fix -- the
+                # reason to stay direct here is the lock/snapshot, not a URL the
+                # qualified path cannot produce.) Fall back to the bare resolve
                 # only for the unnamed `custom` case, which has no own entry.
                 resolved_base_url = None
                 if provider.startswith("custom:"):

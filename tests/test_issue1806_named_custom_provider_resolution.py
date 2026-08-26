@@ -117,3 +117,217 @@ def test_available_models_drops_base_url_derived_custom_slug(monkeypatch):
 
     named_models = [m["id"] for m in groups_by_id["custom:ollama-local"]["models"]]
     assert "carnice-9b:latest" in named_models
+
+
+def _with_multi_custom_provider_config():
+    """Active custom provider PLUS a second, non-active named custom provider.
+
+    Mirrors the config.yaml shape that has no ``providers:`` map at all: every
+    endpoint lives in ``custom_providers:``, and only one of them is the active
+    ``model.provider``.
+    """
+    old_cfg = dict(config.cfg)
+    old_mtime = config._cfg_mtime
+    old_path = getattr(config, "_cfg_path", None)
+    config.cfg.clear()
+    config.cfg.update(
+        {
+            "model": {
+                "default": "active/model",
+                "provider": "custom:active",
+                "base_url": "https://active.example/v1",
+                "api_key": "active-key",
+            },
+            "custom_providers": [
+                {
+                    "name": "active",
+                    "base_url": "https://active.example/v1",
+                    "api_key": "active-key",
+                },
+                {
+                    "name": "omni",
+                    "base_url": "https://omni.example/v1",
+                    "api_key": "omni-key",
+                },
+            ],
+        }
+    )
+    try:
+        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
+    except Exception:
+        config._cfg_mtime = 0.0
+    config._cfg_path = config._get_config_path()
+
+    def restore():
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
+        config.invalidate_models_cache()
+
+    return restore
+
+
+def test_provider_qualified_id_uses_nonactive_custom_provider_base_url():
+    """``@custom:omni:<model>`` must route to omni's base_url, not the default.
+
+    ``_get_provider_base_url`` only reads ``providers:`` and the ACTIVE
+    ``model.base_url``, so a named custom provider that lives solely in
+    ``custom_providers:`` used to resolve to base_url=None. The WebUI then sent
+    the bare model to the active endpoint and got back HTTP 400 "Invalid model
+    format or no credentials for provider: <bare-model>".
+    """
+    restore = _with_multi_custom_provider_config()
+    try:
+        model, provider, base_url = config.resolve_model_provider(
+            "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+        )
+    finally:
+        restore()
+
+    assert model == "antigravity/gemini-3.7-flash-tiered"
+    assert provider == "custom:omni"
+    assert base_url == "https://omni.example/v1"
+
+
+def test_provider_qualified_unknown_custom_slug_keeps_base_url_none():
+    """An UNKNOWN ``custom:`` slug must stay base_url=None -- never a guess.
+
+    Slugs derived from a base-url authority (``custom:local-(127.0.0.1:11434)``)
+    or from a provider that is simply not in ``custom_providers:`` have no
+    endpoint of their own. Guessing one (e.g. "there is only one custom provider,
+    use it" or "fall back to the active ``model.base_url``") would persist a
+    stale endpoint for that slug, which is the #4728 regression. Preserve the
+    prior behaviour: no unique matching entry -> no base_url.
+    """
+    restore = _with_multi_custom_provider_config()
+    try:
+        model, provider, base_url = config.resolve_model_provider(
+            "@custom:not-configured:qwen/qwen-1.5b"
+        )
+    finally:
+        restore()
+
+    assert model == "qwen/qwen-1.5b"
+    assert provider == "custom:not-configured"
+    assert base_url is None
+
+
+def test_provider_qualified_active_custom_slug_still_resolves():
+    """The ACTIVE custom provider keeps resolving to its own endpoint."""
+    restore = _with_multi_custom_provider_config()
+    try:
+        model, provider, base_url = config.resolve_model_provider(
+            "@custom:active:antigravity/gemini-3.7-flash-tiered"
+        )
+    finally:
+        restore()
+
+    assert model == "antigravity/gemini-3.7-flash-tiered"
+    assert provider == "custom:active"
+    assert base_url == "https://active.example/v1"
+
+
+def test_provider_qualified_non_custom_provider_is_unaffected():
+    """A non-``custom:`` @provider hint must not pick up a custom endpoint.
+
+    The custom_providers lookup is gated on the ``custom:`` prefix, so an
+    @openrouter route still resolves through _get_provider_base_url() -- None
+    here, since openrouter is neither the active provider nor in ``providers:``.
+    """
+    restore = _with_multi_custom_provider_config()
+    try:
+        model, provider, base_url = config.resolve_model_provider(
+            "@openrouter:anthropic/claude-sonnet-4.6"
+        )
+    finally:
+        restore()
+
+    assert model == "anthropic/claude-sonnet-4.6"
+    assert provider == "openrouter"
+    assert base_url is None
+
+
+def _with_keyed_and_list_provider_config():
+    """Same slug present BOTH as a ``providers:`` key and a ``custom_providers`` entry.
+
+    Deployments that started on the legacy ``custom_providers:`` list and later
+    gained a keyed ``providers:`` map can carry two records for one slug, each
+    with its own ``base_url``. The other fixtures in this file deliberately model
+    the list-only shape, so this one pins which record wins.
+    """
+    old_cfg = dict(config.cfg)
+    old_mtime = config._cfg_mtime
+    old_path = getattr(config, "_cfg_path", None)
+    config.cfg.clear()
+    config.cfg.update(
+        {
+            "model": {
+                "default": "active/model",
+                "provider": "custom:active",
+                "base_url": "https://active.example/v1",
+                "api_key": "active-key",
+            },
+            "providers": {
+                "custom:omni": {
+                    "base_url": "https://omni-keyed.example/v1",
+                    "api_key": "omni-keyed-key",
+                },
+            },
+            "custom_providers": [
+                {
+                    "name": "active",
+                    "base_url": "https://active.example/v1",
+                    "api_key": "active-key",
+                },
+                {
+                    "name": "omni",
+                    "base_url": "https://omni-list.example/v1",
+                    "api_key": "omni-list-key",
+                },
+            ],
+        }
+    )
+    try:
+        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
+    except Exception:
+        config._cfg_mtime = 0.0
+    config._cfg_path = config._get_config_path()
+
+    def restore():
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
+        config.invalidate_models_cache()
+
+    return restore
+
+
+def test_list_entry_wins_over_keyed_providers_entry_for_same_slug():
+    """``custom_providers[]`` outranks a same-slug ``providers:`` key.
+
+    The named entry is the record the picker's ``custom:<slug>`` id is MINTED
+    from (``_custom_provider_slug_from_name`` reads ``custom_providers[].name``),
+    and it is the one credential resolution scans, so the endpoint must come from
+    that same entry -- otherwise a stale keyed ``providers:`` leftover could pair
+    entry A's URL with entry B's API key. Guards the precedence of the
+    ``custom_base_url if custom_base_url is not None else _get_provider_base_url()``
+    ordering: both lookups return a URL here, so a flipped order would silently
+    route to ``omni-keyed`` instead.
+    """
+    restore = _with_keyed_and_list_provider_config()
+    try:
+        # Sanity: the keyed entry really is resolvable, so this test would fail
+        # (not merely pass vacuously on a None fallback) if precedence flipped.
+        keyed_base_url = config._get_provider_base_url("custom:omni")
+        model, provider, base_url = config.resolve_model_provider(
+            "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+        )
+    finally:
+        restore()
+
+    assert keyed_base_url == "https://omni-keyed.example/v1"
+    assert model == "antigravity/gemini-3.7-flash-tiered"
+    assert provider == "custom:omni"
+    assert base_url == "https://omni-list.example/v1"
