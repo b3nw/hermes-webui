@@ -199,9 +199,15 @@ for(const name of [
   legacySelect.value=ROUTED;
   const legacyState=_modelStateForSelect(legacySelect,legacySelect.value);
 
+  // Dropdown UI rendering: entry.id must be the clean bare model ID, not the routing value.
+  const omniEntryDisplayId=(catalogOption.dataset&&catalogOption.dataset.model)
+    || ((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(catalogOption.value,'custom:omni'):'')
+    || catalogOption.value;
+
   process.stdout.write(JSON.stringify({
     catalogOptionDatasetModel:catalogOption?(catalogOption.dataset.model||null):null,
     catalogOptionProvider:catalogOption?_getOptionProviderId(catalogOption):null,
+    omniEntryDisplayId,
     newSessionState,capturedState,reapplied,reappliedState,
     colonModelState,openRouterState,unknownState,legacyState,
     optionCountAfterPopulate,optionCountAfterSelect,
@@ -234,6 +240,11 @@ def test_catalog_option_keeps_bare_model_metadata(result):
     """The population path must tag routed options with their bare model id."""
     assert result["catalogOptionDatasetModel"] == "antigravity/gemini-3.7-flash-tiered"
     assert result["catalogOptionProvider"] == "custom:omni"
+
+
+def test_dropdown_row_displays_bare_model_id(result):
+    """The dropdown row ID subtext must show the clean bare model ID."""
+    assert result["omniEntryDisplayId"] == "antigravity/gemini-3.7-flash-tiered"
 
 
 def test_new_session_selection_sends_bare_model_and_provider(result):

@@ -4362,7 +4362,10 @@ function renderModelDropdown(){
         const displayName=rawValue.startsWith('@custom:')
           ? getModelLabel(rawValue)
           : (opt.textContent||getModelLabel(rawValue));
-        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false};
+        const displayId=(opt.dataset&&opt.dataset.model)
+          || ((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(rawValue,providerId):'')
+          || rawValue;
+        const entry={value:opt.value,name:esc(displayName),id:esc(displayId),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false};
         _modelData.push(entry);
         groupMeta.modelCount++;
       }
@@ -4370,10 +4373,12 @@ function renderModelDropdown(){
         const displayName=overflowModel.id.startsWith('@custom:')
           ? getModelLabel(overflowModel.id)
           : (overflowModel.label||getModelLabel(overflowModel.id));
+        const displayId=((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(overflowModel.id,providerId):'')
+          || overflowModel.id;
         _modelData.push({
           value:overflowModel.id,
           name:esc(displayName),
-          id:esc(overflowModel.id),
+          id:esc(displayId),
           group:child.label||'',
           groupKey,
           providerId,
@@ -4396,7 +4401,10 @@ function renderModelDropdown(){
       const displayName=rawValue.startsWith('@custom:')
         ? getModelLabel(rawValue)
         : (child.textContent||getModelLabel(rawValue));
-      _modelData.push({value:child.value,name:esc(displayName),id:esc(child.value),group:'',groupKey,providerId:'',badge:_getConfiguredModelBadge(child.value,_badgeMap),hiddenByDefault:false});
+      const displayId=(child.dataset&&child.dataset.model)
+        || ((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(rawValue,child.dataset&&child.dataset.provider):'')
+        || rawValue;
+      _modelData.push({value:child.value,name:esc(displayName),id:esc(displayId),group:'',groupKey,providerId:'',badge:_getConfiguredModelBadge(child.value,_badgeMap),hiddenByDefault:false});
       _groupMeta.get(groupKey).modelCount++;
     }
   }
@@ -4608,7 +4616,8 @@ function renderModelDropdown(){
     for(const m of _modelData){
       const name=m.name.toLowerCase();
       const id=m.id.toLowerCase();
-      if(name.includes(term)||id.includes(term)){
+      const val=String(m.value||'').toLowerCase();
+      if(name.includes(term)||id.includes(term)||val.includes(term)){
         found.add(m.value);
       }
     }
