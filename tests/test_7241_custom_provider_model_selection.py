@@ -204,10 +204,15 @@ for(const name of [
     || ((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(catalogOption.value,'custom:omni'):'')
     || catalogOption.value;
 
+  const colonModelProvider=_providerFromModelValue('@custom:omni:kg/stepfun/step-3.7-flash:free');
+  const colonModelBare=_bareModelForProviderValue('@custom:omni:kg/stepfun/step-3.7-flash:free', colonModelProvider);
+
   process.stdout.write(JSON.stringify({
     catalogOptionDatasetModel:catalogOption?(catalogOption.dataset.model||null):null,
     catalogOptionProvider:catalogOption?_getOptionProviderId(catalogOption):null,
     omniEntryDisplayId,
+    colonModelProvider,
+    colonModelBare,
     newSessionState,capturedState,reapplied,reappliedState,
     colonModelState,openRouterState,unknownState,legacyState,
     optionCountAfterPopulate,optionCountAfterSelect,
@@ -284,6 +289,8 @@ def test_colon_bearing_model_id_is_not_missplit(result):
         "model": "model-a:free",
         "model_provider": "custom:omni",
     }
+    assert result["colonModelProvider"] == "custom:omni"
+    assert result["colonModelBare"] == "kg/stepfun/step-3.7-flash:free"
 
 
 def test_plain_provider_prefix_also_yields_bare_model(result):

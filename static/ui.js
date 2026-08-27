@@ -2980,13 +2980,21 @@ function _getOptionProviderId(opt){
     return group.dataset.provider;
   }
   const value=String(opt.value||'');
-  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
-  return '';
+  if(!value.startsWith('@')||!value.includes(':')) return '';
+  if(value.startsWith('@custom:')){
+    const parts=value.slice(1).split(':');
+    if(parts.length>=2) return `custom:${parts[1]}`;
+  }
+  return value.slice(1,value.indexOf(':'));
 }
 function _providerFromModelValue(modelId){
   const value=String(modelId||'').trim();
-  if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
-  return '';
+  if(!value.startsWith('@')||!value.includes(':')) return '';
+  if(value.startsWith('@custom:')){
+    const parts=value.slice(1).split(':');
+    if(parts.length>=2) return `custom:${parts[1]}`;
+  }
+  return value.slice(1,value.indexOf(':'));
 }
 // Strip ONLY the exact "@{provider}:" routing wrapper the catalog puts on
 // options that belong to a non-active provider, returning the bare model id the
@@ -4359,9 +4367,7 @@ function renderModelDropdown(){
       groupMeta.modelsEndpointError=modelsEndpointError;
       for(const opt of Array.from(child.children)){
         const rawValue=String(opt.value||'');
-        const displayName=rawValue.startsWith('@custom:')
-          ? getModelLabel(rawValue)
-          : (opt.textContent||getModelLabel(rawValue));
+        const displayName=opt.textContent||getModelLabel(rawValue);
         const displayId=(opt.dataset&&opt.dataset.model)
           || ((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(rawValue,providerId):'')
           || rawValue;
@@ -4370,9 +4376,7 @@ function renderModelDropdown(){
         groupMeta.modelCount++;
       }
       for(const overflowModel of _readModelOverflowData(child)){
-        const displayName=overflowModel.id.startsWith('@custom:')
-          ? getModelLabel(overflowModel.id)
-          : (overflowModel.label||getModelLabel(overflowModel.id));
+        const displayName=overflowModel.label||getModelLabel(overflowModel.id);
         const displayId=((typeof _bareModelForProviderValue==='function')?_bareModelForProviderValue(overflowModel.id,providerId):'')
           || overflowModel.id;
         _modelData.push({
@@ -7359,18 +7363,25 @@ function _stripDottedModelPrefix(bare){
 }
 function getModelLabel(modelId){
   if(!modelId) return 'Unknown';
-  const rawId=String(modelId||'');
-  // Preserve custom gateway model IDs exactly as configured.
+  let rawId=String(modelId||'');
+  // Preserve custom gateway model IDs and strip provider routing cleanly.
   // Examples:
-  //   @custom:ai_gateway:Qwen3.6-35B-A3B -> Qwen3.6-35B-A3B
-  //   @custom:qwen397b-64k               -> qwen397b-64k
-  if(rawId.startsWith('@custom:')){
-    const rest=rawId.slice('@custom:'.length);
-    if(rest.includes(':')) return rest.slice(rest.lastIndexOf(':')+1)||rawId;
-    if(rest.includes('/')) return rest.slice(rest.indexOf('/')+1)||rawId;
-    return rest||rawId;
+  //   @custom:omni:kg/stepfun/step-3.7-flash:free -> Step 3.7 Flash:free
+  //   @custom:ai_gateway:Qwen3.6-35B-A3B          -> Qwen3.6-35B-A3B
+  if(rawId.startsWith('@')){
+    const prov=(typeof _providerFromModelValue==='function')?_providerFromModelValue(rawId):'';
+    if(prov&&typeof _bareModelForProviderValue==='function'){
+      rawId=_bareModelForProviderValue(rawId,prov);
+    }else if(rawId.startsWith('@custom:')){
+      const rest=rawId.slice('@custom:'.length);
+      const colon=rest.indexOf(':');
+      rawId=(colon>=0)?rest.slice(colon+1):rest;
+    }else if(rawId.includes(':')){
+      rawId=rawId.slice(rawId.indexOf(':')+1);
+    }
   }
   // Check dynamic labels first, then fall back to splitting the ID
+  if(_dynamicModelLabels[rawId]) return _dynamicModelLabels[rawId];
   if(_dynamicModelLabels[modelId]) return _dynamicModelLabels[modelId];
   // Static fallback for common models
   const STATIC_LABELS={'openai/gpt-5.4-mini':'GPT-5.4 Mini','openai/gpt-4o':'GPT-4o','openai/o3':'o3','openai/o4-mini':'o4-mini','anthropic/claude-sonnet-4.6':'Sonnet 4.6','anthropic/claude-sonnet-4-5':'Sonnet 4.5','anthropic/claude-haiku-3-5':'Haiku 3.5','google/gemini-3.1-pro-preview':'Gemini 3.1 Pro','google/gemini-3-flash-preview':'Gemini 3 Flash','google/gemini-3.1-flash-lite-preview':'Gemini 3.1 Flash Lite','google/gemini-2.5-pro':'Gemini 2.5 Pro','google/gemini-2.5-flash':'Gemini 2.5 Flash','deepseek/deepseek-v4-flash':'DeepSeek V4 Flash','deepseek/deepseek-v4-pro':'DeepSeek V4 Pro','deepseek/deepseek-chat-v3-0324':'DeepSeek V3 (legacy)','meta-llama/llama-4-scout':'Llama 4 Scout'};
