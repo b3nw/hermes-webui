@@ -2988,6 +2988,19 @@ function _providerFromModelValue(modelId){
   if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
   return '';
 }
+// Strip ONLY the exact "@{provider}:" routing wrapper the catalog puts on
+// options that belong to a non-active provider, returning the bare model id the
+// backend expects alongside a separate model_provider (#7241).
+// Never re-parse at an arbitrary colon: a named custom provider ("custom:omni")
+// spans two segments and model ids may themselves contain colons ("model-a:free"),
+// so a positional split mis-identifies both (#6221).
+function _bareModelForProviderValue(modelId, providerId){
+  const value=String(modelId||'');
+  const provider=String(providerId||'').trim();
+  if(!provider||!value.startsWith('@')) return value;
+  const prefix=`@${provider}:`;
+  return value.toLowerCase().startsWith(prefix.toLowerCase())?value.slice(prefix.length):value;
+}
 function _modelPickerOptionIdentity(modelId, providerId){
   let value=String(modelId||'');
   const provider=String(providerId||'').trim();
@@ -3057,7 +3070,16 @@ function _modelStateForSelect(sel, modelId){
     // id (e.g. model-a:free) synthesized as @custom:backup:model-a:free would
     // otherwise mis-parse to provider "custom:backup:model-a" (#6221 re-gate).
     const routedProvider=selected?String(_getOptionProviderId(selected)||'').trim():'';
-    return {model:routedModel||value,model_provider:routedProvider||explicitProvider};
+    // Options built straight from the model catalog carry the provider-qualified
+    // id as their VALUE and may have no data-model (only the option-synthesis
+    // path sets it). Without this recovery the "@custom:omni:vendor/model" value
+    // is persisted and sent AS THE MODEL NAME, and the backend re-splits it into
+    // a bogus provider ("No active credentials for provider: @custom:omni:vendor")
+    // — #7241. Recover the bare id from the option's authoritative provider.
+    const routedFromValue=(routedProvider&&typeof _bareModelForProviderValue==='function')
+      ?_bareModelForProviderValue(value,routedProvider)
+      :'';
+    return {model:routedModel||routedFromValue||value,model_provider:routedProvider||explicitProvider};
   }
   // Resolve the provider from the option whose VALUE matches the requested
   // model — never blindly from sel.selectedOptions[0] (#5567). During a profile
@@ -3651,6 +3673,13 @@ async function populateModelDropdown(opts={}){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
+        // Keep the bare model id on the option, exactly like the option-synthesis
+        // path (_ensureModelOptionInDropdown) does, so model-state extraction sends
+        // "vendor/model" + provider "custom:omni" instead of the routing id (#7241).
+        const _bareId=typeof _bareModelForProviderValue==='function'
+          ?_bareModelForProviderValue(m.id,g.provider_id||'')
+          :m.id;
+        if(_bareId&&_bareId!==m.id) opt.dataset.model=_bareId;
         if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
           opt.dataset.fast='1';
         }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
@@ -4413,7 +4442,11 @@ function renderModelDropdown(){
     const _provider=String((m&&m.providerId)||(m&&m.badge&&m.badge.provider)||((typeof _providerFromModelValue==='function')?_providerFromModelValue(m&&m.value):'')||'').trim();
     return (_provider&&_provider!=='default')?_provider:null;
   };
-  const _isSelectedModelRow=(m)=>String((m&&m.value)||'')===String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'')&&String(_modelProviderForSelectedBadge(m)||'')===String((_selectedModelState&&_selectedModelState.model_provider)||'');
+  // The row VALUE stays provider-qualified while the extracted state model is the
+  // bare routed id (#7241), so also accept a row whose value is exactly what the
+  // <select> currently holds — the provider clause below still keeps duplicate
+  // ids under other providers from lighting up.
+  const _isSelectedModelRow=(m)=>(String((m&&m.value)||'')===String((_selectedModelState&&_selectedModelState.model)||(sel&&sel.value)||'')||String((m&&m.value)||'')===String((sel&&sel.value)||''))&&String(_modelProviderForSelectedBadge(m)||'')===String((_selectedModelState&&_selectedModelState.model_provider)||'');
   const _selectedModelBadge=(m)=>_isSelectedModelRow(m)
     ?`<span class="model-opt-badge model-opt-badge--selected">${esc(t('model_badge_selected')||'Selected')}</span>`
     :'';
