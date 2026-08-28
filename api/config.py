@@ -3309,6 +3309,34 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     # (Plugin-only provider routing handled above, before the config_provider
     # bare-passthrough.)
 
+    # NAMED custom providers ('custom:<slug>') live in cfg['custom_providers'],
+    # not cfg['providers'], so the check above never sees them. Without this
+    # branch a slash ID picked from a non-active named provider (e.g.
+    # 'infrex/glm-5.3-flash' on 'custom:omni' while the configured provider is
+    # 'custom:llm-proxy') falls through the '/' escape below, loses its
+    # qualifier, and is routed to the ACTIVE provider -> HTTP 400 "Invalid model
+    # format or no credentials for provider: infrex/glm-5.3-flash". Keep the
+    # explicit hint so the '@custom:<slug>:' resolution path (with its own
+    # base_url handling) takes over. Bare 'custom' (vendor-routing proxy, #3872)
+    # is deliberately excluded, and for slash ids an unmatched slug fails closed
+    # below rather than fabricating a qualifier (no-slash ids qualify further
+    # down, as they always have). ``_unique_custom_provider_entry`` is pure and
+    # lock-safe, so this stays callable under the non-reentrant ``_cfg_lock``.
+    if provider.startswith("custom:"):
+        try:
+            entry = _unique_custom_provider_entry(
+                cfg.get("custom_providers", []) if isinstance(cfg, dict) else [],
+                _custom_provider_slug_key(provider),
+            )
+        except AmbiguousCustomProviderError:
+            # Encoding is not the credential boundary: a colliding slug keeps the
+            # qualifier so resolve_model_provider() stays the single place that
+            # raises (its existing fail-closed contract), rather than silently
+            # dropping the hint onto the default provider here.
+            return f"@{provider}:{model}"
+        if entry:
+            return f"@{provider}:{model}"
+
     # For non-OpenRouter slash IDs without an explicit configured provider,
     # keep the ID intact so existing custom/proxy base_url routing and
     # portal-provider handling remain in charge.
