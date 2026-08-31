@@ -368,54 +368,101 @@ def test_reported_session_body_parses(tmp_path):
     assert info["output"] == body
 
 
-def test_unstamped_delegation_delivery_still_classifies_as_a_wakeup(tmp_path):
-    """Transcripts persisted before the server-side stamp fix carry no
-    ``_source``; the exact formatter header at position 0 is enough."""
+def test_unstamped_user_rows_fail_closed_to_user_messages_without_process_source(tmp_path):
+    """Provenance belongs strictly to the server-persisted source/turn boundary:
+    exact single and batch headers on rows without ``_source='process_wakeup'``
+    must remain normal user messages; only ``_source='process_wakeup'`` classifies
+    as a process wakeup."""
     messages = {
-        "stamped": {"role": "user", "content": BATCH_INTERRUPTED_BODY, "_source": "process_wakeup"},
-        "unstamped": {"role": "user", "content": BATCH_INTERRUPTED_BODY},
-        "workspace_prefixed": {
+        "batch_stamped": {
+            "role": "user",
+            "content": BATCH_INTERRUPTED_BODY,
+            "_source": "process_wakeup",
+        },
+        "single_stamped": {
+            "role": "user",
+            "content": _single("completed"),
+            "_source": "process_wakeup",
+        },
+        "workspace_prefixed_stamped": {
+            "role": "user",
+            "content": "[Workspace::v1: /tmp/ws]\n" + BATCH_INTERRUPTED_BODY,
+            "_source": "process_wakeup",
+        },
+        "array_content_stamped": {
+            "role": "user",
+            "content": [{"type": "text", "text": BATCH_INTERRUPTED_BODY}],
+            "_source": "process_wakeup",
+        },
+        "batch_unstamped": {
+            "role": "user",
+            "content": BATCH_INTERRUPTED_BODY,
+        },
+        "single_unstamped": {
+            "role": "user",
+            "content": _single("completed"),
+        },
+        "workspace_prefixed_unstamped": {
             "role": "user",
             "content": "[Workspace::v1: /tmp/ws]\n" + BATCH_INTERRUPTED_BODY,
         },
-        "single_unstamped": {"role": "user", "content": _single("completed")},
-        "typed_prose": {"role": "user", "content": "did the delegation batch complete?"},
-        "header_not_at_start": {"role": "user", "content": "look:\n" + BATCH_HEADER},
-        "assistant_echo": {"role": "assistant", "content": BATCH_INTERRUPTED_BODY},
+        "typed_prose": {
+            "role": "user",
+            "content": "did the delegation batch complete?",
+        },
+        "header_not_at_start": {
+            "role": "user",
+            "content": "look:\n" + BATCH_HEADER,
+        },
+        "assistant_echo": {
+            "role": "assistant",
+            "content": BATCH_INTERRUPTED_BODY,
+        },
         "other_source": {
             "role": "user",
             "content": BATCH_INTERRUPTED_BODY,
             "_source": "fork",
         },
-        # The classifier's bounded fast-reject must not make a long workspace
-        # sentinel push the real header out of scope.
-        "long_workspace_prefix": {
+        "webui_source": {
+            "role": "user",
+            "content": BATCH_INTERRUPTED_BODY,
+            "_source": "webui",
+        },
+        "long_workspace_prefix_unstamped": {
             "role": "user",
             "content": "[Workspace::v1: /" + ("d/" * 200) + "ws]\n" + BATCH_INTERRUPTED_BODY,
         },
-        # ...nor may a header that only appears deep in a long body match.
         "header_far_into_body": {
             "role": "user",
             "content": ("filler line\n" * 400) + BATCH_INTERRUPTED_BODY,
         },
-        "array_content": {
+        "array_content_unstamped": {
             "role": "user",
             "content": [{"type": "text", "text": BATCH_INTERRUPTED_BODY}],
         },
     }
     classify = _run({}, messages=messages, tmp_path=tmp_path)["_classify"]
 
-    assert classify["stamped"] is True
-    assert classify["unstamped"] is True
-    assert classify["workspace_prefixed"] is True
-    assert classify["single_unstamped"] is True
+    # Only explicitly stamped process_wakeup rows qualify
+    assert classify["batch_stamped"] is True
+    assert classify["single_stamped"] is True
+    assert classify["workspace_prefixed_stamped"] is True
+    assert classify["array_content_stamped"] is True
+
+    # Unstamped rows matching exact single/batch headers fail closed to user messages
+    assert classify["batch_unstamped"] is False
+    assert classify["single_unstamped"] is False
+    assert classify["workspace_prefixed_unstamped"] is False
+    assert classify["long_workspace_prefix_unstamped"] is False
+    assert classify["array_content_unstamped"] is False
+
+    # Other non-process sources, assistant rows, prose fail closed
     assert classify["typed_prose"] is False
     assert classify["header_not_at_start"] is False
     assert classify["assistant_echo"] is False
     assert classify["other_source"] is False
-    assert classify["long_workspace_prefix"] is True
+    assert classify["webui_source"] is False
     assert classify["header_far_into_body"] is False
-    assert classify["array_content"] is True
 
 
 def test_render_branch_and_css_wire_the_delegation_variant():

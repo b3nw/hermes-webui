@@ -312,22 +312,12 @@ function _stripWorkspaceDisplayPrefix(text){
 // the delegation id as the only free field, so prose that merely mentions a
 // delegation can never claim the wakeup card.
 const _ASYNC_DELEGATION_WAKEUP_HEADER_RE=/^\[ASYNC DELEGATION(?: (BATCH))? COMPLETE — ([^\n\]]+)\](?:\n|$)/;
-// `_source` is the authoritative transport stamp and always wins. The header
-// check is a display-grammar fallback for deliveries persisted WITHOUT it:
-// api/streaming.py:_mark_active_turn_checkpoint used to adopt the Agent's
-// echoed user row with only `_active_turn_token`, so transcripts written
-// before that fix carry unstamped wakeup turns forever. A row already stamped
-// with a different source is left to its own renderer.
+// `_source` is the authoritative transport stamp. Provenance belongs strictly
+// to the server-persisted source/turn boundary: unstamped historical rows or
+// user-authored text matching wakeup grammar fail closed to normal user messages
+// rather than being promoted to server-owned process UI via regex fallback.
 function _isProcessWakeupMessage(m){
-  if(!m) return false;
-  if(m._source === 'process_wakeup') return true;
-  if(m._source || m.role !== 'user') return false;
-  // Cheap bounded reject before any string building: this runs for every
-  // message on every render, and the header only ever sits at the start of the
-  // body (after the optional workspace sentinel). lastIndexOf with a fromIndex
-  // scans at most the first ~1KB instead of the whole multi-KB body.
-  if(typeof m.content === 'string' && m.content.lastIndexOf('[ASYNC DELEGATION', 1024) === -1) return false;
-  return _ASYNC_DELEGATION_WAKEUP_HEADER_RE.test(_stripWorkspaceDisplayPrefix(msgContent(m)));
+  return !!(m && m._source === 'process_wakeup');
 }
 function _renderUserFencedBlocks(text){
   const stash=[];
