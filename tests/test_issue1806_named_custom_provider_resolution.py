@@ -324,6 +324,7 @@ def test_list_entry_wins_over_keyed_providers_entry_for_same_slug():
         model, provider, base_url = config.resolve_model_provider(
             "@custom:omni:antigravity/gemini-3.7-flash-tiered"
         )
+        conn_api_key, conn_base_url = config.resolve_custom_provider_connection("custom:omni")
     finally:
         restore()
 
@@ -331,3 +332,92 @@ def test_list_entry_wins_over_keyed_providers_entry_for_same_slug():
     assert model == "antigravity/gemini-3.7-flash-tiered"
     assert provider == "custom:omni"
     assert base_url == "https://omni-list.example/v1"
+    assert conn_api_key == "omni-list-key"
+    assert conn_base_url == "https://omni-list.example/v1"
+    assert (base_url, conn_api_key) == ("https://omni-list.example/v1", "omni-list-key")
+
+
+def _with_keyed_and_blank_list_provider_config():
+    """Same slug present in ``providers:`` and as a ``custom_providers`` entry with blank base_url.
+
+    The list entry exists and has a distinct API key, but its ``base_url`` is
+    empty. The keyed ``providers:`` entry has both a valid ``base_url`` and its
+    own distinct API key.
+    """
+    old_cfg = dict(config.cfg)
+    old_mtime = config._cfg_mtime
+    old_path = getattr(config, "_cfg_path", None)
+    config.cfg.clear()
+    config.cfg.update(
+        {
+            "model": {
+                "default": "active/model",
+                "provider": "custom:active",
+                "base_url": "https://active.example/v1",
+                "api_key": "active-key",
+            },
+            "providers": {
+                "custom:omni": {
+                    "base_url": "https://omni-keyed.example/v1",
+                    "api_key": "omni-keyed-key",
+                },
+            },
+            "custom_providers": [
+                {
+                    "name": "active",
+                    "base_url": "https://active.example/v1",
+                    "api_key": "active-key",
+                },
+                {
+                    "name": "omni",
+                    "base_url": "",
+                    "api_key": "omni-list-key",
+                },
+            ],
+        }
+    )
+    try:
+        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
+    except Exception:
+        config._cfg_mtime = 0.0
+    config._cfg_path = config._get_config_path()
+
+    def restore():
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
+        config.invalidate_models_cache()
+
+    return restore
+
+
+def test_blank_list_entry_does_not_fall_through_to_keyed_providers_endpoint():
+    """A blank ``custom_providers[].base_url`` must not fall through to a keyed endpoint.
+
+    When a slug exists both in ``custom_providers[]`` (with a blank or empty
+    base_url and API key K_list) and in ``providers:`` (with a populated base_url
+    and API key K_keyed), resolution must treat the list entry as authoritative.
+    Falling through to ``_get_provider_base_url()`` on empty base_url would pair
+    the keyed record's endpoint with the list record's API key, violating the
+    same-entry invariant between resolve_model_provider() and
+    resolve_custom_provider_connection().
+    """
+    restore = _with_keyed_and_blank_list_provider_config()
+    try:
+        keyed_base_url = config._get_provider_base_url("custom:omni")
+        model, provider, base_url = config.resolve_model_provider(
+            "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+        )
+        conn_api_key, conn_base_url = config.resolve_custom_provider_connection("custom:omni")
+    finally:
+        restore()
+
+    assert keyed_base_url == "https://omni-keyed.example/v1"
+    assert model == "antigravity/gemini-3.7-flash-tiered"
+    assert provider == "custom:omni"
+    assert base_url is None
+    assert conn_base_url is None
+    assert conn_api_key == "omni-list-key"
+    assert (base_url, conn_api_key) != ("https://omni-keyed.example/v1", "omni-list-key")
+

@@ -2984,19 +2984,24 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
         # guess: an unmatched slug (e.g. a host:port-derived one absent from
         # custom_providers) keeps the prior None so no stale endpoint is persisted
         # for it (#4728). A colliding slug still fails closed via the raise.
-        custom_base_url = None
+        #
+        # When an exact custom_providers[] entry exists, that row is authoritative
+        # for its slug: use its stripped base_url directly (including None when
+        # blank). It must NOT fall through to _get_provider_base_url(), which
+        # could pair a same-slug keyed `providers:` endpoint with this entry's
+        # credentials (violating same-entry endpoint/key parity). Only fall back
+        # to _get_provider_base_url() when no exact custom_providers[] row exists.
         if provider_hint.startswith("custom:"):
             entry = _unique_custom_provider_entry(
                 cfg.get('custom_providers', []),
                 _custom_provider_slug_key(provider_hint),
             )
             if entry is not None:
-                custom_base_url = str(entry.get('base_url') or '').strip() or None
-        base_url = (
-            custom_base_url
-            if custom_base_url is not None
-            else _get_provider_base_url(provider_hint)
-        )
+                base_url = str(entry.get('base_url') or '').strip() or None
+            else:
+                base_url = _get_provider_base_url(provider_hint)
+        else:
+            base_url = _get_provider_base_url(provider_hint)
         return _finalize(bare_model, provider_hint, base_url)
 
     if "/" in model_id:
