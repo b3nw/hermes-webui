@@ -551,6 +551,7 @@ def _resolve_custom_provider_runtime_overrides(
     resolved_api_key: str | None,
     resolved_base_url: str | None,
     profile_name: str | None = None,
+    custom_provider_lookup: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Return provider/key/base_url overrides for ``custom:*`` endpoints.
 
@@ -568,15 +569,38 @@ def _resolve_custom_provider_runtime_overrides(
     call would read the DEFAULT profile and pair a named profile's endpoint with
     the default profile's API key (finding #3). No-op for the default/root
     profile; when ``profile_name`` is None the ambient scope (if any) is used.
+
+    When an exact ``custom_providers[]`` entry matches, that row is authoritative:
+    both the endpoint (including None when blank) and credential are replaced
+    atomically so keyed or runtime fallbacks cannot mix across authorities.
     """
-    if not (isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")):
+    lookup_provider = custom_provider_lookup or resolved_provider
+    if not (isinstance(lookup_provider, str) and lookup_provider.startswith("custom:")):
         return resolved_provider, resolved_api_key, resolved_base_url
 
     from api import profiles as _profiles_api
     with _profiles_api.profile_scope_for_detached_worker(
         profile_name, "custom provider connection", logger_override=logger
     ):
-        _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+        try:
+            _conn_res = resolve_custom_provider_connection(lookup_provider, return_provenance=True)
+        except TypeError:
+            _conn_res = resolve_custom_provider_connection(lookup_provider)
+        if len(_conn_res) == 3:
+            _cp_key, _cp_base, _is_exact = _conn_res
+        else:
+            _cp_key, _cp_base = _conn_res
+            _is_exact = False
+
+    if _is_exact:
+        resolved_base_url = _cp_base
+        resolved_api_key = _cp_key
+        if resolved_base_url:
+            resolved_provider = "custom"
+            if not resolved_api_key:
+                resolved_api_key = _KEYLESS_CUSTOM_API_KEY
+        return resolved_provider, resolved_api_key, resolved_base_url
+
     if not resolved_api_key and _cp_key:
         resolved_api_key = _cp_key
     if not resolved_base_url and _cp_base:
@@ -621,6 +645,7 @@ def _runtime_preferred_base_url(
     runtime_provider: dict | None,
     resolved_provider: str | None,
     configured_base_url: str | None,
+    session_requested_provider: str | None = None,
 ) -> str | None:
     """Prefer the runtime-normalized base_url, but never override an explicit
     configured endpoint that points somewhere genuinely different.
@@ -646,7 +671,8 @@ def _runtime_preferred_base_url(
         return runtime_base_url
 
     provider_id = str(
-        resolved_provider
+        session_requested_provider
+        or resolved_provider
         or (runtime_provider or {}).get("provider")
         or ""
     ).strip().lower()
@@ -10050,6 +10076,7 @@ def _run_agent_streaming(
                 resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                     resolved_provider, resolved_api_key, resolved_base_url,
                     profile_name=_resolved_profile_name,
+                    custom_provider_lookup=_session_requested_provider,
                 )
 
             # Read per-profile config at call time (not module-level snapshot).
@@ -11168,7 +11195,8 @@ def _run_agent_streaming(
                             if not resolved_provider:
                                 resolved_provider = _heal_rt.get('provider')
                             resolved_base_url = _runtime_preferred_base_url(
-                                _heal_rt, resolved_provider, configured_base_url
+                                _heal_rt, resolved_provider, configured_base_url,
+                                session_requested_provider=_session_requested_provider,
                             )
                             # Preserve the session's original pre-canonicalization
                             # provider identity (captured at first resolve) so a
@@ -11180,6 +11208,7 @@ def _run_agent_streaming(
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                                 resolved_provider, resolved_api_key, resolved_base_url,
                                 profile_name=_resolved_profile_name,
+                                custom_provider_lookup=_session_requested_provider,
                             )
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
@@ -12467,7 +12496,8 @@ def _run_agent_streaming(
                     if not resolved_provider:
                         resolved_provider = _heal_rt.get('provider')
                     resolved_base_url = _runtime_preferred_base_url(
-                        _heal_rt, resolved_provider, configured_base_url
+                        _heal_rt, resolved_provider, configured_base_url,
+                        session_requested_provider=_session_requested_provider,
                     )
                     # Preserve the session's original pre-canonicalization provider
                     # identity (captured at first resolve) so a named custom:slug
@@ -12478,6 +12508,7 @@ def _run_agent_streaming(
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                         resolved_provider, resolved_api_key, resolved_base_url,
                         profile_name=_resolved_profile_name,
+                        custom_provider_lookup=_session_requested_provider,
                     )
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}

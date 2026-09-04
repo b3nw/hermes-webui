@@ -3192,19 +3192,30 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     return _finalize(model_id, config_provider, config_base_url)
 
 
-def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, str | None]:
+def resolve_custom_provider_connection(
+    provider_id: str,
+    *,
+    return_provenance: bool = False,
+) -> tuple[str | None, str | None] | tuple[str | None, str | None, bool]:
     """Return (api_key, base_url) for a named ``custom:*`` provider.
 
     Supports ``custom_providers[].api_key`` as either a literal key or
     ``${ENV_VAR}``, and ``custom_providers[].key_env`` as an env-var hint.
     Returns ``(None, None)`` when no named custom provider matches.
+    If ``return_provenance=True``, returns ``(api_key, base_url, is_exact)``
+    indicating whether the connection was resolved from an exact matching
+    ``custom_providers[]`` entry.
     """
     pid = str(provider_id or "").strip().lower()
     if not pid.startswith("custom:"):
+        if return_provenance:
+            return None, None, False
         return None, None
 
     slug = _custom_provider_slug_key(pid)
     if not slug:
+        if return_provenance:
+            return None, None, False
         return None, None
 
     # Read the live config snapshot to avoid stale module-level cache edge
@@ -3238,18 +3249,14 @@ def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, st
     if matched_entry is not None:
         base_url = str(matched_entry.get("base_url") or "").strip() or None
         api_key = _resolve_key(matched_entry.get("api_key"), matched_entry.get("key_env"), pid)
+        if return_provenance:
+            return api_key, base_url, True
         return api_key, base_url
 
-    # If exactly one custom provider is configured, use it as a pragmatic
-    # fallback for mismatched slugs (e.g. punctuation differences).
-    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
-        entry = custom_providers[0]
-        return (
-            _resolve_key(entry.get("api_key"), entry.get("key_env"), pid),
-            str(entry.get("base_url") or "").strip() or None,
-        )
-
     # Fallbacks for setups that don't use custom_providers names directly.
+    # Preserve keyed-only fallback when no exact list row exists, selecting URL
+    # and key as a complete bundle from the same record rather than mixing
+    # credentials and endpoints across candidate records.
     providers_cfg = cfg_data.get("providers", {})
     provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
     provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
@@ -3257,25 +3264,26 @@ def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, st
     model_cfg = cfg_data.get("model", {})
     model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
 
-    fallback_base = None
-    for candidate in (provider_specific, provider_custom, model_cfg):
-        if isinstance(candidate, dict):
-            _base = str(candidate.get("base_url") or "").strip()
-            if _base:
-                fallback_base = _base
-                break
+    candidates = []
+    if isinstance(provider_specific, dict) and provider_specific:
+        candidates.append(provider_specific)
+    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
+        candidates.append(custom_providers[0])
+    if isinstance(provider_custom, dict) and provider_custom:
+        candidates.append(provider_custom)
+    if isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
+        candidates.append(model_cfg)
 
-    fallback_key = None
-    if isinstance(provider_specific, dict):
-        fallback_key = _resolve_key(provider_specific.get("api_key"), provider_specific.get("key_env"), pid)
-    if not fallback_key and isinstance(provider_custom, dict):
-        fallback_key = _resolve_key(provider_custom.get("api_key"), provider_custom.get("key_env"), pid)
-    if not fallback_key and isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
-        fallback_key = _resolve_key(model_cfg.get("api_key"), model_cfg.get("key_env"), pid)
+    for cand in candidates:
+        cand_key = _resolve_key(cand.get("api_key"), cand.get("key_env"), pid)
+        cand_base = str(cand.get("base_url") or "").strip() or None
+        if cand_key or cand_base:
+            if return_provenance:
+                return cand_key, cand_base, False
+            return cand_key, cand_base
 
-    if fallback_key or fallback_base:
-        return fallback_key, fallback_base or None
-
+    if return_provenance:
+        return None, None, False
     return None, None
 
 

@@ -421,3 +421,288 @@ def test_blank_list_entry_does_not_fall_through_to_keyed_providers_endpoint():
     assert conn_api_key == "omni-list-key"
     assert (base_url, conn_api_key) != ("https://omni-keyed.example/v1", "omni-list-key")
 
+
+def _setup_production_composed_runtime(monkeypatch, cfg_dict, runtime_dict, session_id="test-session-1806"):
+    from unittest import mock
+    import queue
+    import api.streaming as streaming
+    import api.oauth
+
+    with config.SESSION_AGENT_CACHE_LOCK:
+        config.SESSION_AGENT_CACHE.clear()
+
+    old_cfg = dict(config.cfg)
+    old_mtime = config._cfg_mtime
+    old_path = getattr(config, "_cfg_path", None)
+    config.cfg.clear()
+    config.cfg.update(cfg_dict)
+    try:
+        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
+    except Exception:
+        config._cfg_mtime = 0.0
+    config._cfg_path = config._get_config_path()
+
+    class FakeSession:
+        def __init__(self):
+            self.session_id = session_id
+            self.title = "Test"
+            self.workspace = "/tmp"
+            self.model = "test-model"
+            self.messages = []
+            self.personality = None
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.estimated_cost = None
+            self.tool_calls = []
+            self.active_stream_id = None
+            self.pending_user_message = None
+            self.pending_attachments = []
+            self.pending_started_at = None
+            self.pending_user_source = None
+            self.profile = None
+
+        def save(self, touch_updated_at=True, skip_index=False):
+            self._saved = touch_updated_at
+
+        def compact(self):
+            return {"session_id": self.session_id, "messages": self.messages}
+
+    captured = {}
+
+    class CapturingAgent:
+        def __init__(
+            self,
+            model=None,
+            provider=None,
+            base_url=None,
+            api_key=None,
+            **kwargs,
+        ):
+            captured["init_kwargs"] = {
+                "model": model,
+                "provider": provider,
+                "base_url": base_url,
+                "api_key": api_key,
+                **kwargs,
+            }
+            self.session_id = kwargs.get("session_id")
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = None
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return {
+                "messages": [
+                    {"role": "user", "content": kwargs.get("persist_user_message", "")},
+                    {"role": "assistant", "content": "ok"},
+                ]
+            }
+
+        def interrupt(self, _message):
+            captured["interrupted"] = _message
+
+    fake_session = FakeSession()
+    fake_stream_id = f"stream-{session_id}"
+    fake_queue = queue.Queue()
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = mock.Mock(return_value=dict(runtime_dict))
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = mock.Mock(return_value=object())
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_hermes_state)
+
+    monkeypatch.setattr(
+        api.oauth,
+        "resolve_runtime_provider_with_anthropic_env_lock",
+        lambda resolver, **kwargs: resolver(**kwargs),
+    )
+    monkeypatch.setattr(streaming, "get_session", lambda _session_id: fake_session)
+    monkeypatch.setattr(streaming, "_get_ai_agent", lambda: CapturingAgent)
+    monkeypatch.setattr("api.config.get_config", lambda: dict(config.cfg))
+    monkeypatch.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+
+    def restore():
+        with config.SESSION_AGENT_CACHE_LOCK:
+            config.SESSION_AGENT_CACHE.clear()
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
+        config.invalidate_models_cache()
+
+    return fake_stream_id, fake_queue, captured, restore
+
+
+def test_production_composed_nonblank_exact_list_row_yields_list_url_and_list_key(monkeypatch):
+    """(a) Nonblank exact list row plus distinct same-slug keyed row yields list URL/list key.
+
+    In production, resolve_runtime_provider() scans providers: first and returns
+    the keyed URL and key. When an exact custom_providers[] entry matches, the
+    runtime send path must atomically replace both fields so that final AIAgent
+    construction receives list endpoint + list key, never keyed key.
+    """
+    import api.streaming as streaming
+
+    cfg_dict = {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {
+            "custom:omni": {
+                "base_url": "https://keyed-url-sentinel.example/v1",
+                "api_key": "keyed-key-sentinel-abc",
+            },
+        },
+        "custom_providers": [
+            {
+                "name": "omni",
+                "base_url": "https://list-url-sentinel.example/v1",
+                "api_key": "list-key-sentinel-xyz",
+            },
+        ],
+    }
+    runtime_dict = {
+        "provider": "custom:omni",
+        "base_url": "https://keyed-url-sentinel.example/v1",
+        "api_key": "keyed-key-sentinel-abc",
+    }
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id="session-1806-nonblank"
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id="session-1806-nonblank",
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    init_kwargs = captured["init_kwargs"]
+    assert init_kwargs["base_url"] == "https://list-url-sentinel.example/v1"
+    assert init_kwargs["api_key"] == "list-key-sentinel-xyz"
+    assert init_kwargs["provider"] == "custom"
+    assert init_kwargs["base_url"] != "https://keyed-url-sentinel.example/v1"
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+
+
+def test_production_composed_blank_exact_list_row_cannot_repopulate_from_keyed_row(monkeypatch):
+    """(b) Blank exact list row cannot repopulate from the keyed row.
+
+    When an exact custom_providers[] entry exists with an empty base_url, that
+    row is authoritative. Final construction must receive base_url=None and the
+    list key; it must NOT fall through to or repopulate the keyed base_url or
+    keyed API key.
+    """
+    import api.streaming as streaming
+
+    cfg_dict = {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {
+            "custom:omni": {
+                "base_url": "https://keyed-url-sentinel.example/v1",
+                "api_key": "keyed-key-sentinel-abc",
+            },
+        },
+        "custom_providers": [
+            {
+                "name": "omni",
+                "base_url": "",
+                "api_key": "list-key-sentinel-xyz",
+            },
+        ],
+    }
+    runtime_dict = {
+        "provider": "custom:omni",
+        "base_url": "https://keyed-url-sentinel.example/v1",
+        "api_key": "keyed-key-sentinel-abc",
+    }
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id="session-1806-blank"
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id="session-1806-blank",
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    init_kwargs = captured["init_kwargs"]
+    assert init_kwargs["base_url"] is None
+    assert init_kwargs["api_key"] == "list-key-sentinel-xyz"
+    assert init_kwargs["base_url"] != "https://keyed-url-sentinel.example/v1"
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+
+
+def test_production_composed_keyed_only_still_yields_keyed_url_and_key(monkeypatch):
+    """(c) Keyed-only/no-list still yields the keyed URL/key.
+
+    When no matching row exists in custom_providers[], the keyed providers:
+    record is authoritative and supplies both base_url and api_key.
+    """
+    import api.streaming as streaming
+
+    cfg_dict = {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {
+            "custom:omni": {
+                "base_url": "https://keyed-url-sentinel.example/v1",
+                "api_key": "keyed-key-sentinel-abc",
+            },
+        },
+        "custom_providers": [
+            {
+                "name": "active",
+                "base_url": "https://active.example/v1",
+                "api_key": "active-key",
+            },
+        ],
+    }
+    runtime_dict = {
+        "provider": "custom:omni",
+        "base_url": "https://keyed-url-sentinel.example/v1",
+        "api_key": "keyed-key-sentinel-abc",
+    }
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id="session-1806-keyed"
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id="session-1806-keyed",
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    init_kwargs = captured["init_kwargs"]
+    assert init_kwargs["base_url"] == "https://keyed-url-sentinel.example/v1"
+    assert init_kwargs["api_key"] == "keyed-key-sentinel-abc"
+    assert init_kwargs["provider"] == "custom"
+
+
