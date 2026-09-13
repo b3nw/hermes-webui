@@ -3271,6 +3271,97 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     return _finalize(model_id, config_provider, config_base_url)
 
 
+def _custom_record_base_url(record: object) -> str | None:
+    """Return a custom record's OWN endpoint, or None when it declares none."""
+    if not isinstance(record, dict):
+        return None
+    return str(record.get("base_url") or "").strip() or None
+
+
+def _resolve_custom_record_key(
+    raw_api_key: object,
+    raw_key_env: object,
+    provider_hint: object = None,
+) -> str | None:
+    """Static credential declared by ONE custom record.
+
+    Accepts a literal key, a ``${ENV_VAR}`` reference or a ``key_env`` env-var
+    hint, then falls back to the ``CUSTOM_<SLUG>_API_KEY`` convention. Reading
+    every form from the SAME record is what keeps an endpoint and a credential
+    from being resolved out of two different authorities.
+    """
+    api_key = None
+    if raw_api_key is not None:
+        key_text = str(raw_api_key).strip()
+        if key_text.startswith("${") and key_text.endswith("}") and len(key_text) > 3:
+            api_key = _thread_local_env_value(key_text[2:-1]).strip() or None
+        elif key_text:
+            api_key = key_text
+    if not api_key:
+        key_env = str(raw_key_env or "").strip()
+        if key_env:
+            api_key = _thread_local_env_value(key_env).strip() or None
+    if not api_key and provider_hint:
+        api_key = _lookup_custom_api_key_env(provider_hint)
+    return api_key
+
+
+def _select_custom_provider_record(
+    pid: str,
+    slug: str,
+    cfg_data: dict,
+) -> tuple[dict | None, str, bool]:
+    """Return ``(record, source, is_exact)`` — the ONE authoritative record for ``pid``.
+
+    Selection order is the WebUI routing contract:
+
+    1. the exact ``custom_providers[]`` row whose name normalizes to ``slug``
+       (authoritative for its slug even against a same-slug keyed record, and
+       even when its ``base_url`` is blank — see #1806);
+    2. otherwise the first keyed/``model:`` record that actually declares a
+       connection, taken as a COMPLETE record rather than field-by-field.
+
+    ``source`` is ``custom_providers`` / ``providers`` / ``model`` (or ``""``
+    when nothing matched) and names the authority that owns every field the
+    caller then lifts off ``record``.
+    """
+    custom_providers = cfg_data.get("custom_providers", [])
+    if not isinstance(custom_providers, list):
+        custom_providers = []
+
+    # Fail closed when the slug maps to multiple entries (raises); otherwise use
+    # the single matching entry. Shared with resolve_model_provider so endpoint
+    # and credential are always resolved from the SAME entry.
+    matched_entry = _unique_custom_provider_entry(custom_providers, slug)
+    if matched_entry is not None:
+        return matched_entry, "custom_providers", True
+
+    # Fallbacks for setups that don't use custom_providers names directly.
+    providers_cfg = cfg_data.get("providers", {})
+    provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
+    provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
+
+    model_cfg = cfg_data.get("model", {})
+    model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
+
+    candidates: list[tuple[dict, str]] = []
+    if isinstance(provider_specific, dict) and provider_specific:
+        candidates.append((provider_specific, "providers"))
+    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
+        candidates.append((custom_providers[0], "custom_providers"))
+    if isinstance(provider_custom, dict) and provider_custom:
+        candidates.append((provider_custom, "providers"))
+    if isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
+        candidates.append((model_cfg, "model"))
+
+    for cand, source in candidates:
+        cand_key = _resolve_custom_record_key(cand.get("api_key"), cand.get("key_env"), pid)
+        if cand_key or _custom_record_base_url(cand):
+            return cand, source, False
+
+    return None, "", False
+
+
 def resolve_custom_provider_connection(
     provider_id: str,
     *,
@@ -3284,6 +3375,12 @@ def resolve_custom_provider_connection(
     If ``return_provenance=True``, returns ``(api_key, base_url, is_exact)``
     indicating whether the connection was resolved from an exact matching
     ``custom_providers[]`` entry.
+
+    This is the URL/key VIEW of the authoritative record. Agent-construction
+    paths want :func:`resolve_custom_provider_bundle` instead: the record also
+    owns ``api_mode``, ``key_cmd``, pool credentials and ACP transport fields,
+    and a caller that takes only two of them still builds a mixed-authority
+    agent.
     """
     pid = str(provider_id or "").strip().lower()
     if not pid.startswith("custom:"):
@@ -3299,77 +3396,467 @@ def resolve_custom_provider_connection(
 
     # Read the live config snapshot to avoid stale module-level cache edge
     # cases after profile switches or runtime config edits.
-    cfg_data = get_config()
-
-    def _resolve_key(raw_api_key, raw_key_env, provider_hint=None) -> str | None:
-        api_key = None
-        if raw_api_key is not None:
-            key_text = str(raw_api_key).strip()
-            if key_text.startswith("${") and key_text.endswith("}") and len(key_text) > 3:
-                api_key = _thread_local_env_value(key_text[2:-1]).strip() or None
-            elif key_text:
-                api_key = key_text
-        if not api_key:
-            key_env = str(raw_key_env or "").strip()
-            if key_env:
-                api_key = _thread_local_env_value(key_env).strip() or None
-        if not api_key and provider_hint:
-            api_key = _lookup_custom_api_key_env(provider_hint)
-        return api_key
-
-    custom_providers = cfg_data.get("custom_providers", [])
-    if not isinstance(custom_providers, list):
-        custom_providers = []
-
-    # Fail closed when the slug maps to multiple entries (raises); otherwise use
-    # the single matching entry. Shared with resolve_model_provider so endpoint
-    # and credential are always resolved from the SAME entry.
-    matched_entry = _unique_custom_provider_entry(custom_providers, slug)
-    if matched_entry is not None:
-        base_url = str(matched_entry.get("base_url") or "").strip() or None
-        api_key = _resolve_key(matched_entry.get("api_key"), matched_entry.get("key_env"), pid)
+    record, _source, is_exact = _select_custom_provider_record(pid, slug, get_config())
+    if record is None:
         if return_provenance:
-            return api_key, base_url, True
-        return api_key, base_url
+            return None, None, False
+        return None, None
 
-    # Fallbacks for setups that don't use custom_providers names directly.
-    # Preserve keyed-only fallback when no exact list row exists, selecting URL
-    # and key as a complete bundle from the same record rather than mixing
-    # credentials and endpoints across candidate records.
-    providers_cfg = cfg_data.get("providers", {})
-    provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
-    provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
-
-    model_cfg = cfg_data.get("model", {})
-    model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
-
-    candidates = []
-    if isinstance(provider_specific, dict) and provider_specific:
-        candidates.append(provider_specific)
-    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
-        candidates.append(custom_providers[0])
-    if isinstance(provider_custom, dict) and provider_custom:
-        candidates.append(provider_custom)
-    if isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
-        candidates.append(model_cfg)
-
-    for cand in candidates:
-        cand_key = _resolve_key(cand.get("api_key"), cand.get("key_env"), pid)
-        cand_base = str(cand.get("base_url") or "").strip() or None
-        if cand_key or cand_base:
-            if return_provenance:
-                return cand_key, cand_base, False
-            return cand_key, cand_base
-
+    base_url = _custom_record_base_url(record)
+    api_key = _resolve_custom_record_key(record.get("api_key"), record.get("key_env"), pid)
     if return_provenance:
-        return None, None, False
-    return None, None
+        return api_key, base_url, is_exact
+    return api_key, base_url
 
 
 # Local OpenAI-compatible servers frequently run without authentication, so a
 # missing key must not fail before the first request: hand the SDK a harmless
-# placeholder and let the endpoint accept it or return its own auth error.
+# placeholder and let the endpoint accept it or return its own auth error. It is
+# applied ONLY after the authoritative record has been resolved in full and
+# reported itself genuinely keyless (no api_key, no key_env, no key_cmd, no
+# host-gated env key, no credential pool) — substituting it while any of those
+# could still mint a credential is what turned a working ``key_cmd`` endpoint
+# into a 401.
 KEYLESS_CUSTOM_API_KEY = "dummy-key"
+
+# The constructor-routing fields AIAgent takes beside provider/base_url/api_key.
+# They travel with the connection: a bundle that replaces the endpoint and the
+# credential but leaves these behind builds an agent whose wire protocol
+# (api_mode), transport (ACP subprocess) or credential source (pool) still
+# points at the previous authority.
+CUSTOM_CONNECTION_SIDE_FIELDS = ("api_mode", "acp_command", "acp_args", "credential_pool")
+
+# Alias spellings accepted for a record's ``api_mode`` / ``transport``, mirroring
+# hermes_cli.config_providers._canonical_api_mode. Resolved locally rather than
+# imported so a record's own transport survives even when the installed runtime
+# module is unavailable (or replaced by a test double).
+_API_MODE_ALIASES = {
+    "chat-completions": "chat_completions",
+    "chatcompletions": "chat_completions",
+    "openai": "chat_completions",
+    "responses": "codex_responses",
+    "openai_responses": "codex_responses",
+    "openai-responses": "codex_responses",
+    "anthropic": "anthropic_messages",
+    "anthropic-messages": "anthropic_messages",
+    "messages": "anthropic_messages",
+    "bedrock": "bedrock_converse",
+    "bedrock-converse": "bedrock_converse",
+}
+_VALID_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+    "codex_app_server",
+}
+
+
+def _custom_record_api_mode(record: dict) -> str | None:
+    """Return the wire protocol a custom record declares for ITSELF, else None.
+
+    ``transport:`` is the v12-migration spelling of ``api_mode:``; hand-edited
+    configs still use either. An unrecognized value returns None so the runtime
+    keeps its own host/provider detection instead of being handed nonsense.
+    """
+    for field in ("api_mode", "transport"):
+        raw = record.get(field)
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        canonical = _API_MODE_ALIASES.get(cleaned.lower(), cleaned).lower()
+        if canonical in _VALID_API_MODES:
+            return canonical
+    return None
+
+
+def _custom_record_acp_transport(record: dict) -> dict:
+    """Return the ACP subprocess transport a custom record declares for ITSELF."""
+    owned: dict = {}
+    command = record.get("acp_command") or record.get("command")
+    if isinstance(command, str) and command.strip():
+        owned["acp_command"] = command.strip()
+    args = record.get("acp_args")
+    if args is None:
+        args = record.get("args")
+    if isinstance(args, (list, tuple)) and len(args) > 0:
+        owned["acp_args"] = list(args)
+    return owned
+
+
+def _custom_record_pool_runtime(base_url: str | None, record: dict) -> dict | None:
+    """Runtime dict from the credential pool that owns ``base_url``, else None.
+
+    Delegates to the installed runtime's own pool lookup so pool ownership,
+    ordering and the loopback placeholder behave exactly as they do for a CLI
+    send. Best-effort: builds that do not expose the helper (or a stubbed
+    runtime module) simply report no pool.
+    """
+    if not base_url:
+        return None
+    try:
+        import hermes_cli.runtime_provider as _runtime_provider
+
+        resolve_pool = getattr(_runtime_provider, "_try_resolve_from_custom_pool", None)
+        if resolve_pool is None:
+            return None
+        return resolve_pool(
+            base_url,
+            "custom",
+            _custom_record_api_mode(record),
+            provider_name=str(record.get("provider_key") or record.get("name") or "") or None,
+        )
+    except Exception:
+        return None
+
+
+def _host_gated_env_key(base_url: str | None) -> str | None:
+    """Env credential the installed runtime would accept for ``base_url``, else None.
+
+    Host-GATED on purpose (GHSA-76xc-57q6-vm5m): the helper only yields
+    OPENAI/OPENROUTER/``<VENDOR>``_API_KEY when the endpoint's host is the
+    authoritative one, so this cannot leak a cloud key to an unrelated custom
+    endpoint. Consulted here only so "is this endpoint genuinely keyless?" has
+    the same answer in WebUI as it does at runtime.
+    """
+    if not base_url:
+        return None
+    try:
+        import hermes_cli.runtime_provider as _runtime_provider
+
+        candidates = getattr(_runtime_provider, "_host_gated_env_key_candidates", None)
+        if candidates is None:
+            return None
+        for candidate in candidates(base_url, ollama=False):
+            cleaned = str(candidate or "").strip()
+            if cleaned:
+                return cleaned
+    except Exception:
+        return None
+    return None
+
+
+def _custom_record_key_cmd_provider(base_url: str | None, record: dict, pid: str):
+    """Per-request token provider for a record's ``key_cmd``, else None.
+
+    ``key_cmd`` names a command that PRINTS a short-lived bearer; both wire
+    clients accept a callable api_key and mint per request. It is a real
+    credential source, so a record that declares one is NOT keyless and must
+    never be handed :data:`KEYLESS_CUSTOM_API_KEY`.
+    """
+    key_cmd = str(record.get("key_cmd") or "").strip()
+    if not key_cmd:
+        return None
+    try:
+        from agent.command_token_source import build_command_token_provider
+
+        return build_command_token_provider(
+            key_cmd, str(record.get("name") or record.get("provider_key") or pid or "custom")
+        )
+    except Exception:
+        logger.debug("key_cmd token provider unavailable for %s", pid, exc_info=True)
+        return None
+
+
+def resolve_custom_provider_bundle(
+    provider_id: str,
+    *,
+    connection_resolver=None,
+) -> dict | None:
+    """Return the COMPLETE connection bundle a named ``custom:*`` record owns.
+
+    ``None`` when ``provider_id`` is not a named custom provider or no record
+    matches. Otherwise a dict with:
+
+    ``base_url``
+        the record's own endpoint (``None`` when it declares none).
+    ``api_key``
+        the record's own credential, resolved through the SAME ladder the
+        runtime uses for a named custom provider: pool credential, then literal
+        / ``${ENV}`` / ``key_env`` / ``CUSTOM_<SLUG>_API_KEY``, then a host-gated
+        env key — with ``key_cmd`` overriding the static forms because it mints a
+        fresh bearer per request. May be a callable (``key_cmd`` token provider).
+    ``keyless``
+        True only when that whole ladder produced nothing, i.e. the endpoint is
+        genuinely unauthenticated. This is the ONLY gate on
+        :data:`KEYLESS_CUSTOM_API_KEY`.
+    ``owned``
+        the subset of :data:`CUSTOM_CONNECTION_SIDE_FIELDS` this record supplies
+        itself. Callers keep these and must not overwrite them with the ambient
+        runtime's values; fields ABSENT here are simply unowned, not proven
+        foreign (see :func:`merge_custom_provider_runtime_bundle`).
+    ``source`` / ``is_exact`` / ``record``
+        the provenance of the selection, so a caller can tell an exact
+        ``custom_providers[]`` row from a keyed fallback.
+
+    ``connection_resolver`` lets a caller inject its own module-bound reference
+    to :func:`resolve_custom_provider_connection`, so monkeypatching that name in
+    the caller's namespace still takes effect. An injected resolver can only
+    report a URL/key pair — there is no record behind it — so the bundle it
+    yields owns no side fields and the caller keeps the runtime's.
+    """
+    pid = str(provider_id or "").strip().lower()
+    if not pid.startswith("custom:"):
+        return None
+    slug = _custom_provider_slug_key(pid)
+    if not slug:
+        return None
+
+    if connection_resolver is not None and connection_resolver is not resolve_custom_provider_connection:
+        # Tolerate resolvers that predate/omit the provenance kwarg (older builds
+        # and test doubles that patch in a plain two-value resolver).
+        try:
+            conn = connection_resolver(pid, return_provenance=True)
+        except TypeError:
+            conn = connection_resolver(pid)
+        if len(conn) == 3:
+            api_key, base_url, is_exact = conn
+        else:
+            api_key, base_url = conn
+            is_exact = False
+        if not (is_exact or api_key or base_url):
+            return None
+        return {
+            "provider_id": pid,
+            "slug": slug,
+            "source": "resolver",
+            "is_exact": bool(is_exact),
+            "record": None,
+            "base_url": base_url,
+            "api_key": api_key,
+            "keyless": not api_key,
+            "owned": {},
+        }
+
+    record, source, is_exact = _select_custom_provider_record(pid, slug, get_config())
+    if record is None:
+        return None
+
+    base_url = _custom_record_base_url(record)
+    owned: dict = {}
+
+    api_mode = _custom_record_api_mode(record)
+    if api_mode:
+        owned["api_mode"] = api_mode
+    owned.update(_custom_record_acp_transport(record))
+
+    # Pool first, exactly like the runtime's named-custom path: a pooled
+    # endpoint's credential AND its pool object come from the same lookup.
+    api_key = None
+    pool_runtime = _custom_record_pool_runtime(base_url, record)
+    if pool_runtime:
+        api_key = pool_runtime.get("api_key") or None
+        if pool_runtime.get("credential_pool") is not None:
+            owned["credential_pool"] = pool_runtime.get("credential_pool")
+
+    if not api_key:
+        api_key = _resolve_custom_record_key(record.get("api_key"), record.get("key_env"), pid)
+    if not api_key:
+        api_key = _host_gated_env_key(base_url)
+
+    # ``key_cmd`` beats a static api_key / key_env (short-lived bearers go stale
+    # mid-session), but never displaces a pooled credential, which the pool
+    # itself already rotates.
+    if not pool_runtime:
+        token_provider = _custom_record_key_cmd_provider(base_url, record, pid)
+        if token_provider is not None:
+            api_key = token_provider
+
+    if "credential_pool" not in owned and record.get("credential_pool") is not None:
+        owned["credential_pool"] = record.get("credential_pool")
+
+    return {
+        "provider_id": pid,
+        "slug": slug,
+        "source": source,
+        "is_exact": is_exact,
+        "record": record,
+        "base_url": base_url,
+        "api_key": api_key,
+        "keyless": not api_key and not record.get("key_cmd"),
+        "owned": owned,
+    }
+
+
+def _custom_bundle_endpoint_matches(bundle: dict, runtime_provider: dict) -> bool:
+    """True when the runtime resolved the SAME endpoint the record owns.
+
+    This is the provenance test that decides whether the ambient runtime's side
+    fields are same-authority (keep) or foreign (clear). A record that declares
+    no endpoint of its own cannot prove the runtime is foreign, so its runtime
+    fields stand.
+    """
+    if not isinstance(runtime_provider, dict) or not runtime_provider:
+        return False
+    record_base_url = bundle.get("base_url")
+    rt_base_url = runtime_provider.get("base_url")
+    if not record_base_url and not rt_base_url:
+        return True
+    if not record_base_url or not rt_base_url:
+        return False
+    return _normalize_base_url_for_match(record_base_url) == _normalize_base_url_for_match(
+        rt_base_url
+    )
+
+
+def merge_custom_provider_runtime_bundle(
+    resolved_provider: str | None,
+    resolved_api_key: str | None,
+    resolved_base_url: str | None,
+    runtime_provider: dict | None = None,
+    *,
+    lookup_provider: str | None = None,
+    connection_resolver=None,
+) -> dict:
+    """Return the COMPLETE constructor-routing bundle for one send attempt.
+
+    Keys: ``provider``, ``base_url``, ``api_key`` plus every field in
+    :data:`CUSTOM_CONNECTION_SIDE_FIELDS`. Callers must apply the WHOLE dict —
+    that is the point: the connection and the transport/protocol/pool fields are
+    one authority, and the agent-cache signature must be derived from the same
+    dict so a bundle change always mints a new agent.
+
+    Every consumer that builds an AIAgent for a ``custom:<slug>`` route goes
+    through here so the endpoint, the credential and the routing fields all come
+    from ONE record. The fill-only pattern this replaces
+    (``if not api_key: api_key = ...``) mixed authorities whenever the runtime
+    provider had already supplied a truthy value from a same-slug keyed
+    ``providers:`` record: resolution deterministically produced the
+    ``custom_providers[]`` row's URL while keeping the keyed row's API key.
+
+    Ownership rules, per side field:
+
+    * the selected record declares it -> the record's value wins (an exact list
+      row's ``api_mode: anthropic_messages`` is not "ambient noise" to be
+      cleared, and a keyed record keeps the pool/transport it owns);
+    * the record declares no endpoint of its own, or the runtime resolved the
+      SAME endpoint -> the runtime's value is same-authority and is kept;
+    * otherwise the runtime resolved a DIFFERENT authority -> the field is
+      cleared, because passing it through is what let a custom HTTP endpoint
+      inherit Anthropic credential pooling and a Claude ACP subprocess.
+
+    :data:`KEYLESS_CUSTOM_API_KEY` is substituted only once the selected record's
+    COMPLETE credential ladder has reported the endpoint genuinely keyless. A
+    record that declares a credential source which produced nothing here (an
+    unbuildable ``key_cmd``, say) is sent without a key rather than with a
+    placeholder that guarantees a 401 and hides the real cause.
+    """
+    return _custom_provider_runtime_bundle_with_provenance(
+        resolved_provider,
+        resolved_api_key,
+        resolved_base_url,
+        runtime_provider,
+        lookup_provider=lookup_provider,
+        connection_resolver=connection_resolver,
+    )[0]
+
+
+def _custom_provider_runtime_bundle_with_provenance(
+    resolved_provider: str | None,
+    resolved_api_key: str | None,
+    resolved_base_url: str | None,
+    runtime_provider: dict | None = None,
+    *,
+    lookup_provider: str | None = None,
+    connection_resolver=None,
+) -> tuple[dict, dict | None]:
+    """:func:`merge_custom_provider_runtime_bundle` plus the record it selected.
+
+    Returns ``(bundle, custom)`` where ``custom`` is the
+    :func:`resolve_custom_provider_bundle` result the merge applied (``None``
+    when the route is not a named custom provider, or no record matched).
+    Callers that also need the provenance take it from here rather than
+    re-resolving: a second resolution re-reads the config and can mint a second
+    ``key_cmd`` token provider or select a different pool entry.
+    """
+    _rt = runtime_provider if isinstance(runtime_provider, dict) else {}
+    bundle = {
+        "provider": resolved_provider,
+        "base_url": resolved_base_url,
+        "api_key": resolved_api_key,
+        "api_mode": _rt.get("api_mode"),
+        "acp_command": _rt.get("acp_command", _rt.get("command")),
+        "acp_args": _rt.get("acp_args", _rt.get("args")),
+        "credential_pool": _rt.get("credential_pool"),
+    }
+
+    lookup = lookup_provider or resolved_provider
+    if not (isinstance(lookup, str) and lookup.startswith("custom:")):
+        return bundle, None
+
+    custom = resolve_custom_provider_bundle(lookup, connection_resolver=connection_resolver)
+    if custom is None:
+        return bundle, None
+
+    same_authority = _custom_bundle_endpoint_matches(custom, _rt)
+
+    if custom["is_exact"]:
+        # An exact ``custom_providers[]`` row is authoritative for its slug: BOTH
+        # the endpoint (including None when the row's base_url is blank) and the
+        # credential are replaced, never merged.
+        bundle["base_url"] = custom["base_url"]
+        if custom["api_key"]:
+            bundle["api_key"] = custom["api_key"]
+        elif same_authority and _rt.get("api_key"):
+            bundle["api_key"] = _rt.get("api_key")
+        else:
+            bundle["api_key"] = None
+    else:
+        # No exact row: the keyed/``model:`` record fills only what the runtime
+        # did not already resolve — and it was picked as one complete record, so
+        # the two fields still cannot split across authorities.
+        if same_authority and _rt.get("api_key"):
+            bundle["api_key"] = _rt.get("api_key")
+        elif custom["api_key"]:
+            bundle["api_key"] = custom["api_key"]
+        if not bundle["base_url"] and custom["base_url"]:
+            bundle["base_url"] = custom["base_url"]
+
+    for field in CUSTOM_CONNECTION_SIDE_FIELDS:
+        if field in custom["owned"]:
+            # The selected record declares this field for ITSELF, so it wins over
+            # the ambient runtime even when the two disagree: an exact list row's
+            # ``api_mode: anthropic_messages`` is the row's wire protocol, not
+            # ambient noise, and a keyed record keeps the pool/ACP transport it
+            # declares.
+            bundle[field] = custom["owned"][field]
+        elif not same_authority:
+            # The record owns an endpoint the runtime did NOT resolve, so this
+            # value provably came from a different authority. Clearing it is what
+            # stops a custom HTTP endpoint inheriting Anthropic credential pooling
+            # and a Claude ACP subprocess.
+            bundle[field] = None
+        # else: the runtime resolved the SAME endpoint the record owns, so its
+        # value is same-authority and the seed above already kept it.
+
+    if bundle["base_url"]:
+        # Route through the generic custom OpenAI-compatible client once the
+        # named provider has supplied the concrete endpoint. Keeping the provider
+        # as custom:<slug> would make Agent init synthesize invalid env-var hints
+        # like CUSTOM:SOMETHING-8000_API_KEY on keyless setups.
+        bundle["provider"] = "custom"
+        if not bundle["api_key"]:
+            if custom["keyless"]:
+                # Only now, with the record's full credential ladder exhausted
+                # (pool, api_key, key_env, CUSTOM_<SLUG>_API_KEY, key_cmd,
+                # host-gated env) and the runtime offering nothing either, is the
+                # endpoint provably keyless.
+                bundle["api_key"] = KEYLESS_CUSTOM_API_KEY
+            else:
+                # The record DECLARES a credential source that did not yield one
+                # here (e.g. a ``key_cmd`` whose token provider could not be
+                # built). Substituting the placeholder would turn that into a
+                # silent 401 against an endpoint that does require auth; leave the
+                # credential unset so the failure names its real cause.
+                logger.warning(
+                    "custom provider %s declares a credential source that produced "
+                    "no key; sending without one rather than the keyless placeholder",
+                    custom["provider_id"],
+                )
+
+    return bundle, custom
 
 
 def apply_custom_provider_connection_authority(
@@ -3379,72 +3866,25 @@ def apply_custom_provider_connection_authority(
     *,
     lookup_provider: str | None = None,
     connection_resolver=None,
+    runtime_provider: dict | None = None,
 ) -> tuple[str | None, str | None, str | None, bool]:
-    """Apply a named ``custom:*`` provider's OWN connection bundle atomically.
+    """Connection-only VIEW of :func:`merge_custom_provider_runtime_bundle`.
 
-    Returns ``(provider, api_key, base_url, custom_owned)``.
-
-    Every consumer that builds an AIAgent for a ``custom:<slug>`` route must go
-    through here so the endpoint and the credential always come from ONE record.
-    The fill-only pattern this replaces (``if not api_key: api_key = ...``) mixed
-    authorities whenever the runtime provider had already supplied a truthy value
-    from a same-slug keyed ``providers:`` record: resolution deterministically
-    produced the ``custom_providers[]`` row's URL while keeping the keyed row's
-    API key, so the final constructor got list-URL + keyed-key.
-
-    An exact ``custom_providers[]`` row is authoritative for its slug: BOTH the
-    endpoint (including ``None`` when the row's ``base_url`` is blank) and the
-    credential are replaced, never merged. Only when no exact row matches do the
-    keyed/``model:`` fallbacks fill missing fields — and ``connection_resolver``
-    already picks those as a complete same-record bundle.
-
+    Returns ``(provider, api_key, base_url, custom_owned)``, where
     ``custom_owned`` reports whether a config-owned custom record supplied the
-    connection. Callers that also route runtime-owned side fields (credential
-    pool, api_mode, ACP command/args) must CLEAR them when it is True: those
-    belong to the ambient runtime provider, not to this custom endpoint.
-
-    ``connection_resolver`` lets a caller pass its own module-bound reference to
-    :func:`resolve_custom_provider_connection` (so monkeypatching that name in
-    the caller's namespace still takes effect) and defaults to this module's.
+    connection. Kept for callers that genuinely construct nothing else; anything
+    that builds an AIAgent should take the whole bundle instead, because the
+    three connection fields alone are not a complete constructor contract.
     """
-    lookup = lookup_provider or resolved_provider
-    if not (isinstance(lookup, str) and lookup.startswith("custom:")):
-        return resolved_provider, resolved_api_key, resolved_base_url, False
-
-    _resolver = connection_resolver or resolve_custom_provider_connection
-    # Tolerate resolvers that predate/omit the provenance kwarg (older builds and
-    # test doubles that patch in a plain two-value resolver).
-    try:
-        _conn = _resolver(lookup, return_provenance=True)
-    except TypeError:
-        _conn = _resolver(lookup)
-    if len(_conn) == 3:
-        cp_key, cp_base, is_exact = _conn
-    else:
-        cp_key, cp_base = _conn
-        is_exact = False
-
-    if is_exact:
-        resolved_base_url = cp_base
-        resolved_api_key = cp_key
-    else:
-        if not resolved_api_key and cp_key:
-            resolved_api_key = cp_key
-        if not resolved_base_url and cp_base:
-            resolved_base_url = cp_base
-
-    if resolved_base_url:
-        # Route through the generic custom OpenAI-compatible client once the
-        # named provider has supplied the concrete endpoint. Keeping the provider
-        # as custom:<slug> would make Agent init synthesize invalid env-var hints
-        # like CUSTOM:SOMETHING-8000_API_KEY on keyless setups.
-        resolved_provider = "custom"
-        if not resolved_api_key:
-            resolved_api_key = KEYLESS_CUSTOM_API_KEY
-
-    return resolved_provider, resolved_api_key, resolved_base_url, bool(
-        is_exact or cp_key or cp_base
+    bundle, custom = _custom_provider_runtime_bundle_with_provenance(
+        resolved_provider,
+        resolved_api_key,
+        resolved_base_url,
+        runtime_provider,
+        lookup_provider=lookup_provider,
+        connection_resolver=connection_resolver,
     )
+    return bundle["provider"], bundle["api_key"], bundle["base_url"], custom is not None
 
 
 # Subprocess ACP transports (Cursor/Copilot CLI). Model IDs often contain '/'
