@@ -8,6 +8,7 @@ model selection and send runtime auth down an impossible env-var path.
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import types
@@ -810,18 +811,47 @@ _LIST_ROW_URL = "https://list-url-sentinel.example/v1"
 _LIST_ROW_KEY = "list-key-sentinel-xyz"
 
 
-def _assert_exact_list_row_bundle(init_kwargs, label):
-    """Assert the whole constructor bundle is target-owned, not a mixed one."""
+# Case (d): every side field in ``_AMBIENT_SIDE_FIELD_RUNTIME`` is genuinely
+# FOREIGN to ``_KEYED_VS_LIST_CFG`` -- the list row owns a different endpoint and
+# declares none of these for itself, so provenance proves they belong to the
+# ambient provider and every one must be cleared. This is an ownership verdict,
+# not a blanket "custom routes never carry side fields" rule: the cases below
+# pin records that DO own them, and there the same merge must keep them.
+_FOREIGN_AMBIENT_SIDE_FIELDS = {
+    "api_mode": None,
+    "acp_command": None,
+    "acp_args": None,
+    "credential_pool": None,
+}
+
+
+def _assert_side_fields(init_kwargs, expected, label):
+    """Assert each constructor side field equals the authority that OWNS it."""
+    for field, value in expected.items():
+        actual = init_kwargs[field]
+        if callable(value):
+            assert actual is value, f"{label}: {field} lost its owner's value"
+        else:
+            assert actual == value, f"{label}: {field} is {actual!r}, expected {value!r}"
+
+
+def _assert_exact_list_row_bundle(init_kwargs, label, side_fields=None):
+    """Assert the whole constructor bundle is target-owned, not a mixed one.
+
+    ``side_fields`` names what the exact list row's authority resolves each side
+    field to; it defaults to case (d), the all-foreign ambient runtime.
+    """
     assert init_kwargs["base_url"] == _LIST_ROW_URL, label
     assert init_kwargs["api_key"] == _LIST_ROW_KEY, label
     assert init_kwargs["provider"] == "custom", label
     # None of the keyed/ambient authority may survive anywhere in the bundle.
     assert init_kwargs["base_url"] != "https://keyed-url-sentinel.example/v1", label
     assert init_kwargs["api_key"] != "keyed-key-sentinel-abc", label
-    assert init_kwargs["credential_pool"] is None, label
-    assert init_kwargs["api_mode"] is None, label
-    assert init_kwargs["acp_command"] is None, label
-    assert init_kwargs["acp_args"] is None, label
+    _assert_side_fields(
+        init_kwargs,
+        _FOREIGN_AMBIENT_SIDE_FIELDS if side_fields is None else side_fields,
+        label,
+    )
 
 
 def test_capturing_agent_exposes_every_runtime_constructor_field(monkeypatch):
@@ -985,6 +1015,329 @@ def test_agent_cache_signature_tracks_the_resolved_bundle(monkeypatch):
     sig_ambient = _run(dict(_AMBIENT_SIDE_FIELD_RUNTIME), "session-1806-sig-ambient")
     assert sig_plain == sig_ambient, (
         "signature still varies with runtime fields the bundle cleared"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ownership-aware side fields
+#
+# "Clear the runtime-owned side fields whenever a custom record supplies the
+# connection" over-corrects. ``api_mode``, ``credential_pool``, ``acp_command``
+# and ``acp_args`` are not intrinsically ambient: a ``custom_providers[]`` row is
+# free to declare ``api_mode: anthropic_messages``, and a keyed
+# ``providers['custom:<slug>']`` record is free to declare a pool and an ACP
+# transport. Blanket-clearing them downgrades an Anthropic-protocol row to
+# chat-completions and drops a keyed record's own pool/transport.
+#
+# The rule these tests pin is provenance, not field name:
+#
+#   * the selected record declares the field  -> the record's value wins;
+#   * the runtime resolved the SAME endpoint  -> its value is same-authority, keep;
+#   * the runtime resolved a DIFFERENT one    -> proven foreign, clear.
+#
+# The same distinction gates ``dummy-key``: it is a statement that the endpoint
+# is UNAUTHENTICATED, so it may only be substituted once the record's whole
+# credential ladder (pool, api_key, key_env, CUSTOM_<SLUG>_API_KEY, key_cmd,
+# host-gated env) has come up empty. Substituting it over a ``key_cmd`` or a
+# pooled credential turns a working endpoint into a 401.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_composed_send(monkeypatch, cfg_dict, runtime_dict, session_id, before_send=None):
+    """Drive ONE production-composed streaming send; return the constructor kwargs.
+
+    ``before_send`` runs after the fake ``hermes_cli.runtime_provider`` module is
+    installed, so a test can hang extra runtime helpers (the credential-pool
+    lookup) off it before resolution happens.
+    """
+    import api.streaming as streaming
+
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id=session_id
+    )
+    try:
+        if before_send is not None:
+            before_send()
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+    return captured["init_kwargs"]
+
+
+def _exact_list_row_cfg(*, drop=(), **row_fields):
+    """``_KEYED_VS_LIST_CFG`` with the exact ``custom_providers[]`` row extended."""
+    cfg_dict = copy.deepcopy(_KEYED_VS_LIST_CFG)
+    for field in drop:
+        cfg_dict["custom_providers"][0].pop(field, None)
+    cfg_dict["custom_providers"][0].update(row_fields)
+    return cfg_dict
+
+
+def _ambient_runtime(**overrides):
+    runtime = copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME)
+    runtime.update(overrides)
+    return runtime
+
+
+# ── (a) exact-list-owned Anthropic mode ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "row_fields,session_suffix",
+    [
+        ({"api_mode": "anthropic_messages"}, "api-mode"),
+        # ``transport:`` is the v12-migration spelling and ``anthropic`` an
+        # accepted alias; a hand-edited config using either still owns the mode.
+        ({"transport": "anthropic"}, "transport-alias"),
+    ],
+)
+def test_exact_list_row_keeps_its_own_anthropic_api_mode(
+    monkeypatch, row_fields, session_suffix
+):
+    """(a) The row declares its wire protocol, so neither clearing nor the ambient wins.
+
+    The ambient runtime reports ``chat_completions`` for a DIFFERENT endpoint.
+    Both failure modes are visible here: passing the ambient value through gives
+    ``chat_completions``, blanket-clearing gives ``None``, and only reading the
+    row's own declaration gives ``anthropic_messages`` — which is what decides
+    whether the send speaks /v1/messages or /v1/chat/completions.
+    """
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(**row_fields),
+        _ambient_runtime(api_mode="chat_completions"),
+        f"session-1806-owned-{session_suffix}",
+    )
+
+    _assert_exact_list_row_bundle(
+        init_kwargs,
+        f"exact list row owns api_mode ({session_suffix})",
+        side_fields={**_FOREIGN_AMBIENT_SIDE_FIELDS, "api_mode": "anthropic_messages"},
+    )
+
+
+# ── (b) exact-list key_cmd / pool credential ─────────────────────────────────
+
+
+def _fake_command_token_source(monkeypatch, build):
+    fake_module = types.ModuleType("agent.command_token_source")
+    fake_module.build_command_token_provider = build
+    monkeypatch.setitem(sys.modules, "agent.command_token_source", fake_module)
+
+
+def test_exact_list_row_key_cmd_is_not_replaced_by_dummy_key(monkeypatch):
+    """(b) A ``key_cmd`` row mints a real per-request bearer, so it is NOT keyless.
+
+    ``key_cmd`` names a command that prints a short-lived bearer; both wire
+    clients accept a callable api_key and mint one per request. Handing the
+    endpoint ``dummy-key`` instead — because the row carries no literal
+    ``api_key`` — is a guaranteed 401 against an endpoint that does want auth.
+    """
+    built = {}
+
+    def _token_provider():
+        return "minted-bearer-sentinel"
+
+    def _build(key_cmd, name):
+        built["key_cmd"] = key_cmd
+        built["name"] = name
+        return _token_provider
+
+    _fake_command_token_source(monkeypatch, _build)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(drop=("api_key",), key_cmd="print-omni-bearer"),
+        _ambient_runtime(),
+        "session-1806-owned-key-cmd",
+    )
+
+    assert built["key_cmd"] == "print-omni-bearer", "key_cmd was never consulted"
+    assert built["name"] == "omni"
+    assert init_kwargs["api_key"] is _token_provider, "row's key_cmd token source lost"
+    assert init_kwargs["api_key"]() == "minted-bearer-sentinel"
+    assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+    assert init_kwargs["base_url"] == _LIST_ROW_URL
+    assert init_kwargs["provider"] == "custom"
+    _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, "exact list row key_cmd")
+
+
+def test_exact_list_row_unbuildable_key_cmd_still_refuses_dummy_key(monkeypatch):
+    """(b) ``dummy-key`` asserts "this endpoint is unauthenticated" — never a guess.
+
+    When the token provider cannot be built (older agent build, broken command
+    spec) the endpoint is still an authenticated one whose credential is missing.
+    Substituting the keyless placeholder would report that as an opaque 401
+    instead of the real cause, so the send goes out with no credential at all.
+    """
+
+    def _build(_key_cmd, _name):
+        raise RuntimeError("command token source unavailable")
+
+    _fake_command_token_source(monkeypatch, _build)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(drop=("api_key",), key_cmd="print-omni-bearer"),
+        _ambient_runtime(),
+        "session-1806-owned-key-cmd-broken",
+    )
+
+    assert init_kwargs["api_key"] is None, "keyless placeholder masked a declared key_cmd"
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+    assert init_kwargs["base_url"] == _LIST_ROW_URL
+
+
+def test_exact_list_row_pool_credential_and_pool_object_both_survive(monkeypatch):
+    """(b) A pooled row keeps the pool's key AND the pool object — from ITS endpoint.
+
+    The credential and the ``credential_pool`` the agent rotates it with come
+    from one lookup keyed on the ROW's base_url. Clearing the pool (while keeping
+    its key) leaves the agent unable to rotate; keeping the ambient pool points
+    rotation at the previous authority; falling back to ``dummy-key`` drops the
+    credential entirely.
+    """
+    pool_sentinel = ["list-row-pool-sentinel"]
+    seen = {}
+
+    def _before_send():
+        runtime_module = sys.modules["hermes_cli.runtime_provider"]
+
+        def _try_resolve_from_custom_pool(
+            base_url, provider_label, api_mode_override=None, provider_name=None
+        ):
+            seen["base_url"] = base_url
+            seen["provider_name"] = provider_name
+            if base_url != _LIST_ROW_URL:
+                return None
+            return {"api_key": "pool-key-sentinel", "credential_pool": pool_sentinel}
+
+        runtime_module._try_resolve_from_custom_pool = _try_resolve_from_custom_pool
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(drop=("api_key",)),
+        _ambient_runtime(),
+        "session-1806-owned-pool",
+        before_send=_before_send,
+    )
+
+    # The pool was looked up for the ROW's endpoint, not the ambient one.
+    assert seen["base_url"] == _LIST_ROW_URL
+    assert seen["provider_name"] == "omni"
+    assert init_kwargs["api_key"] == "pool-key-sentinel"
+    assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+    _assert_side_fields(
+        init_kwargs,
+        {**_FOREIGN_AMBIENT_SIDE_FIELDS, "credential_pool": pool_sentinel},
+        "exact list row pool",
+    )
+    assert init_kwargs["credential_pool"] is pool_sentinel
+    assert init_kwargs["credential_pool"] != _AMBIENT_SIDE_FIELD_RUNTIME["credential_pool"]
+
+
+# ── (c) keyed-only record's own side fields ──────────────────────────────────
+
+
+_KEYED_ONLY_OWNED_CFG = {
+    "model": {"default": "active/model", "provider": "custom:active"},
+    "providers": {
+        "custom:omni": {
+            "base_url": "https://keyed-url-sentinel.example/v1",
+            "api_key": "keyed-key-sentinel-abc",
+            # Side fields the KEYED record declares for itself.
+            "api_mode": "anthropic_messages",
+            "credential_pool": ["keyed-pool-sentinel"],
+            "acp_command": "keyed-acp-sentinel",
+            "acp_args": ["--keyed-arg-sentinel"],
+        },
+    },
+    "custom_providers": [
+        {
+            "name": "active",
+            "base_url": "https://active.example/v1",
+            "api_key": "active-key",
+        },
+    ],
+}
+
+
+def test_keyed_only_record_keeps_the_side_fields_it_owns(monkeypatch):
+    """(c) No list row: the keyed record is the authority for ITS side fields too.
+
+    ``providers['custom:omni']`` supplies the endpoint and the credential, so it
+    also owns the pool, wire protocol and ACP transport it declares. Clearing
+    them because the route is ``custom:<slug>`` throws away the record's own
+    configuration; taking the ambient values (all four differ here) routes the
+    send through the previous authority.
+    """
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        copy.deepcopy(_KEYED_ONLY_OWNED_CFG),
+        _ambient_runtime(
+            api_mode="chat_completions",
+            command="ambient-acp-sentinel",
+            args=["--ambient-arg-sentinel"],
+            credential_pool=["ambient-pool-sentinel"],
+        ),
+        "session-1806-keyed-owned",
+    )
+
+    assert init_kwargs["base_url"] == "https://keyed-url-sentinel.example/v1"
+    assert init_kwargs["api_key"] == "keyed-key-sentinel-abc"
+    assert init_kwargs["provider"] == "custom"
+    _assert_side_fields(
+        init_kwargs,
+        {
+            "api_mode": "anthropic_messages",
+            "credential_pool": ["keyed-pool-sentinel"],
+            "acp_command": "keyed-acp-sentinel",
+            "acp_args": ["--keyed-arg-sentinel"],
+        },
+        "keyed-only owned side fields",
+    )
+
+
+def test_keyed_only_record_without_side_fields_keeps_same_endpoint_runtime(monkeypatch):
+    """(c) The clear is provenance-driven, not slug-driven.
+
+    Here the keyed record declares no side fields and the runtime resolved the
+    SAME endpoint the record owns, so the runtime's values are same-authority.
+    Clearing them would strip a legitimately-pooled Anthropic-protocol endpoint
+    of its pool and protocol just because the route is spelled ``custom:<slug>``.
+    """
+    cfg_dict = copy.deepcopy(_KEYED_ONLY_OWNED_CFG)
+    for field in ("api_mode", "credential_pool", "acp_command", "acp_args"):
+        cfg_dict["providers"]["custom:omni"].pop(field)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        cfg_dict,
+        _ambient_runtime(),
+        "session-1806-keyed-same-authority",
+    )
+
+    assert init_kwargs["base_url"] == "https://keyed-url-sentinel.example/v1"
+    _assert_side_fields(
+        init_kwargs,
+        {
+            "api_mode": _AMBIENT_SIDE_FIELD_RUNTIME["api_mode"],
+            "credential_pool": _AMBIENT_SIDE_FIELD_RUNTIME["credential_pool"],
+            "acp_command": _AMBIENT_SIDE_FIELD_RUNTIME["command"],
+            "acp_args": _AMBIENT_SIDE_FIELD_RUNTIME["args"],
+        },
+        "keyed-only same-authority runtime",
     )
 
 

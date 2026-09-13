@@ -46,6 +46,7 @@ from api.config import (
     resolve_model_provider,
     resolve_custom_provider_connection,
     apply_custom_provider_connection_authority,
+    merge_custom_provider_runtime_bundle,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -670,40 +671,21 @@ def _resolve_runtime_connection_bundle(
     the point: the endpoint/credential and the transport/protocol/pool fields
     are one authority, and the agent-cache signature must be derived from the
     same dict so a bundle change always mints a new agent.
-
-    When a config-owned custom record supplies the connection, the runtime-owned
-    side fields are explicitly cleared rather than passed through. A named
-    ``custom:<slug>`` endpoint is a plain OpenAI-compatible HTTP endpoint: it
-    does not use Anthropic credential pooling, does not speak a non-default
-    ``api_mode``, and is not reached through a Claude/Cursor ACP subprocess. The
-    ambient runtime provider can legitimately report all three (that's the
-    provider the process is otherwise authenticated as), so passing them through
-    is what made a custom-provider send inherit a foreign transport/credential.
     """
-    (
-        provider,
-        api_key,
-        base_url,
-        custom_owned,
-    ) = _resolve_custom_provider_connection_authority(
-        resolved_provider,
-        resolved_api_key,
-        resolved_base_url,
-        profile_name=profile_name,
-        custom_provider_lookup=custom_provider_lookup,
-    )
+    lookup_provider = custom_provider_lookup or resolved_provider
+    from api import profiles as _profiles_api
 
-    bundle = {'provider': provider, 'base_url': base_url, 'api_key': api_key}
-    if custom_owned:
-        bundle.update({_field: None for _field in _RUNTIME_BUNDLE_FIELDS})
-        return bundle
-
-    _rt = runtime_provider if isinstance(runtime_provider, dict) else {}
-    bundle['api_mode'] = _rt.get('api_mode')
-    bundle['acp_command'] = _rt.get('command')
-    bundle['acp_args'] = _rt.get('args')
-    bundle['credential_pool'] = _rt.get('credential_pool')
-    return bundle
+    with _profiles_api.profile_scope_for_detached_worker(
+        profile_name, "custom provider connection", logger_override=logger
+    ):
+        return merge_custom_provider_runtime_bundle(
+            resolved_provider,
+            resolved_api_key,
+            resolved_base_url,
+            runtime_provider,
+            lookup_provider=lookup_provider,
+            connection_resolver=resolve_custom_provider_connection,
+        )
 
 
 def _same_base_url_endpoint(url_a: str, url_b: str) -> bool:
