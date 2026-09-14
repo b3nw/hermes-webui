@@ -2970,6 +2970,109 @@ from api.request_diagnostics import RequestDiagnostics
 from api.system_health import build_system_health_payload
 
 
+# ── Non-streaming custom-provider connection authority ───────────────────────
+#
+# Several WebUI consumers build their own AIAgent outside the streaming path
+# (POST /api/chat, manual compression, update summary, git commit message,
+# handoff summary). They resolve a model/provider, ask the Hermes runtime
+# provider for a connection, then had to apply the named ``custom:<slug>``
+# record's authority by hand.
+#
+# ``apply_custom_provider_connection_authority`` returns only the THREE
+# connection fields, and three fields are not a complete constructor contract:
+# AIAgent also takes ``api_mode`` (wire protocol), ``credential_pool``
+# (credential source) and ``acp_command``/``acp_args`` (subprocess transport).
+# A consumer that replaced the endpoint and credential while leaving those to
+# default — or, worse, to the ambient runtime — built a mixed-authority agent:
+# an exact row's ``api_mode: anthropic_messages`` or its own pool never reached
+# the constructor at all. These helpers carry the WHOLE bundle instead, exactly
+# as ``api/streaming.py`` does for the streaming path.
+
+# The constructor-routing fields that travel with provider/base_url/api_key as
+# one authority. Mirrors ``api.streaming._RUNTIME_BUNDLE_FIELDS`` and
+# ``api.config.CUSTOM_CONNECTION_SIDE_FIELDS``.
+_AGENT_BUNDLE_SIDE_FIELDS = ("api_mode", "acp_command", "acp_args", "credential_pool")
+
+
+def _resolve_agent_connection_bundle(
+    resolved_provider,
+    resolved_api_key,
+    resolved_base_url,
+    runtime_provider=None,
+    *,
+    lookup_provider=None,
+):
+    """Return the COMPLETE constructor-routing bundle for a non-streaming send.
+
+    Keys: ``provider``, ``base_url``, ``api_key`` plus every field in
+    :data:`_AGENT_BUNDLE_SIDE_FIELDS`. Pass the whole dict to the constructor
+    via :func:`_agent_bundle_kwargs` — the endpoint/credential and the
+    transport/protocol/pool fields are ONE authority.
+
+    ``runtime_provider`` is the dict ``resolve_runtime_provider`` returned. It
+    matters: the merge seeds the side fields from it and then decides, by
+    endpoint provenance, whether they are same-authority (keep) or the ambient
+    provider's (clear). Omitting it silently drops that signal.
+
+    ``lookup_provider`` preserves the pre-canonicalization ``custom:<slug>``
+    identity, since the merge rewrites a resolved bundle's provider to the
+    generic ``custom``.
+    """
+    return api_config.merge_custom_provider_runtime_bundle(
+        resolved_provider,
+        resolved_api_key,
+        resolved_base_url,
+        runtime_provider,
+        lookup_provider=lookup_provider or resolved_provider,
+    )
+
+
+def _agent_bundle_kwargs(agent_cls, bundle):
+    """Return the bundle's side-field kwargs supported by ``agent_cls``.
+
+    ``api_mode``/``acp_command``/``acp_args``/``credential_pool`` were added to
+    AIAgent over several releases, so gate each on the constructor signature the
+    way the streaming path does rather than raising TypeError against an older
+    hermes-agent build. Values come from the BUNDLE, never from the runtime
+    provider dict: a custom-provider override clears these, and reading them off
+    the runtime would re-introduce the authority the merge just replaced.
+    """
+    import inspect as _inspect
+
+    try:
+        params = set(_inspect.signature(agent_cls.__init__).parameters)
+    except (TypeError, ValueError):
+        return {}
+    return {
+        field: bundle[field]
+        for field in _AGENT_BUNDLE_SIDE_FIELDS
+        if field in params
+    }
+
+
+def _auxiliary_main_runtime(bundle, model):
+    """Return the ``main_runtime`` an auxiliary client must receive for a bundle.
+
+    When the auxiliary client answers, AIAgent is never built, so this dict is
+    the ONLY place the resolved authority reaches the wire. It therefore carries
+    the same whole bundle :func:`_agent_bundle_kwargs` hands the constructor —
+    endpoint and credential plus every field in
+    :data:`_AGENT_BUNDLE_SIDE_FIELDS`. Sending only provider/model/base_url/
+    api_key silently downgraded an exact row's ``api_mode``
+    (``anthropic_messages`` fell back to chat completions) and dropped the
+    credential pool/ACP transport that belong to the same record.
+    """
+    runtime = {
+        "provider": bundle["provider"],
+        "model": model,
+        "base_url": bundle["base_url"],
+        "api_key": bundle["api_key"],
+    }
+    for field in _AGENT_BUNDLE_SIDE_FIELDS:
+        runtime[field] = bundle[field]
+    return runtime
+
+
 def _kanban_unknown_endpoint(handler, parsed, method: str) -> bool:
     """Return a Kanban-specific 404 for stale clients/obsolete endpoint shapes."""
     return bad(
@@ -14919,7 +15022,6 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
         logger_override=logger,
     ):
         from api.config import (
-            apply_custom_provider_connection_authority,
             get_effective_default_model,
             resolve_model_provider,
         )
@@ -14931,6 +15033,7 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
 
         _main_model, _main_provider, _main_base_url = resolve_model_provider(get_effective_default_model())
         _main_api_key = None
+        _rt = None
         try:
             from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
             from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -14947,22 +15050,16 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
         except Exception as _e:
             logger.debug("update summary runtime provider resolution failed: %s", _e)
         # Atomic custom-provider authority (see the /api/chat note): the record
-        # that supplies the endpoint must also supply the credential.
-        (
-            _main_provider,
-            _main_api_key,
-            _main_base_url,
-            _,
-        ) = apply_custom_provider_connection_authority(
-            _main_provider, _main_api_key, _main_base_url
+        # that supplies the endpoint must also supply the credential — and the
+        # wire protocol, credential pool and ACP transport that go with it.
+        _bundle = _resolve_agent_connection_bundle(
+            _main_provider, _main_api_key, _main_base_url, _rt
         )
+        _main_provider = _bundle["provider"]
+        _main_api_key = _bundle["api_key"]
+        _main_base_url = _bundle["base_url"]
 
-        main_runtime = {
-            "provider": _main_provider,
-            "model": _main_model,
-            "base_url": _main_base_url,
-            "api_key": _main_api_key,
-        }
+        main_runtime = _auxiliary_main_runtime(_bundle, _main_model)
 
         ensure_agent_runtime_current()
         try:
@@ -14992,6 +15089,7 @@ def _llm_update_summary(system_prompt: str, user_prompt: str, active_profile: st
             quiet_mode=True,
             enabled_toolsets=[],
             session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
+            **_agent_bundle_kwargs(AIAgent, _bundle),
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -24527,16 +24625,14 @@ def _handle_chat_sync(handler, body):
         AIAgent = require_ai_agent_class()
 
         with CHAT_LOCK:
-            from api.config import (
-                resolve_model_provider,
-                apply_custom_provider_connection_authority,
-            )
+            from api.config import resolve_model_provider
 
             _model, _provider, _base_url = resolve_model_provider(
                 model_with_provider_context(s.model, getattr(s, "model_provider", None))
             )
             # Resolve API key via Hermes runtime provider (matches gateway behaviour)
             _api_key = None
+            _rt = None
             try:
                 from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -24556,13 +24652,18 @@ def _handle_chat_sync(handler, body):
                     f"[webui] WARNING: resolve_runtime_provider failed: {_e}",
                     flush=True,
                 )
-            # Apply the named custom provider's OWN record atomically. The
-            # fill-only form this replaced kept a truthy runtime value, so a slug
-            # present in BOTH custom_providers[] and providers: sent the list
-            # row's URL with the keyed row's API key.
-            _provider, _api_key, _base_url, _ = apply_custom_provider_connection_authority(
-                _provider, _api_key, _base_url
+            # Apply the named custom provider's OWN record atomically, as one
+            # COMPLETE bundle. The fill-only form this replaced kept a truthy
+            # runtime value, so a slug present in BOTH custom_providers[] and
+            # providers: sent the list row's URL with the keyed row's API key;
+            # the connection-only view that followed still truncated the record's
+            # api_mode / credential_pool / ACP transport before the constructor.
+            _bundle = _resolve_agent_connection_bundle(
+                _provider, _api_key, _base_url, _rt
             )
+            _provider = _bundle["provider"]
+            _api_key = _bundle["api_key"]
+            _base_url = _bundle["base_url"]
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
@@ -24574,6 +24675,7 @@ def _handle_chat_sync(handler, body):
                 quiet_mode=True,
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
+                **_agent_bundle_kwargs(AIAgent, _bundle),
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
@@ -25139,7 +25241,6 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
         logger_override=logger,
     ):
         from api.config import (
-            apply_custom_provider_connection_authority,
             get_effective_default_model,
             model_with_provider_context,
             resolve_model_provider,
@@ -25154,6 +25255,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
         )
         _main_model, _main_provider, _main_base_url = resolve_model_provider(model_for_resolution)
         _main_api_key = None
+        _rt = None
         try:
             from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
             from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -25170,26 +25272,20 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
         except Exception as _e:
             logger.debug("git commit message runtime provider resolution failed: %s", _e)
         # Atomic custom-provider authority (see the /api/chat note): the record
-        # that supplies the endpoint must also supply the credential.
-        (
-            _main_provider,
-            _main_api_key,
-            _main_base_url,
-            _,
-        ) = apply_custom_provider_connection_authority(
-            _main_provider, _main_api_key, _main_base_url
+        # that supplies the endpoint must also supply the credential — and the
+        # wire protocol, credential pool and ACP transport that go with it.
+        _bundle = _resolve_agent_connection_bundle(
+            _main_provider, _main_api_key, _main_base_url, _rt
         )
+        _main_provider = _bundle["provider"]
+        _main_api_key = _bundle["api_key"]
+        _main_base_url = _bundle["base_url"]
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        main_runtime = {
-            "provider": _main_provider,
-            "model": _main_model,
-            "base_url": _main_base_url,
-            "api_key": _main_api_key,
-        }
+        main_runtime = _auxiliary_main_runtime(_bundle, _main_model)
         ensure_agent_runtime_current()
         try:
             from agent.auxiliary_client import get_text_auxiliary_client
@@ -25218,6 +25314,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
             quiet_mode=True,
             enabled_toolsets=[],
             session_id=f"git-commit-message-{uuid.uuid4().hex[:8]}",
+            **_agent_bundle_kwargs(AIAgent, _bundle),
         )
         result = agent.run_conversation(
             user_message=user_prompt,
@@ -27237,6 +27334,7 @@ def _handle_session_compress(handler, body):
         )
 
         resolved_api_key = None
+        _rt = None
         try:
             _rt = resolve_runtime_provider_with_anthropic_env_lock(
                 _runtime_provider.resolve_runtime_provider,
@@ -27251,15 +27349,15 @@ def _handle_session_compress(handler, body):
             logger.warning("resolve_runtime_provider failed for compression: %s", _e)
 
         # Atomic custom-provider authority: the deterministic list-row URL must
-        # not be paired with a keyed/runtime API key (see the /api/chat note).
-        (
-            resolved_provider,
-            resolved_api_key,
-            resolved_base_url,
-            _,
-        ) = _cfg.apply_custom_provider_connection_authority(
-            resolved_provider, resolved_api_key, resolved_base_url
+        # not be paired with a keyed/runtime API key (see the /api/chat note),
+        # and the record's own api_mode / credential_pool / ACP transport must
+        # reach the constructor with it rather than being truncated away.
+        _bundle = _resolve_agent_connection_bundle(
+            resolved_provider, resolved_api_key, resolved_base_url, _rt
         )
+        resolved_provider = _bundle["provider"]
+        resolved_api_key = _bundle["api_key"]
+        resolved_base_url = _bundle["base_url"]
 
         if not resolved_api_key:
             return bad(handler, "No provider configured -- cannot compress.")
@@ -27288,6 +27386,7 @@ def _handle_session_compress(handler, body):
             quiet_mode=True,
             enabled_toolsets=_resolve_cli_toolsets(),
             session_id=sid,
+            **_agent_bundle_kwargs(AIAgent, _bundle),
         )
         compressed = agent.context_compressor.compress(
             original_messages,
@@ -27927,6 +28026,7 @@ def _handle_handoff_summary(handler, body):
         resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(model_for_resolution)
 
         resolved_api_key = None
+        _rt = None
         try:
             _rt = resolve_runtime_provider_with_anthropic_env_lock(
                 _runtime_provider.resolve_runtime_provider,
@@ -27941,15 +28041,15 @@ def _handle_handoff_summary(handler, body):
             logger.warning("resolve_runtime_provider failed for handoff summary: %s", _e)
 
         # Atomic custom-provider authority (see the /api/chat note): the session's
-        # own custom_providers[] row owns BOTH the endpoint and the credential.
-        (
-            resolved_provider,
-            resolved_api_key,
-            resolved_base_url,
-            _,
-        ) = _cfg.apply_custom_provider_connection_authority(
-            resolved_provider, resolved_api_key, resolved_base_url
+        # own custom_providers[] row owns BOTH the endpoint and the credential,
+        # plus the api_mode / credential_pool / ACP transport that travel with
+        # them as one constructor bundle.
+        _bundle = _resolve_agent_connection_bundle(
+            resolved_provider, resolved_api_key, resolved_base_url, _rt
         )
+        resolved_provider = _bundle["provider"]
+        resolved_api_key = _bundle["api_key"]
+        resolved_base_url = _bundle["base_url"]
 
         if not resolved_api_key:
             summary_text = _fallback_handoff_summary(msgs)
@@ -27980,6 +28080,7 @@ def _handle_handoff_summary(handler, body):
             quiet_mode=True,
             enabled_toolsets=[],
             session_id=sid,
+            **_agent_bundle_kwargs(AIAgent, _bundle),
         )
 
         summary_system_prompt = (
