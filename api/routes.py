@@ -3017,13 +3017,32 @@ def _resolve_agent_connection_bundle(
     ``lookup_provider`` preserves the pre-canonicalization ``custom:<slug>``
     identity, since the merge rewrites a resolved bundle's provider to the
     generic ``custom``.
+
+    Raises :class:`api.config.CustomProviderRouteError` when the merge returns a
+    TERMINAL route verdict — a named ``custom:<slug>`` that resolved no complete
+    ``(api_key, base_url)`` pair. This is the single chokepoint for every
+    non-streaming and auxiliary consumer precisely because an incomplete bundle
+    is NOT a refusal at the constructor: AIAgent's ``_init_openai_client()``
+    only honours an explicit pair when BOTH fields are truthy and otherwise
+    calls ``_routed_client_kwargs()``, which re-resolves a provider and can
+    reach the ambient endpoint or the init-time fallback chain. Returning the
+    bundle with a hole in it would therefore route the send somewhere the user
+    never asked for; raising here keeps the refusal terminal for all five call
+    sites (POST /api/chat, manual compression, update summary, git commit
+    message, handoff summary) without each having to remember to check.
+
+    The exception subclasses ``ValueError``, so the existing ``except
+    ValueError`` / broad-``except`` handlers at those call sites already turn it
+    into a controlled 400 or a deterministic non-LLM fallback.
     """
-    return api_config.merge_custom_provider_runtime_bundle(
-        resolved_provider,
-        resolved_api_key,
-        resolved_base_url,
-        runtime_provider,
-        lookup_provider=lookup_provider or resolved_provider,
+    return api_config.raise_for_custom_provider_route(
+        api_config.merge_custom_provider_runtime_bundle(
+            resolved_provider,
+            resolved_api_key,
+            resolved_base_url,
+            runtime_provider,
+            lookup_provider=lookup_provider or resolved_provider,
+        )
     )
 
 
@@ -24658,9 +24677,26 @@ def _handle_chat_sync(handler, body):
             # providers: sent the list row's URL with the keyed row's API key;
             # the connection-only view that followed still truncated the record's
             # api_mode / credential_pool / ACP transport before the constructor.
-            _bundle = _resolve_agent_connection_bundle(
-                _provider, _api_key, _base_url, _rt
-            )
+            try:
+                _bundle = _resolve_agent_connection_bundle(
+                    _provider, _api_key, _base_url, _rt
+                )
+            except api_config.CustomProviderRouteError as _route_err:
+                # The named route resolved no usable connection. Constructing
+                # AIAgent with the incomplete pair would send this turn through
+                # ``_routed_client_kwargs()`` to whatever provider init resolves
+                # next, so answer with the actionable cause instead. 400, not
+                # 500: it is a user-fixable provider misconfiguration, exactly
+                # like the ambiguous-slug collision.
+                logger.warning(
+                    "Chat blocked by unroutable custom provider: %s", _route_err.message
+                )
+                return j(handler, {
+                    "error": _route_err.message,
+                    "type": "custom_provider_unroutable",
+                    "reason": _route_err.reason,
+                    "hint": _route_err.hint,
+                }, status=400)
             _provider = _bundle["provider"]
             _api_key = _bundle["api_key"]
             _base_url = _bundle["base_url"]

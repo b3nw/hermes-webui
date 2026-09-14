@@ -47,6 +47,11 @@ from api.config import (
     resolve_custom_provider_connection,
     apply_custom_provider_connection_authority,
     merge_custom_provider_runtime_bundle,
+    CustomProviderRouteError,
+    CUSTOM_ROUTE_NO_CREDENTIAL,
+    CUSTOM_ROUTE_NO_ENDPOINT,
+    custom_provider_route_error,
+    raise_for_custom_provider_route,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -1503,6 +1508,35 @@ def _result_reports_compression_snapshot_stale(result) -> bool:
     )
 
 
+def _custom_provider_route_classification(error) -> dict:
+    """WebUI apperror classification for a terminal custom-provider route.
+
+    ``error`` is either a :class:`CustomProviderRouteError` or the verdict dict
+    :func:`custom_provider_route_error` read off a bundle — the retry paths hold
+    the verdict without ever raising, so both shapes classify identically.
+    """
+    if isinstance(error, dict):
+        reason = error.get('reason')
+        hint = error.get('hint') or ''
+        message = error.get('message') or ''
+    else:
+        reason = getattr(error, 'reason', None)
+        hint = getattr(error, 'hint', '') or ''
+        message = getattr(error, 'message', None) or str(error)
+    if reason == CUSTOM_ROUTE_NO_CREDENTIAL:
+        label = 'Provider credential unavailable'
+    elif reason == CUSTOM_ROUTE_NO_ENDPOINT:
+        label = 'Provider endpoint unavailable'
+    else:
+        label = 'Provider not configured'
+    return {
+        'label': label,
+        'type': 'provider_unroutable',
+        'hint': hint,
+        'message': message,
+    }
+
+
 def _classify_provider_error(
     err_str: str,
     exc=None,
@@ -1525,6 +1559,12 @@ def _classify_provider_error(
     err_str = str(_probe_text or err_str or '')
     _err_lower = err_str.lower()
     _exc_name = type(exc).__name__ if exc is not None else ''
+    if isinstance(exc, CustomProviderRouteError):
+        # An unroutable named ``custom:<slug>`` route. Classified BEFORE any text
+        # matching so it can never be read as a 401 — the auth branch would run
+        # credential self-heal, which re-resolves a provider and is exactly the
+        # re-routing this verdict exists to prevent.
+        return _custom_provider_route_classification(exc)
     _result_is_compression_snapshot_stale = (
         _result_reports_compression_snapshot_stale(result)
     )
@@ -10510,6 +10550,21 @@ def _run_agent_streaming(
                     profile_name=_resolved_profile_name,
                     custom_provider_lookup=_session_requested_provider,
                 )
+                # Stop HERE on a terminal route verdict — before the agent
+                # kwargs, before _AIAgent(), before the agent-cache write. A
+                # named custom:<slug> that resolved no complete
+                # (api_key, base_url) pair is not "fail closed" at the
+                # constructor: AIAgent honours an explicit pair only when BOTH
+                # are truthy and otherwise calls _routed_client_kwargs(), which
+                # re-resolves a provider and can land on the ambient endpoint or
+                # the init-time fallback chain. Raising sends this turn to the
+                # outer handler, which classifies it via
+                # _custom_provider_route_classification() and emits a controlled
+                # provider / missing-credential error — and, because we never
+                # reach SESSION_AGENT_CACHE, the cache is never poisoned with an
+                # agent built on an unroutable bundle that later turns would
+                # silently reuse.
+                raise_for_custom_provider_route(_runtime_bundle)
                 resolved_provider = _runtime_bundle['provider']
                 resolved_api_key = _runtime_bundle['api_key']
                 resolved_base_url = _runtime_bundle['base_url']
@@ -11642,6 +11697,18 @@ def _run_agent_streaming(
                                 profile_name=_resolved_profile_name,
                                 custom_provider_lookup=_session_requested_provider,
                             )
+                            # The re-resolve can turn a previously routable named
+                            # route terminal (the record's key_cmd stopped
+                            # minting, the pool drained, the row was edited
+                            # mid-turn). Abandon the retry BEFORE _AIAgent and
+                            # before the SESSION_AGENT_CACHE write below: healing
+                            # a 401 by handing the constructor an incomplete pair
+                            # is exactly the re-routing this verdict exists to
+                            # stop, and caching that agent would carry it into
+                            # every later turn. Raising reaches the outer handler,
+                            # which emits the controlled provider /
+                            # missing-credential error instead of the 401.
+                            raise_for_custom_provider_route(_runtime_bundle)
                             resolved_provider = _runtime_bundle['provider']
                             resolved_api_key = _runtime_bundle['api_key']
                             resolved_base_url = _runtime_bundle['base_url']
@@ -12904,9 +12971,18 @@ def _run_agent_streaming(
         _exc_is_compression_snapshot_stale = (
             _classification['type'] == 'compression_snapshot_stale'
         )
+        _exc_is_provider_unroutable = _classification['type'] == 'provider_unroutable'
 
         # The user hint still points to Settings / `hermes model` from _classify_provider_error().
-        if _exc_is_quota:
+        if _exc_is_provider_unroutable:
+            # Checked FIRST so the terminal route verdict can never be flattened
+            # into the generic 'Error' tail of this chain: its hint names the
+            # exact provider setting to fix, which is the only actionable thing
+            # the user gets on an unroutable custom:<slug>.
+            _exc_label, _exc_type, _exc_hint = (
+                _classification['label'], _classification['type'], _classification['hint'],
+            )
+        elif _exc_is_quota:
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
@@ -12920,6 +12996,15 @@ def _run_agent_streaming(
             )
         elif _exc_is_auth:
             _heal_stale_classification = None
+            # Set when the self-heal re-resolve produces a TERMINAL route
+            # verdict. Unlike the two in-flight sites, this branch runs INSIDE
+            # the outer exception handler, so raising here would escape the
+            # generator with no error event at all. Record the verdict instead
+            # and let the abandoned heal fall through to the emission below,
+            # which prefers this classification over the generic
+            # "Authentication error" — the 401 is a symptom, the unroutable
+            # named provider is the cause the user can actually fix.
+            _heal_route_classification = None
             if not _self_healed:
                 # ── Credential self-heal on 401 (#1401) ──
                 # Bind the session's profile so the self-heal re-resolve AND the
@@ -12961,6 +13046,29 @@ def _run_agent_streaming(
                         profile_name=_resolved_profile_name,
                         custom_provider_lookup=_session_requested_provider,
                     )
+                    _heal_route_verdict = custom_provider_route_error(_runtime_bundle)
+                    if _heal_route_verdict is not None:
+                        # The refreshed credential did not produce a routable
+                        # named connection. Abandon the heal BEFORE _AIAgent and
+                        # before the SESSION_AGENT_CACHE write below — building
+                        # here would hand the constructor an incomplete pair and
+                        # let _routed_client_kwargs() pick a provider of its own,
+                        # and caching that agent would keep doing so on every
+                        # later turn in this session.
+                        _heal_route_classification = (
+                            _custom_provider_route_classification(_heal_route_verdict)
+                        )
+                        logger.warning(
+                            '[webui] self-heal (except path): abandoning retry — %s',
+                            _heal_route_classification['message'],
+                        )
+                        # Clearing _heal_rt closes the retry block below. We must
+                        # NOT raise from inside the outer exception handler: that
+                        # would escape the generator and the client would get no
+                        # error event at all.
+                        _heal_rt = None
+
+                if _heal_rt is not None:
                     resolved_provider = _runtime_bundle['provider']
                     resolved_api_key = _runtime_bundle['api_key']
                     resolved_base_url = _runtime_bundle['base_url']
@@ -13113,7 +13221,18 @@ def _run_agent_streaming(
                     except Exception as _retry_exc2:
                         logger.warning('[webui] self-heal (except path): retry failed: %s', _retry_exc2)
                         # Fall through to emit the original error
-            if _heal_stale_classification is not None:
+            if _heal_route_classification is not None:
+                # The heal was abandoned because the named route is unroutable.
+                # Report THAT, not the 401 that triggered the heal: telling the
+                # user to check credentials when the provider resolves no
+                # endpoint (or declares a credential source that yields nothing)
+                # sends them to the wrong setting.
+                _exc_label = _heal_route_classification['label']
+                _exc_type = _heal_route_classification['type']
+                _exc_hint = _heal_route_classification['hint']
+                if _heal_route_classification['message']:
+                    err_str = _heal_route_classification['message']
+            elif _heal_stale_classification is not None:
                 _exc_label = _heal_stale_classification['label']
                 _exc_type = _heal_stale_classification['type']
                 _exc_hint = _heal_stale_classification['hint']
