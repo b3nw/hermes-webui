@@ -3328,6 +3328,126 @@ CUSTOM_SELECTION_AMBIGUOUS = "ambiguous"
 CUSTOM_SELECTION_UNOWNED = (CUSTOM_SELECTION_MISSING, CUSTOM_SELECTION_MALFORMED)
 
 
+# ── Terminal routing verdicts ────────────────────────────────────────────────
+#
+# Hermes Agent does NOT read an incomplete connection pair as a refusal. Its
+# ``agent/agent_init.py:_init_openai_client()`` honours the explicit endpoint and
+# credential the constructor was handed only when BOTH are truthy:
+#
+#     if api_key and base_url:
+#         client_kwargs = _explicit_client_kwargs(...)
+#     else:
+#         client_kwargs = _routed_client_kwargs(...)
+#
+# and ``_routed_client_kwargs()`` resolves a provider AGAIN — through the
+# centralized router, then the init-time fallback chain. So a bundle that "fails
+# closed" by clearing its endpoint and/or its credential is not terminal at the
+# constructor boundary; clearing those fields is precisely the signal to route
+# somewhere else, which is how an unroutable custom slug ends up talking to the
+# ambient or fallback provider after all.
+#
+# A route that cannot be resolved therefore has to be represented as an explicit
+# verdict rather than as an ordinary constructor-ready dict with a hole in it.
+# :data:`CUSTOM_ROUTE_ERROR_FIELD` carries that verdict on every merged bundle
+# (``None`` when the route is fine), and every consumer that builds an AIAgent —
+# or writes the agent cache, or hands the bundle to an auxiliary client — must
+# stop on it and emit a controlled failure instead.
+CUSTOM_ROUTE_UNOWNED = "unowned_custom_provider"
+CUSTOM_ROUTE_NO_CREDENTIAL = "custom_provider_credential_unresolved"
+CUSTOM_ROUTE_NO_ENDPOINT = "custom_provider_endpoint_unresolved"
+
+# Key the verdict travels under on a merged bundle. ``None`` == routable.
+CUSTOM_ROUTE_ERROR_FIELD = "route_error"
+
+
+class CustomProviderRouteError(ValueError):
+    """Raised when a named ``custom:<slug>`` route must not reach a provider client.
+
+    The route resolved to no usable ``(api_key, base_url)`` pair, and passing
+    that pair to AIAgent would re-enter provider routing rather than fail (see
+    the :data:`CUSTOM_ROUTE_ERROR_FIELD` note above). Raising is how the refusal
+    stays terminal across the constructor boundary.
+
+    Subclasses ``ValueError`` for the same reason
+    :class:`AmbiguousCustomProviderError` does: existing ``except ValueError`` /
+    broad-``except`` handlers in the non-streaming routes already turn it into a
+    controlled 400 / deterministic fallback instead of a traceback.
+    """
+
+    def __init__(self, message: str, *, reason: str, provider: str | None = None, hint: str = ""):
+        super().__init__(message)
+        # Forwarded verbatim by HTTP handlers, exactly like the ambiguous-slug
+        # error's ``.message``.
+        self.message = message
+        self.reason = reason
+        self.provider = provider
+        self.hint = hint
+
+
+def _custom_route_verdict(reason: str, provider: str | None) -> dict:
+    """Build the terminal verdict recorded on an unroutable bundle."""
+    name = str(provider or "").strip() or "custom"
+    if reason == CUSTOM_ROUTE_UNOWNED:
+        message = (
+            f"Custom provider '{name}' is not configured: no custom_providers[] row, "
+            "keyed providers[] record or model: authority owns that name."
+        )
+        hint = (
+            "Add the provider under Settings -> Providers (or config.yaml "
+            "custom_providers[]), or pick a configured provider, then send again."
+        )
+    elif reason == CUSTOM_ROUTE_NO_CREDENTIAL:
+        message = (
+            f"Custom provider '{name}' declares a credential source that produced no "
+            "API key, so the route has no usable connection."
+        )
+        hint = (
+            "Check the provider's api_key / key_env / key_cmd / credential_pool "
+            "setting and the environment variable it names, then send again."
+        )
+    else:
+        message = (
+            f"Custom provider '{name}' resolved no endpoint, so the route has no "
+            "usable connection."
+        )
+        hint = (
+            "Set a base_url for the provider under Settings -> Providers (or "
+            "config.yaml custom_providers[]), then send again."
+        )
+    return {"reason": reason, "provider": name, "message": message, "hint": hint}
+
+
+def custom_provider_route_error(bundle: object) -> dict | None:
+    """Return ``bundle``'s terminal verdict, or ``None`` when it is routable.
+
+    The verdict dict carries ``reason`` (one of :data:`CUSTOM_ROUTE_UNOWNED`,
+    :data:`CUSTOM_ROUTE_NO_CREDENTIAL`, :data:`CUSTOM_ROUTE_NO_ENDPOINT`),
+    ``provider``, a user-facing ``message`` and a ``hint``.
+    """
+    if not isinstance(bundle, dict):
+        return None
+    verdict = bundle.get(CUSTOM_ROUTE_ERROR_FIELD)
+    return verdict if isinstance(verdict, dict) else None
+
+
+def raise_for_custom_provider_route(bundle: dict) -> dict:
+    """Return ``bundle`` when routable; raise :class:`CustomProviderRouteError` otherwise.
+
+    The single chokepoint every AIAgent-constructing consumer goes through, so
+    "this route is unresolvable" cannot degrade into "resolve it some other way"
+    at the constructor.
+    """
+    verdict = custom_provider_route_error(bundle)
+    if verdict is None:
+        return bundle
+    raise CustomProviderRouteError(
+        verdict["message"],
+        reason=verdict["reason"],
+        provider=verdict["provider"],
+        hint=verdict["hint"],
+    )
+
+
 # Identity fields a record can use to NAME the custom provider it belongs to.
 # ``name`` is the friendly name a ``custom_providers[]`` entry carries, so a
 # ``providers:`` record spelled the same way is claiming the same identity. A
@@ -3945,11 +4065,22 @@ def merge_custom_provider_runtime_bundle(
 ) -> dict:
     """Return the COMPLETE constructor-routing bundle for one send attempt.
 
-    Keys: ``provider``, ``base_url``, ``api_key`` plus every field in
-    :data:`CUSTOM_CONNECTION_SIDE_FIELDS`. Callers must apply the WHOLE dict —
-    that is the point: the connection and the transport/protocol/pool fields are
-    one authority, and the agent-cache signature must be derived from the same
-    dict so a bundle change always mints a new agent.
+    Keys: ``provider``, ``base_url``, ``api_key``, every field in
+    :data:`CUSTOM_CONNECTION_SIDE_FIELDS`, and
+    :data:`CUSTOM_ROUTE_ERROR_FIELD`. Callers must apply the WHOLE dict — that is
+    the point: the connection and the transport/protocol/pool fields are one
+    authority, and the agent-cache signature must be derived from the same dict
+    so a bundle change always mints a new agent.
+
+    :data:`CUSTOM_ROUTE_ERROR_FIELD` is the bundle's TERMINAL verdict, and it is
+    not optional to check. A named ``custom:`` route that resolves no complete
+    ``(api_key, base_url)`` pair is not constructor-ready: Hermes Agent reads the
+    missing field as permission to resolve another provider, so every consumer
+    that builds an AIAgent (or writes the agent cache, or feeds an auxiliary
+    client) must run the bundle through :func:`raise_for_custom_provider_route`
+    first and fail the turn with a controlled provider / missing-credential
+    error. See the :data:`CUSTOM_ROUTE_ERROR_FIELD` commentary for the exact
+    constructor branch this defends.
 
     Every consumer that builds an AIAgent for a ``custom:<slug>`` route goes
     through here so the endpoint, the credential and the routing fields all come
@@ -3969,6 +4100,12 @@ def merge_custom_provider_runtime_bundle(
     * otherwise the runtime resolved a DIFFERENT authority -> the field is
       cleared, because passing it through is what let a custom HTTP endpoint
       inherit Anthropic credential pooling and a Claude ACP subprocess.
+
+    The CREDENTIAL of an exact ``custom_providers[]`` row is exempt from the
+    same-endpoint rule above: it is resolved from that row's own ladder and is
+    never inherited from the runtime, because a same-slug keyed record may
+    declare the identical ``base_url`` and endpoint equality would then be
+    enough to hand the row somebody else's key.
 
     :data:`KEYLESS_CUSTOM_API_KEY` is substituted only once the selected record
     reports that it DECLARES no credential source at all. A record that declares
@@ -4021,6 +4158,11 @@ def _custom_provider_runtime_bundle_with_provenance(
         "acp_command": _rt.get("acp_command", _rt.get("command")),
         "acp_args": _rt.get("acp_args", _rt.get("args")),
         "credential_pool": _rt.get("credential_pool"),
+        # Routable until a named custom route proves otherwise. Non-custom
+        # routes legitimately leave the endpoint and/or credential to the
+        # runtime provider, so only the named-``custom:`` branches below can
+        # record a verdict here.
+        CUSTOM_ROUTE_ERROR_FIELD: None,
     }
 
     lookup = lookup_provider or resolved_provider
@@ -4065,6 +4207,12 @@ def _custom_provider_runtime_bundle_with_provenance(
         bundle["api_key"] = None
         for field in CUSTOM_CONNECTION_SIDE_FIELDS:
             bundle[field] = None
+        # Clearing the fields is NOT what makes this terminal — the constructor
+        # reads an empty pair as "route me somewhere else". Record the verdict so
+        # consumers stop before AIAgent instead.
+        bundle[CUSTOM_ROUTE_ERROR_FIELD] = _custom_route_verdict(
+            CUSTOM_ROUTE_UNOWNED, lookup
+        )
         return bundle, custom
 
     same_authority = _custom_bundle_endpoint_matches(custom, _rt)
@@ -4072,14 +4220,28 @@ def _custom_provider_runtime_bundle_with_provenance(
     if custom["is_exact"]:
         # An exact ``custom_providers[]`` row is authoritative for its slug: BOTH
         # the endpoint (including None when the row's base_url is blank) and the
-        # credential are replaced, never merged.
+        # credential are replaced, never merged. The credential comes from the
+        # ROW's own ladder (pool, api_key/``${ENV}``/``key_env``/
+        # ``CUSTOM_<SLUG>_API_KEY``, ``key_cmd``, host-gated env) and from
+        # nowhere else — including when ``same_authority`` holds.
+        #
+        # Endpoint equality is NOT record provenance. A same-slug keyed
+        # ``providers["custom:<slug>"]`` record is free to declare the very same
+        # ``base_url``, and the ambient runtime dict carrying that URL is then
+        # indistinguishable by URL from one the row itself resolved. Accepting
+        # ``_rt["api_key"]`` on that evidence hands the keyed row's credential to
+        # the exact row, which is precisely the split-authority merge this
+        # function exists to stop: the row's URL with the keyed row's key.
+        #
+        # So a row whose declared credential produced nothing here keeps
+        # ``api_key`` None and falls through to the terminal-route verdict below,
+        # naming the setting to fix, rather than silently borrowing a credential
+        # the row never declared. A row that declares NO credential at all is
+        # reported ``keyless`` by the resolution above and gets
+        # :data:`KEYLESS_CUSTOM_API_KEY` there — that is the row's own statement
+        # that the endpoint is unauthenticated, not an inherited key either.
         bundle["base_url"] = custom["base_url"]
-        if custom["api_key"]:
-            bundle["api_key"] = custom["api_key"]
-        elif same_authority and _rt.get("api_key"):
-            bundle["api_key"] = _rt.get("api_key")
-        else:
-            bundle["api_key"] = None
+        bundle["api_key"] = custom["api_key"] or None
     else:
         # No exact row: the keyed/``model:`` record fills only what the runtime
         # did not already resolve — and it was picked as one complete record, so
@@ -4133,6 +4295,24 @@ def _custom_provider_runtime_bundle_with_provenance(
                     custom["provider_id"],
                 )
 
+    if not (bundle["api_key"] and bundle["base_url"]):
+        # A record OWNS this route, but the merge could not produce the complete
+        # explicit pair AIAgent needs to honour it. Leaving the hole would hand
+        # the send straight back to ``_routed_client_kwargs()``, which re-resolves
+        # the provider and can reach the ambient endpoint, a keyed row this record
+        # deliberately displaced, or the init-time fallback chain. Name the real
+        # cause instead and let the caller fail the turn.
+        bundle[CUSTOM_ROUTE_ERROR_FIELD] = _custom_route_verdict(
+            CUSTOM_ROUTE_NO_CREDENTIAL if bundle["base_url"] else CUSTOM_ROUTE_NO_ENDPOINT,
+            custom["provider_id"],
+        )
+        logger.warning(
+            "custom provider %s resolved no routable connection (%s); refusing to "
+            "build an agent that would re-enter provider routing",
+            custom["provider_id"],
+            bundle[CUSTOM_ROUTE_ERROR_FIELD]["reason"],
+        )
+
     return bundle, custom
 
 
@@ -4151,9 +4331,13 @@ def apply_custom_provider_connection_authority(
     ``custom_owned`` reports whether a config-owned custom record supplied the
     connection — False for a named route nothing owns, whose key and base_url
     come back ``None`` rather than as the ambient runtime's. Kept for callers
-    that genuinely construct nothing else; anything that builds an AIAgent
-    should take the whole bundle instead, because the three connection fields
-    alone are not a complete constructor contract.
+    that genuinely construct nothing else (capability/vision lookups); anything
+    that builds an AIAgent must take the whole bundle instead and honour its
+    :data:`CUSTOM_ROUTE_ERROR_FIELD` verdict, because the three connection fields
+    alone are neither a complete constructor contract nor a terminal refusal.
+    This view deliberately does NOT raise: a capability lookup asking "can this
+    route do vision" is not a constructor boundary and must not turn into a
+    failed turn.
     """
     bundle, custom = _custom_provider_runtime_bundle_with_provenance(
         resolved_provider,

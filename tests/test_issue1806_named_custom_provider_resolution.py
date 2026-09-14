@@ -430,6 +430,7 @@ def _setup_production_composed_runtime(
     runtime_dict,
     session_id="test-session-1806",
     fail_first=None,
+    heal_mutate=None,
 ):
     """Compose the production streaming send path around a capturing agent.
 
@@ -444,6 +445,14 @@ def _setup_production_composed_runtime(
     Both make ``_attempt_credential_self_heal`` hand back the same ambient
     runtime dict production would re-resolve, so the retry sees the identical
     truthy side-field sentinels the initial send did.
+
+    ``heal_mutate`` is the hook for the state a retry guard actually defends
+    against: it runs INSIDE the stubbed self-heal, i.e. after the first agent
+    has already been constructed and has already failed with a 401, but BEFORE
+    the retry re-resolves its bundle. Mutating ``config.cfg`` there reproduces
+    the row being edited, unnamed or drained mid-turn -- the only way a route
+    that was routable at first resolution becomes terminal at retry
+    construction.
     """
     from unittest import mock
     import queue
@@ -523,6 +532,29 @@ def _setup_production_composed_runtime(
             captured.setdefault("init_kwargs_history", []).append(
                 dict(captured["init_kwargs"])
             )
+            captured.setdefault("instances", []).append(self)
+            # Mirror ``agent/agent_init.py:_init_openai_client()``:
+            #
+            #     if api_key and base_url:
+            #         client_kwargs = _explicit_client_kwargs(...)
+            #     else:
+            #         client_kwargs = _routed_client_kwargs(...)
+            #
+            # An incomplete connection pair is NOT a refusal at this boundary —
+            # it is the signal to resolve a provider all over again, through the
+            # centralized router and then the init-time fallback chain. Recording
+            # the branch here is what lets a test assert the real defect ("this
+            # send would have been re-routed") instead of the weaker proxy
+            # ("base_url came back None"), which an unroutable bundle satisfies
+            # while still reaching a provider the user never chose.
+            if api_key and base_url:
+                captured.setdefault("explicit_client_kwargs_calls", []).append(
+                    {"api_key": api_key, "base_url": base_url}
+                )
+            else:
+                captured.setdefault("routed_client_kwargs_calls", []).append(
+                    {"provider": provider, "api_key": api_key, "base_url": base_url}
+                )
             self.session_id = kwargs.get("session_id")
             self.context_compressor = None
             self.session_prompt_tokens = 0
@@ -551,12 +583,13 @@ def _setup_production_composed_runtime(
 
     fake_session = FakeSession()
     fake_stream_id = f"stream-{session_id}"
-    if fail_first == "returned_error":
-        # The returned-error branch lives behind the stale-writeback guard, which
-        # only lets the owning worker persist. /api/chat/start stamps
-        # ``active_stream_id`` before dispatching the worker, so model that here
-        # or the guard returns before the retry is ever reached.
-        fake_session.active_stream_id = fake_stream_id
+    # Both the returned-error retry branch AND the outer error emission live
+    # behind the stale-writeback guard, which only lets the OWNING worker
+    # persist and emit. /api/chat/start stamps ``active_stream_id`` before
+    # dispatching the worker, so model that here unconditionally — otherwise the
+    # guard returns early and a terminal route verdict reaches the queue as
+    # nothing at all, which a refusal test would read as "no controlled failure".
+    fake_session.active_stream_id = fake_stream_id
     fake_queue = queue.Queue()
 
     fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
@@ -583,11 +616,15 @@ def _setup_production_composed_runtime(
         # Production re-resolves the ambient runtime provider on a 401 heal, so
         # the retry must see the same truthy side-field sentinels — that is
         # exactly the state in which a partial rebuild leaks them through.
-        monkeypatch.setattr(
-            streaming,
-            "_attempt_credential_self_heal",
-            lambda *_args, **_kwargs: dict(runtime_dict),
-        )
+        def _fake_self_heal(*_args, **_kwargs):
+            # Production re-reads provider state during the heal. Running the
+            # mutation here -- not before the send -- is what makes the FIRST
+            # resolution routable and only the RETRY resolution terminal.
+            if heal_mutate is not None:
+                heal_mutate()
+            return dict(runtime_dict)
+
+        monkeypatch.setattr(streaming, "_attempt_credential_self_heal", _fake_self_heal)
 
     def restore():
         with config.SESSION_AGENT_CACHE_LOCK:
@@ -658,15 +695,15 @@ def test_production_composed_nonblank_exact_list_row_yields_list_url_and_list_ke
 
 
 def test_production_composed_blank_exact_list_row_cannot_repopulate_from_keyed_row(monkeypatch):
-    """(b) Blank exact list row cannot repopulate from the keyed row.
+    """(b) A blank exact list row is terminal — it cannot repopulate from the keyed row.
 
-    When an exact custom_providers[] entry exists with an empty base_url, that
-    row is authoritative. Final construction must receive base_url=None and the
-    list key; it must NOT fall through to or repopulate the keyed base_url or
-    keyed API key.
+    When an exact ``custom_providers[]`` entry exists with an empty base_url,
+    that row is authoritative and the route has no endpoint. Handing AIAgent
+    ``base_url=None`` with the list key would NOT refuse: ``_init_openai_client()``
+    honours an explicit pair only when both fields are truthy, so it would call
+    ``_routed_client_kwargs()`` and re-resolve a provider — reaching the keyed
+    row's endpoint by another door. The send must stop before construction.
     """
-    import api.streaming as streaming
-
     cfg_dict = {
         "model": {"default": "active/model", "provider": "custom:active"},
         "providers": {
@@ -688,28 +725,26 @@ def test_production_composed_blank_exact_list_row_cannot_repopulate_from_keyed_r
         "base_url": "https://keyed-url-sentinel.example/v1",
         "api_key": "keyed-key-sentinel-abc",
     }
-    stream_id, q, captured, restore = _setup_production_composed_runtime(
-        monkeypatch, cfg_dict, runtime_dict, session_id="session-1806-blank"
-    )
-    try:
-        streaming.STREAMS[stream_id] = q
-        streaming._run_agent_streaming(
-            session_id="session-1806-blank",
-            msg_text="hello",
-            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
-            workspace="/tmp",
-            stream_id=stream_id,
-        )
-    finally:
-        streaming.STREAMS.pop(stream_id, None)
-        streaming.AGENT_INSTANCES.pop(stream_id, None)
-        restore()
 
-    init_kwargs = captured["init_kwargs"]
-    assert init_kwargs["base_url"] is None
-    assert init_kwargs["api_key"] == "list-key-sentinel-xyz"
-    assert init_kwargs["base_url"] != "https://keyed-url-sentinel.example/v1"
-    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
+    captured, apperrors = _run_composed_send_expecting_refusal(
+        monkeypatch,
+        cfg_dict,
+        runtime_dict,
+        "session-1806-blank",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+    )
+
+    payload = apperrors[-1]
+    assert "resolved no endpoint" in payload["message"], payload
+    assert "base_url" in payload["hint"], (
+        f"the refusal must name the endpoint setting to fix: {payload}"
+    )
+    # The refusal must not hand the user the keyed row it declined to fall
+    # through to — naming it would read as "this endpoint was used".
+    assert "keyed-url-sentinel" not in str(payload), payload
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        "a client was configured for a route with no endpoint"
+    )
 
 
 def test_production_composed_keyed_only_still_yields_keyed_url_and_key(monkeypatch):
@@ -1074,6 +1109,108 @@ def _run_composed_send(monkeypatch, cfg_dict, runtime_dict, session_id, before_s
     return captured["init_kwargs"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal route verdicts: the send must STOP, not fail closed and continue
+#
+# "Fail closed" was the wrong shape for an unresolvable named route. Clearing
+# ``base_url``/``api_key`` looks terminal in a bundle assertion, but at the
+# constructor it is the opposite: ``_init_openai_client()`` honours an explicit
+# pair only when BOTH fields are truthy and otherwise calls
+# ``_routed_client_kwargs()``, which re-resolves a provider through the
+# centralized router and the init-time fallback chain. So the very bundles the
+# earlier tests asserted were "safe" are the ones that route the user's prompt —
+# and whatever credential init finds — to a provider they never picked.
+#
+# The helpers below assert the real property: for both terminal shapes (a slug
+# nothing owns, and an owned row whose declared credential resolved to nothing)
+# NO agent is constructed at all, so ``_routed_client_kwargs()`` is never
+# reached, the agent cache is never written, and the turn ends on a controlled
+# ``provider_unroutable`` apperror instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _drain_apperrors(fake_queue):
+    """Return every ``apperror`` payload the worker queued."""
+    import queue as _queue
+
+    payloads = []
+    while True:
+        try:
+            item = fake_queue.get_nowait()
+        except _queue.Empty:
+            break
+        if item and item[0] == "apperror":
+            payloads.append(item[1])
+    return payloads
+
+
+def _assert_route_refused(captured, apperrors, label, *, expected_reason=None):
+    """Assert the send stopped at the route verdict, before any provider routing."""
+    routed = captured.get("routed_client_kwargs_calls", [])
+    assert not routed, (
+        f"{label}: AIAgent was constructed with an incomplete connection pair "
+        f"{routed}, so _init_openai_client() fell through to "
+        f"_routed_client_kwargs() and re-resolved a provider"
+    )
+    assert not captured.get("init_kwargs_history"), (
+        f"{label}: an agent was constructed for an unroutable route"
+    )
+    assert not captured.get("run_calls"), f"{label}: the turn was actually sent"
+
+    assert apperrors, f"{label}: no controlled failure was emitted"
+    payload = apperrors[-1]
+    assert payload["type"] == "provider_unroutable", (
+        f"{label}: emitted {payload['type']!r} instead of a provider-route failure"
+    )
+    assert payload.get("hint"), f"{label}: the failure named no fix"
+    if expected_reason is not None:
+        assert expected_reason in payload.get("message", "") or expected_reason in payload.get(
+            "hint", ""
+        ), f"{label}: the failure did not name {expected_reason!r}: {payload}"
+
+    with config.SESSION_AGENT_CACHE_LOCK:
+        assert not config.SESSION_AGENT_CACHE, (
+            f"{label}: the agent cache was poisoned with an unroutable bundle, so "
+            f"every later turn in this session would reuse it"
+        )
+    return payload
+
+
+def _run_composed_send_expecting_refusal(
+    monkeypatch, cfg_dict, runtime_dict, session_id, *, model
+):
+    """Drive one composed send whose route is terminal at the FIRST resolution.
+
+    Returns ``(captured, apperrors)``. Deliberately takes no ``fail_first``: the
+    verdict lands before any agent exists, so there is no 401 for the self-heal
+    retries to act on and threading one through would only produce cases that
+    re-run identical code. The retry regions have their own harness,
+    :func:`_run_composed_retry_expecting_abandoned_heal`.
+    """
+    import api.streaming as streaming
+
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id=session_id
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model=model,
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+        apperrors = _drain_apperrors(q)
+        # Read the cache BEFORE restore() clears it.
+        _assert_route_refused(captured, apperrors, session_id)
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+    return captured, apperrors
+
+
 def _exact_list_row_cfg(*, drop=(), **row_fields):
     """``_KEYED_VS_LIST_CFG`` with the exact ``custom_providers[]`` row extended."""
     cfg_dict = copy.deepcopy(_KEYED_VS_LIST_CFG)
@@ -1178,8 +1315,10 @@ def test_exact_list_row_unbuildable_key_cmd_still_refuses_dummy_key(monkeypatch)
 
     When the token provider cannot be built (older agent build, broken command
     spec) the endpoint is still an authenticated one whose credential is missing.
-    Substituting the keyless placeholder would report that as an opaque 401
-    instead of the real cause, so the send goes out with no credential at all.
+    The placeholder would report that as an opaque 401, and sending with NO key
+    is no safer: an agent built with ``api_key=None`` never reaches an explicit
+    client, so ``_routed_client_kwargs()`` re-resolves a provider and the turn
+    leaves for whatever credential init finds next. The route is terminal.
     """
 
     def _build(_key_cmd, _name):
@@ -1187,16 +1326,26 @@ def test_exact_list_row_unbuildable_key_cmd_still_refuses_dummy_key(monkeypatch)
 
     _fake_command_token_source(monkeypatch, _build)
 
-    init_kwargs = _run_composed_send(
+    captured, apperrors = _run_composed_send_expecting_refusal(
         monkeypatch,
         _exact_list_row_cfg(drop=("api_key",), key_cmd="print-omni-bearer"),
         _ambient_runtime(),
         "session-1806-owned-key-cmd-broken",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
     )
 
-    assert init_kwargs["api_key"] is None, "keyless placeholder masked a declared key_cmd"
-    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc"
-    assert init_kwargs["base_url"] == _LIST_ROW_URL
+    payload = apperrors[-1]
+    assert "produced no API key" in payload["message"], payload
+    assert "key_cmd" in payload["hint"], (
+        f"the refusal must name the credential setting to fix: {payload}"
+    )
+    # Neither the placeholder nor the ambient keyed credential may appear
+    # anywhere on the refusal path.
+    assert config.KEYLESS_CUSTOM_API_KEY not in str(payload), payload
+    assert "keyed-key-sentinel-abc" not in str(payload), payload
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        "a client was configured for a route whose declared credential failed"
+    )
 
 
 def test_exact_list_row_pool_credential_and_pool_object_both_survive(monkeypatch):
@@ -2131,74 +2280,53 @@ def test_unknown_named_slug_connection_view_also_fails_closed(monkeypatch):
     assert custom_owned is False, "nothing owns the slug, so the record cannot be reported as owning it"
 
 
-@pytest.mark.parametrize(
-    "fail_first,label",
-    [
-        (None, "initial send"),
-        ("returned_error", "returned-error retry"),
-        ("raised", "raised-exception retry"),
-    ],
-)
-def test_unowned_named_slug_fails_closed_across_streaming_lifecycle(
-    monkeypatch, fail_first, label
-):
-    """All three streaming lifecycle regions refuse the unrelated row.
+def test_unowned_named_slug_fails_closed_at_the_first_streaming_resolution(monkeypatch):
+    """The initial resolution refuses the unrelated row — terminally.
 
     The ambient runtime seeds a truthy URL, key and pool (plus api_mode and an
     ACP transport), and config holds exactly ONE custom row — named ``omni``,
-    with a truthy URL and key of its own. The send asks for ``custom:ghost``.
-    Every agent constructed on this path must come out with no endpoint, no
-    credential and no ambient side fields: not ``omni``'s pair, not the ambient
-    provider's, and never ``dummy-key``.
-    """
-    import api.streaming as streaming
+    with a truthy URL and key of its own. The send asks for ``custom:ghost``,
+    which nothing owns.
 
-    session_id = f"session-1806-ghost-{fail_first or 'initial'}"
-    stream_id, q, captured, restore = _setup_production_composed_runtime(
+    This covers the FIRST of the three streaming regions that build an agent,
+    and only that one: the verdict is terminal here, so no agent is constructed,
+    no turn is sent, and no 401 exists for the two self-heal retries to act on.
+    Parametrizing ``fail_first`` over this case would re-run identical code and
+    prove nothing about those retry guards — they are exercised directly by
+    ``test_retry_abandons_the_heal_*`` below, which start from a ROUTABLE route
+    and break it mid-turn.
+    """
+    label = "initial send"
+    session_id = "session-1806-ghost-initial"
+
+    captured, apperrors = _run_composed_send_expecting_refusal(
         monkeypatch,
         copy.deepcopy(_SOLE_UNRELATED_ROW_CFG),
         dict(_AMBIENT_SIDE_FIELD_RUNTIME),
-        session_id=session_id,
-        fail_first=fail_first,
+        session_id,
+        model="@custom:ghost:antigravity/gemini-3.7-flash-tiered",
     )
-    try:
-        streaming.STREAMS[stream_id] = q
-        streaming._run_agent_streaming(
-            session_id=session_id,
-            msg_text="hello",
-            model="@custom:ghost:antigravity/gemini-3.7-flash-tiered",
-            workspace="/tmp",
-            stream_id=stream_id,
-        )
-    finally:
-        streaming.STREAMS.pop(stream_id, None)
-        streaming.AGENT_INSTANCES.pop(stream_id, None)
-        restore()
 
-    history = captured.get("init_kwargs_history", [])
-    assert history, f"{label}: no agent was constructed"
-    if fail_first is not None:
-        assert len(history) >= 2, f"{label} did not construct a second agent"
+    payload = apperrors[-1]
+    assert "custom:ghost" in payload["message"], f"{label}: {payload}"
+    assert "is not configured" in payload["message"], f"{label}: {payload}"
 
-    for index, init_kwargs in enumerate(history):
-        where = f"{label} construction #{index}"
-        assert init_kwargs["base_url"] != "https://omni.example/v1", (
-            f"{where}: unrelated sole row supplied the endpoint"
-        )
-        assert init_kwargs["api_key"] != "omni-key", (
-            f"{where}: unrelated sole row supplied the credential"
-        )
-        assert init_kwargs["base_url"] != _AMBIENT_SIDE_FIELD_RUNTIME["base_url"], where
-        assert init_kwargs["api_key"] != _AMBIENT_SIDE_FIELD_RUNTIME["api_key"], where
-        assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
-            f"{where}: an unresolvable route was handed the keyless placeholder"
-        )
-        assert init_kwargs["base_url"] is None, where
-        assert init_kwargs["api_key"] is None, where
-        assert init_kwargs["provider"] == "custom:ghost", (
-            f"{where}: unresolvable route was rewritten to generic custom"
-        )
-        _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, where)
+    # Nothing that could have been routed to may appear on the refusal path:
+    # not the unrelated sole row's pair, not the ambient provider's, and never
+    # the keyless placeholder.
+    blob = str(payload) + str(captured)
+    for leaked in (
+        "https://omni.example/v1",
+        "omni-key",
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        config.KEYLESS_CUSTOM_API_KEY,
+    ):
+        assert leaked not in blob, f"{label}: {leaked!r} leaked into the refused route"
+
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        f"{label}: a client was configured for a slug nothing owns"
+    )
 
 
 # ── declared-but-unresolved credentials are NOT keyless ──────────────────────
@@ -2247,29 +2375,38 @@ def test_declared_but_unresolved_credential_is_not_keyless(monkeypatch, row_fiel
 def test_declared_but_unresolved_credential_never_gets_the_dummy_key(
     monkeypatch, row_fields, label
 ):
-    """End to end: the send goes out with NO key rather than the placeholder.
+    """End to end: the send STOPS — neither the placeholder nor a keyless send.
 
-    The endpoint still resolves (the row owns it), so the request is made — it
-    just carries no credential, and the resulting error names the real cause
-    instead of an authentication failure the placeholder invented.
+    The endpoint resolves (the row owns it), but the declared credential source
+    produced nothing. Sending anyway with ``api_key=None`` is not the safe
+    middle ground it looks like: with only one of the pair truthy, AIAgent falls
+    through to ``_routed_client_kwargs()`` and re-resolves a provider, so the
+    turn — and whatever credential init then finds — leaves for an endpoint the
+    user never chose. The turn ends on the actionable cause instead.
     """
     _clear_credential_env(monkeypatch)
 
-    init_kwargs = _run_composed_send(
+    captured, apperrors = _run_composed_send_expecting_refusal(
         monkeypatch,
         _exact_list_row_cfg(drop=("api_key",), **row_fields),
         _ambient_runtime(),
         f"session-1806-unresolved-{label}",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
     )
 
-    assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
+    payload = apperrors[-1]
+    assert "produced no API key" in payload["message"], f"{label}: {payload}"
+    assert "custom:omni" in payload["message"], (
+        f"{label}: the refusal did not name the provider that failed: {payload}"
+    )
+    assert config.KEYLESS_CUSTOM_API_KEY not in str(payload), (
         f"{label}: keyless placeholder masked a declared-but-missing credential"
     )
-    assert init_kwargs["api_key"] is None, f"{label}: unexpected credential"
-    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc", (
-        f"{label}: the ambient keyed record supplied the credential"
+    assert "keyed-key-sentinel-abc" not in str(payload), (
+        f"{label}: the ambient keyed record leaked into the refusal"
     )
-    assert init_kwargs["base_url"] == _LIST_ROW_URL, f"{label}: the row still owns its endpoint"
+    # The row owns its endpoint, so nothing may have been dialled with it.
+    assert not captured.get("explicit_client_kwargs_calls"), f"{label}: a client was configured"
 
 
 def test_row_declaring_no_credential_is_still_keyless(monkeypatch):
@@ -2291,6 +2428,529 @@ def test_row_declaring_no_credential_is_still_keyless(monkeypatch):
     assert init_kwargs["api_key"] == config.KEYLESS_CUSTOM_API_KEY
     assert init_kwargs["base_url"] == _LIST_ROW_URL
     assert init_kwargs["provider"] == "custom"
+
+
+# ── the exact row's credential is never the same-endpoint keyed row's ───────
+#
+# Every unresolved-credential case above puts the keyed record on a DIFFERENT
+# endpoint, so the merge's provenance test already proves the ambient credential
+# foreign. That leaves the collision untested: a keyed
+# ``providers["custom:<slug>"]`` record may declare the SAME ``base_url`` as the
+# exact ``custom_providers[]`` row, and then endpoint equality alone cannot tell
+# the row's own resolution from the keyed row's. Inferring "same authority" from
+# the URL there hands the keyed row's key to the exact row — the row's endpoint
+# married to somebody else's credential, which is the split-authority merge the
+# whole module exists to prevent.
+#
+# An exact row is a COMPLETE record: its credential comes from its own ladder or
+# it does not come at all.
+
+
+_SHARED_ENDPOINT_URL = "https://shared-url-sentinel.example/v1"
+_SHARED_ENDPOINT_KEYED_KEY = "shared-endpoint-keyed-sentinel-def"
+
+
+def _shared_endpoint_cfg(**row_fields):
+    """Exact list row and same-slug keyed record on the IDENTICAL ``base_url``."""
+    return {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {
+            "custom:omni": {
+                "base_url": _SHARED_ENDPOINT_URL,
+                "api_key": _SHARED_ENDPOINT_KEYED_KEY,
+            },
+        },
+        "custom_providers": [
+            {"name": "omni", "base_url": _SHARED_ENDPOINT_URL, **row_fields},
+        ],
+    }
+
+
+def _shared_endpoint_runtime():
+    """The ambient runtime that resolution of the KEYED record produces.
+
+    Same endpoint as the exact row, carrying the keyed record's credential — the
+    state in which URL equality stops being evidence of provenance.
+    """
+    return _ambient_runtime(
+        base_url=_SHARED_ENDPOINT_URL, api_key=_SHARED_ENDPOINT_KEYED_KEY
+    )
+
+
+@pytest.mark.parametrize("row_fields,label", _UNRESOLVED_CREDENTIAL_ROWS)
+def test_exact_row_unresolved_credential_ignores_same_endpoint_keyed_key(
+    monkeypatch, row_fields, label
+):
+    """The row DECLARED a credential that produced nothing: the route is terminal.
+
+    The keyed record sharing the endpoint changes nothing about that. If the
+    merge accepts ``_rt["api_key"]`` because the URLs match, the bundle silently
+    authenticates the row's endpoint with the keyed row's secret and reports
+    itself routable, so the user never learns their ``key_env`` is unset.
+    """
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _shared_endpoint_cfg(**row_fields))
+
+    resolved = config.resolve_custom_provider_bundle("custom:omni")
+    assert resolved["is_exact"] is True, f"{label}: the exact row was not selected"
+    assert resolved["keyless"] is False, (
+        f"{label}: a declared credential source was reported as keyless"
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_ENDPOINT_KEYED_KEY,
+        _SHARED_ENDPOINT_URL,
+        _shared_endpoint_runtime(),
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _SHARED_ENDPOINT_URL, f"{label}: the row lost its endpoint"
+    assert bundle["api_key"] is None, (
+        f"{label}: the exact row borrowed the same-endpoint keyed credential: {bundle!r}"
+    )
+    assert bundle["api_key"] != _SHARED_ENDPOINT_KEYED_KEY, f"{label}: {bundle!r}"
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
+        f"{label}: the placeholder masked a declared-but-missing credential"
+    )
+    verdict = config.custom_provider_route_error(bundle)
+    assert verdict, f"{label}: an unroutable bundle reported itself routable: {bundle!r}"
+    assert verdict["reason"] == config.CUSTOM_ROUTE_NO_CREDENTIAL, f"{label}: {verdict}"
+
+
+@pytest.mark.parametrize("row_fields,label", _UNRESOLVED_CREDENTIAL_ROWS)
+def test_composed_send_refuses_exact_row_sharing_the_keyed_endpoint(
+    monkeypatch, row_fields, label
+):
+    """End to end: the turn stops instead of dialling with the keyed row's key.
+
+    The production-composed path is where the borrowed credential would actually
+    be spent — the endpoint resolves, so nothing downstream would question a
+    truthy ``api_key``.
+    """
+    _clear_credential_env(monkeypatch)
+
+    captured, apperrors = _run_composed_send_expecting_refusal(
+        monkeypatch,
+        _shared_endpoint_cfg(**row_fields),
+        _shared_endpoint_runtime(),
+        f"session-1806-shared-endpoint-{label}",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+    )
+
+    payload = apperrors[-1]
+    assert "produced no API key" in payload["message"], f"{label}: {payload}"
+    assert "custom:omni" in payload["message"], f"{label}: {payload}"
+    assert _SHARED_ENDPOINT_KEYED_KEY not in str(payload), (
+        f"{label}: the same-endpoint keyed credential leaked into the refusal"
+    )
+    assert config.KEYLESS_CUSTOM_API_KEY not in str(payload), f"{label}: {payload}"
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        f"{label}: a client was configured for a route whose credential failed"
+    )
+
+
+def test_exact_row_declaring_no_credential_ignores_the_shared_endpoint_key(monkeypatch):
+    """The other half of the rule: a keyless row does not borrow the key either.
+
+    The row declares NO credential, which is its own statement that the endpoint
+    is unauthenticated. ``dummy-key`` follows from the row, not from the keyed
+    record that happens to point at the same URL — so the route stays routable
+    and the keyed secret still never leaves the keyed record.
+    """
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _shared_endpoint_cfg())
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_ENDPOINT_KEYED_KEY,
+        _SHARED_ENDPOINT_URL,
+        _shared_endpoint_runtime(),
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _SHARED_ENDPOINT_URL
+    assert bundle["api_key"] == config.KEYLESS_CUSTOM_API_KEY, (
+        f"the keyless row did not keep its own credential verdict: {bundle!r}"
+    )
+    assert bundle["api_key"] != _SHARED_ENDPOINT_KEYED_KEY, bundle
+    assert config.custom_provider_route_error(bundle) is None, bundle
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The two 401 self-heal RETRIES are route boundaries too
+#
+# Everything above stops a terminal route at the FIRST resolution, where no agent
+# exists yet. The self-heal retries are a different boundary, and a strictly
+# worse one: the route WAS routable when the turn started, an agent was built and
+# written to ``SESSION_AGENT_CACHE`` under a valid bundle signature, the provider
+# answered 401, and only THEN does the re-resolve run. Whatever that second
+# resolution returns is what the retry agent gets constructed from.
+#
+# That window is real state, not a hypothetical: between the first send and the
+# heal the owning ``custom_providers[]`` row can be edited, renamed or deleted in
+# Settings, and its ``key_env`` / pool can stop yielding a credential. The
+# refreshed bundle is then terminal, and building the retry agent from it hands
+# ``_init_openai_client()`` an incomplete pair — so the retry, the send that
+# actually carries the user's prompt, is the one that re-enters
+# ``_routed_client_kwargs()``. It also overwrites a GOOD cache entry with the
+# poisoned agent, so every later turn in the session reuses it.
+#
+# ``heal_mutate`` runs inside the stubbed ``_attempt_credential_self_heal`` —
+# after the first agent has already failed with its 401, before the retry
+# re-resolves its bundle — which is the only point at which that transition can
+# be staged. Each test below asserts the first send really happened (one agent,
+# one turn, one cache write), so a regression that makes the route terminal up
+# front cannot pass these by the back door.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# No ``providers:`` block and a ``model.provider`` naming an UNRELATED slug: the
+# single list row is the ONLY authority for ``custom:omni``, so removing or
+# renaming it below leaves the slug owned by nothing at all. A same-slug keyed
+# record or a ``model:`` block naming ``custom:omni`` would each still be an
+# authority and would make the "unowned" cases test something weaker.
+_RETRY_OWNED_CFG = {
+    "model": {"default": "active/model", "provider": "custom:active"},
+    "custom_providers": [
+        {
+            "name": "omni",
+            "base_url": _LIST_ROW_URL,
+            "api_key": _LIST_ROW_KEY,
+        },
+    ],
+}
+
+_RETRY_MODEL = "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+
+
+def _retry_cfg_rows(**row_fields):
+    """The owning row with ``row_fields`` applied; ``None`` values drop the field."""
+    row = dict(_RETRY_OWNED_CFG["custom_providers"][0])
+    for field, value in row_fields.items():
+        if value is None:
+            row.pop(field, None)
+        else:
+            row[field] = value
+    return [row]
+
+
+def _drop_the_owning_row():
+    """The row is deleted mid-turn — nothing owns ``custom:omni`` any more."""
+    config.cfg["custom_providers"] = []
+
+
+def _rename_the_owning_row():
+    """The row is renamed mid-turn, so it now owns a DIFFERENT slug.
+
+    The pair is still sitting in config, which is exactly the shape that made
+    the sole-unrelated-row fallback look harmless: ``custom:omni`` must not
+    inherit it just because it is the only row left.
+    """
+    config.cfg["custom_providers"] = _retry_cfg_rows(name="omni-renamed")
+
+
+def _malform_the_owning_row():
+    """The row loses its name, so it names no slug and therefore owns none.
+
+    ``CUSTOM_SELECTION_MALFORMED`` proper describes a bare ``custom:`` lookup
+    with no slug behind it, which cannot arise mid-turn — the lookup is fixed at
+    the first resolve. A row that stops naming any identity is the reachable
+    malformed-record analogue, and it must fail closed the same way.
+    """
+    config.cfg["custom_providers"] = _retry_cfg_rows(name=None)
+
+
+_RETRY_UNOWNED_MUTATIONS = [
+    (_drop_the_owning_row, "deleted", "row deleted"),
+    (_rename_the_owning_row, "renamed", "row renamed to another slug"),
+    (_malform_the_owning_row, "unnamed", "row lost its name"),
+]
+
+
+def _retry_credential_mutation(row_fields):
+    """Return a heal mutation that keeps the endpoint but breaks the credential."""
+
+    def _mutate():
+        # ``api_key`` first so a row that DECLARES one (the ``${ENV}`` shape)
+        # overrides the drop, while ``key_env`` / ``credential_pool`` rows keep
+        # it dropped. Either way the row still owns its endpoint.
+        fields = {"api_key": None, **row_fields}
+        config.cfg["custom_providers"] = _retry_cfg_rows(**fields)
+
+    return _mutate
+
+
+def _run_composed_retry_expecting_abandoned_heal(
+    monkeypatch, cfg_dict, runtime_dict, session_id, *, fail_first, heal_mutate
+):
+    """Drive a send that starts routable and turns terminal at the 401 retry.
+
+    Returns ``(captured, apperrors, cache_at_heal, cache_after)``. Both cache
+    views are read while the worker's entries are still live — ``restore()``
+    clears ``SESSION_AGENT_CACHE`` — so the caller can compare what the initial
+    send cached against what survived the abandoned heal.
+    """
+    import api.streaming as streaming
+
+    cache_at_heal = {}
+
+    def _stage_the_terminal_retry():
+        # Snapshot the entry the FIRST (routable) agent was cached under, taken
+        # before the route is broken. The abandoned retry must leave it exactly
+        # as it is: replacing it is how one mid-turn config edit would re-route
+        # every remaining turn in the session.
+        with config.SESSION_AGENT_CACHE_LOCK:
+            cache_at_heal.update(config.SESSION_AGENT_CACHE)
+        heal_mutate()
+
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch,
+        copy.deepcopy(cfg_dict),
+        runtime_dict,
+        session_id=session_id,
+        fail_first=fail_first,
+        heal_mutate=_stage_the_terminal_retry,
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model=_RETRY_MODEL,
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+        apperrors = _drain_apperrors(q)
+        with config.SESSION_AGENT_CACHE_LOCK:
+            cache_after = dict(config.SESSION_AGENT_CACHE)
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+    return captured, apperrors, cache_at_heal, cache_after
+
+
+def _assert_retry_abandoned(
+    captured, apperrors, cache_at_heal, cache_after, session_id, label, *, expected_cause
+):
+    """Assert the retry stopped at the refreshed route verdict, not at the 401."""
+    # (0) The case is only meaningful if the FIRST send was routable and really
+    # ran. Without this, a regression that made the route terminal at initial
+    # resolution would satisfy every assertion below for the wrong reason.
+    history = captured.get("init_kwargs_history", [])
+    assert history, f"{label}: the initial send never constructed an agent"
+    assert history[0]["base_url"] == _LIST_ROW_URL, (
+        f"{label}: the initial send did not resolve the owning row, so no 401 "
+        f"retry path was ever reached: {history[0]}"
+    )
+    assert history[0]["api_key"] == _LIST_ROW_KEY, f"{label}: {history[0]}"
+    assert cache_at_heal.get(session_id), (
+        f"{label}: the initial agent was never cached, so this case cannot show "
+        f"that the abandoned retry left a good cache entry alone"
+    )
+
+    # (1) No second agent — the retry construction is what the guard prevents.
+    assert len(history) == 1, (
+        f"{label}: the retry constructed a second agent on a route that had "
+        f"become terminal ({len(history)} constructions: {history})"
+    )
+    assert len(captured.get("instances", [])) == 1, label
+
+    # (2) _routed_client_kwargs() is never reached. The one explicit call is the
+    # initial, complete pair; anything else means an incomplete pair reached
+    # _init_openai_client() and re-entered provider routing.
+    routed = captured.get("routed_client_kwargs_calls", [])
+    assert not routed, (
+        f"{label}: the retry agent was built with an incomplete connection pair "
+        f"{routed}, so _init_openai_client() fell through to "
+        f"_routed_client_kwargs() and re-resolved a provider"
+    )
+    explicit = captured.get("explicit_client_kwargs_calls", [])
+    assert explicit == [{"api_key": _LIST_ROW_KEY, "base_url": _LIST_ROW_URL}], (
+        f"{label}: expected only the initial send's explicit pair, got {explicit}"
+    )
+
+    # (3) The retry turn was never sent.
+    assert captured.get("run_calls") == 1, (
+        f"{label}: run_conversation ran {captured.get('run_calls')!r} times — the "
+        f"retry turn was sent on a route that no longer resolves"
+    )
+
+    # (4) The cache still holds the FIRST agent under the FIRST bundle
+    # signature. A retry write here would be the durable half of the defect:
+    # later turns reuse the cached agent without re-resolving at all.
+    assert list(cache_after) == [session_id], (
+        f"{label}: unexpected agent-cache contents {list(cache_after)}"
+    )
+    assert cache_after[session_id][0] is cache_at_heal[session_id][0], (
+        f"{label}: the agent cache was rewritten with a retry agent built on an "
+        f"unroutable bundle"
+    )
+    assert cache_after[session_id][1] == cache_at_heal[session_id][1], (
+        f"{label}: a cache entry was written under the invalid bundle's signature"
+    )
+    assert cache_after[session_id][0] is captured["instances"][0], label
+
+    # (5) The client is told the real cause, not the 401 that triggered the heal.
+    assert apperrors, f"{label}: no controlled failure was emitted"
+    payload = apperrors[-1]
+    assert payload["type"] == "provider_unroutable", (
+        f"{label}: emitted {payload['type']!r} instead of a provider-route "
+        f"failure — the 401 is the symptom, the unroutable route is the cause"
+    )
+    assert expected_cause in payload.get("message", ""), (
+        f"{label}: the failure did not name {expected_cause!r}: {payload}"
+    )
+    assert "custom:omni" in payload.get("message", ""), (
+        f"{label}: the failure did not name the provider that failed: {payload}"
+    )
+    assert payload.get("hint"), f"{label}: the failure named no fix"
+
+    # Nothing the abandoned retry could have been re-routed to may appear on the
+    # refusal path, and the keyless placeholder may never stand in for it.
+    blob = str(payload)
+    for leaked in (
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        config.KEYLESS_CUSTOM_API_KEY,
+    ):
+        assert leaked not in blob, f"{label}: {leaked!r} leaked into the refusal"
+    return payload
+
+
+@pytest.mark.parametrize("fail_first", ["returned_error", "raised"])
+@pytest.mark.parametrize(
+    "heal_mutate,mutation_slug,mutation_label",
+    _RETRY_UNOWNED_MUTATIONS,
+    ids=[slug for _fn, slug, _label in _RETRY_UNOWNED_MUTATIONS],
+)
+def test_retry_abandons_the_heal_when_the_slug_stops_being_owned(
+    monkeypatch, fail_first, heal_mutate, mutation_slug, mutation_label
+):
+    """Case A — the refreshed route is unowned, so the retry must not be built.
+
+    The turn starts on a row that owns ``custom:omni`` outright, so an agent is
+    constructed with the row's exact pair and the turn is sent. The provider
+    answers 401. Before the heal re-resolves, the row stops owning the slug.
+
+    Building the retry from that bundle is the whole defect: its key and URL are
+    empty, which ``_init_openai_client()`` reads as "resolve a provider yourself"
+    — and the ambient runtime dict the heal returns still carries a truthy
+    endpoint, credential and pool for a provider the user never named.
+    """
+    label = f"{mutation_label} / {fail_first}"
+    session_id = f"session-1806-retry-unowned-{fail_first}-{mutation_slug}"
+
+    captured, apperrors, cache_at_heal, cache_after = (
+        _run_composed_retry_expecting_abandoned_heal(
+            monkeypatch,
+            _RETRY_OWNED_CFG,
+            _ambient_runtime(),
+            session_id,
+            fail_first=fail_first,
+            heal_mutate=heal_mutate,
+        )
+    )
+
+    _assert_retry_abandoned(
+        captured,
+        apperrors,
+        cache_at_heal,
+        cache_after,
+        session_id,
+        label,
+        expected_cause="is not configured",
+    )
+
+
+@pytest.mark.parametrize("fail_first", ["returned_error", "raised"])
+@pytest.mark.parametrize("row_fields,credential_label", _UNRESOLVED_CREDENTIAL_ROWS)
+def test_retry_abandons_the_heal_when_the_refreshed_credential_resolves_to_nothing(
+    monkeypatch, fail_first, row_fields, credential_label
+):
+    """Case B — the row still owns the route, but its credential now yields nothing.
+
+    This is the shape a 401 self-heal is most likely to meet in the wild: the
+    401 happened BECAUSE the credential went away, so the re-resolve finds the
+    same row with a declared-but-unresolved source. ``keyless`` is False there,
+    so no ``dummy-key`` is substituted and the pair stays incomplete — and an
+    incomplete pair at the constructor is a re-route, not a refusal.
+
+    The retry therefore has to stop, and the turn has to end naming the
+    credential setting rather than the 401 it produced.
+    """
+    _clear_credential_env(monkeypatch)
+    label = f"{credential_label} / {fail_first}"
+    session_id = f"session-1806-retry-nocred-{fail_first}-{credential_label}"
+
+    captured, apperrors, cache_at_heal, cache_after = (
+        _run_composed_retry_expecting_abandoned_heal(
+            monkeypatch,
+            _RETRY_OWNED_CFG,
+            _ambient_runtime(),
+            session_id,
+            fail_first=fail_first,
+            heal_mutate=_retry_credential_mutation(row_fields),
+        )
+    )
+
+    _assert_retry_abandoned(
+        captured,
+        apperrors,
+        cache_at_heal,
+        cache_after,
+        session_id,
+        label,
+        expected_cause="produced no API key",
+    )
+
+
+def test_retry_still_succeeds_when_the_refreshed_route_is_still_routable(monkeypatch):
+    """The negative control: a heal that re-resolves a GOOD route still retries.
+
+    Without this, every assertion above would also pass if the guards simply
+    abandoned all self-heals — which would take the #1401 credential-refresh
+    retry away entirely. Here the mutation swaps the row's key for a NEW one
+    (the refresh a heal exists to pick up), so the retry must be constructed
+    with the new pair and the turn must be sent a second time.
+    """
+    session_id = "session-1806-retry-still-routable"
+
+    def _rotate_the_credential():
+        config.cfg["custom_providers"] = _retry_cfg_rows(api_key="rotated-key-sentinel")
+
+    import api.streaming as streaming
+
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch,
+        copy.deepcopy(_RETRY_OWNED_CFG),
+        _ambient_runtime(),
+        session_id=session_id,
+        fail_first="returned_error",
+        heal_mutate=_rotate_the_credential,
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model=_RETRY_MODEL,
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+        apperrors = _drain_apperrors(q)
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    history = captured["init_kwargs_history"]
+    assert len(history) == 2, f"the routable heal did not retry: {history}"
+    assert history[1]["api_key"] == "rotated-key-sentinel"
+    assert history[1]["base_url"] == _LIST_ROW_URL
+    assert captured["run_calls"] == 2, "the refreshed credential never sent a turn"
+    assert not apperrors, f"a routable retry emitted a failure: {apperrors}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2694,3 +3354,203 @@ def test_keyed_record_side_fields_survive_the_runtime_bundle(monkeypatch):
         "keyed side-field-only record through the runtime bundle",
     )
     assert init_kwargs["provider"] == "custom"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-streaming consumers: the verdict is terminal off the streaming path too
+#
+# ``api/streaming.py`` is not the only thing that builds an AIAgent from a
+# merged bundle. POST /api/chat and the four auxiliary consumers all go through
+# ``routes._resolve_agent_connection_bundle()``, which is the single chokepoint
+# that must RAISE rather than hand back a bundle with a hole in it: an
+# incomplete ``(api_key, base_url)`` pair is not a refusal at the constructor,
+# it is the signal to re-resolve a provider through ``_routed_client_kwargs()``.
+# These pin the raise, the 400 POST /api/chat turns it into, and the negative
+# control that a routable bundle still comes back untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _terminal_route_cfg(kind):
+    """Config producing each of the three terminal verdicts for one slug."""
+    if kind == "unowned":
+        # Exactly one row, named something else: nothing owns ``custom:ghost``.
+        return copy.deepcopy(_SOLE_UNRELATED_ROW_CFG)
+    if kind == "no_endpoint":
+        # The exact row owns the slug and blanks the endpoint, so the keyed
+        # row's URL must not be reachable by falling through.
+        return _exact_list_row_cfg(base_url="")
+    # The exact row declares a credential source that resolves to nothing.
+    return _exact_list_row_cfg(drop=("api_key",), key_env=_MISSING_ENV_VAR)
+
+
+_TERMINAL_ROUTE_CASES = [
+    ("unowned", "custom:ghost", config.CUSTOM_ROUTE_UNOWNED, "is not configured", "Settings"),
+    (
+        "no_endpoint",
+        "custom:omni",
+        config.CUSTOM_ROUTE_NO_ENDPOINT,
+        "resolved no endpoint",
+        "base_url",
+    ),
+    (
+        "no_credential",
+        "custom:omni",
+        config.CUSTOM_ROUTE_NO_CREDENTIAL,
+        "produced no API key",
+        "key_env",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "kind,slug,expected_reason,message_fragment,hint_fragment", _TERMINAL_ROUTE_CASES
+)
+def test_agent_connection_bundle_raises_on_terminal_route(
+    monkeypatch, kind, slug, expected_reason, message_fragment, hint_fragment
+):
+    """The non-streaming chokepoint refuses instead of returning a holed bundle.
+
+    Returning ``{"base_url": None, ...}`` here would look terminal to the caller
+    and be the opposite at the constructor, so all five consumers that share
+    this helper would each have had to remember to check. Raising makes the
+    refusal structural — and the exception subclasses ``ValueError``, which is
+    what the existing handlers at those call sites already catch.
+    """
+    import api.routes as routes
+
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _terminal_route_cfg(kind))
+
+    # Mirror POST /api/chat's own sequence: resolve the model's provider, then
+    # let the ambient runtime fill the endpoint/credential it did not resolve.
+    _model, provider, base_url = config.resolve_model_provider(
+        f"@{slug}:antigravity/gemini-3.7-flash-tiered"
+    )
+    runtime = copy.deepcopy(_ROUTE_KEYED_RUNTIME)
+    api_key = runtime["api_key"]
+    if not base_url:
+        base_url = runtime["base_url"]
+
+    with pytest.raises(config.CustomProviderRouteError) as excinfo:
+        routes._resolve_agent_connection_bundle(provider, api_key, base_url, runtime)
+
+    err = excinfo.value
+    assert isinstance(err, ValueError), (
+        "the existing except-ValueError handlers at the five call sites must keep catching it"
+    )
+    assert err.reason == expected_reason
+    assert err.provider == slug
+    assert message_fragment in err.message, err.message
+    assert hint_fragment in err.hint, err.hint
+
+
+def test_agent_connection_bundle_returns_routable_bundle_unchanged(monkeypatch):
+    """The negative control: a routable named route still comes back, not raised.
+
+    Without this, the three cases above are equally satisfied by a helper that
+    refuses everything — which would take every working custom provider down.
+    """
+    import api.routes as routes
+
+    _with_direct_config(monkeypatch, copy.deepcopy(_KEYED_VS_LIST_CFG))
+
+    bundle = routes._resolve_agent_connection_bundle(
+        "custom:omni",
+        "keyed-key-sentinel-abc",
+        "https://keyed-url-sentinel.example/v1",
+        copy.deepcopy(_ROUTE_KEYED_RUNTIME),
+    )
+
+    assert bundle["base_url"] == _LIST_ROW_URL
+    assert bundle["api_key"] == _LIST_ROW_KEY
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+
+
+def _drive_sync_chat_route_expecting_refusal(monkeypatch, cfg_dict, slug):
+    """Drive POST /api/chat to its refusal; return ``(payload, status, captured)``.
+
+    The session carries the explicit ``@custom:<slug>:<model>`` form the picker
+    emits, which ``model_with_provider_context()`` passes through untouched.
+    That matters for the unowned case: a BARE model plus a stale
+    ``model_provider`` never mints an ``@custom:ghost:`` route in the first
+    place (the #7356 guard drops the hint), so the explicit form is the shape in
+    which an unowned slug actually reaches this route.
+    """
+    import api.routes as routes
+
+    captured, fake_session = _setup_route_consumer_runtime(
+        monkeypatch,
+        session_messages=_four_route_messages(),
+        cfg_dict=cfg_dict,
+        runtime_dict=copy.deepcopy(_ROUTE_KEYED_RUNTIME),
+    )
+    fake_session.model = f"@{slug}:antigravity/gemini-3.7-flash-tiered"
+    fake_session.model_provider = slug
+
+    responses = []
+    monkeypatch.setattr(routes, "get_session", lambda _sid: fake_session)
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **_k: None)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda ws: "/tmp")
+    monkeypatch.setattr(
+        routes, "_get_session_agent_lock", lambda _sid: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        routes, "_read_profile_model_config", lambda *_a, **_k: (None, None, None)
+    )
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda model, provider, **_k: (model, provider),
+    )
+    # Capture the status alongside the payload -- "which HTTP code" is half the
+    # contract here (400 user-fixable, not a 500 traceback).
+    def _capture_j(_handler, payload, **kwargs):
+        responses.append((payload, kwargs.get("status", 200)))
+        return payload
+
+    monkeypatch.setattr(routes, "j", _capture_j)
+    monkeypatch.setattr(routes, "bad", lambda _handler, message, *_a, **_k: {"error": message})
+
+    routes._handle_chat_sync(
+        object(), {"session_id": "session-1806-route", "message": "hi"}
+    )
+
+    assert responses, "POST /api/chat returned no response at all"
+    payload, status = responses[-1]
+    return payload, status, captured
+
+
+@pytest.mark.parametrize(
+    "kind,slug,expected_reason,message_fragment,hint_fragment", _TERMINAL_ROUTE_CASES
+)
+def test_sync_chat_route_answers_400_on_unroutable_custom_provider(
+    monkeypatch, kind, slug, expected_reason, message_fragment, hint_fragment
+):
+    """POST /api/chat answers the actionable cause, and never builds the agent.
+
+    400, not 500: an unroutable ``custom:<slug>`` is a user-fixable provider
+    misconfiguration, exactly like the ambiguous-slug collision. The constructor
+    must not be reached at all — the capturing double raises on ``__init__``, so
+    a bundle that got that far would surface as a leaked
+    ``_RouteAgentCaptured`` rather than a quiet pass.
+    """
+    _clear_credential_env(monkeypatch)
+
+    payload, status, captured = _drive_sync_chat_route_expecting_refusal(
+        monkeypatch, _terminal_route_cfg(kind), slug
+    )
+
+    assert status == 400, payload
+    assert payload["type"] == "custom_provider_unroutable", payload
+    assert payload["reason"] == expected_reason, payload
+    assert message_fragment in payload["error"], payload
+    assert slug in payload["error"], payload
+    assert hint_fragment in payload["hint"], payload
+
+    assert "init_kwargs" not in captured, (
+        "an agent was constructed for an unroutable route on the non-streaming path"
+    )
+    # The refusal must not hand back the endpoint or credential it declined to
+    # route through.
+    assert "keyed-url-sentinel" not in str(payload), payload
+    assert "keyed-key-sentinel-abc" not in str(payload), payload
