@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
+import os
 import sys
 import types
 
@@ -3554,3 +3555,1182 @@ def test_sync_chat_route_answers_400_on_unroutable_custom_provider(
     # route through.
     assert "keyed-url-sentinel" not in str(payload), payload
     assert "keyed-key-sentinel-abc" not in str(payload), payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The standard Hermes v12 config shape: a RAW ``providers:<key>`` record
+#
+# Everything above this point describes a config that spells a named custom
+# provider one of the two ways the WebUI itself writes: a ``custom_providers[]``
+# row, or a ``providers['custom:<slug>']`` key. Hermes v12 writes neither. Its
+# config is
+#
+#     model:
+#       provider: custom:omni
+#     providers:
+#       omni:
+#         base_url: https://omni.example/v1
+#         key_env: OMNI_GATE_KEY
+#
+# and the installed Agent routes it fine: ``_match_new_style_provider()`` scans
+# the ENABLED entries of the raw ``providers:`` mapping and takes the first whose
+# alias set — minted from BOTH the display ``name`` and the config KEY — holds
+# the requested identity. The WebUI looked only at the ``custom:``-prefixed
+# spellings, so every send on a stock v12 config failed closed as
+# ``unowned_custom_provider`` while the CLI on the same config sent happily.
+#
+# These regressions use ONLY that shape: no ``custom_providers[]`` list entry and
+# no ``providers['custom:omni']`` key. :func:`_v12_raw_cfg` asserts the absence,
+# so a future edit that quietly re-adds either spelling turns the whole section
+# vacuous loudly rather than silently.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_V12_URL = "https://v12-raw-url-sentinel.example/v1"
+_V12_KEY = "v12-raw-key-sentinel"
+_V12_KEY_ENV = "HERMES_TEST_1806_V12_OMNI_KEY"
+
+
+def _v12_raw_cfg(record, *, key="omni", model_provider="custom:omni"):
+    """``providers: {<key>: record}`` and a ``model:`` block — nothing else.
+
+    The ``model:`` block deliberately declares NO connection field of its own.
+    ``model.provider: custom:omni`` makes it a candidate in
+    ``_select_custom_provider_record``, and a base_url there would let it own
+    the route — which would prove nothing about the raw record under test.
+    """
+    cfg_dict = {
+        "model": {
+            "default": "antigravity/gemini-3.7-flash-tiered",
+            "provider": model_provider,
+        },
+        "providers": {key: copy.deepcopy(record)},
+    }
+    assert "custom_providers" not in cfg_dict, "the raw shape carries no list"
+    assert not any(
+        str(k).lower().startswith("custom") for k in cfg_dict["providers"]
+    ), "the raw shape carries no ``custom:``-prefixed key"
+    assert not (set(cfg_dict["model"]) & {"base_url", "api_key", "key_env"}), (
+        "the model: block must declare no connection of its own"
+    )
+    return cfg_dict
+
+
+def _v12_env(monkeypatch):
+    """Seed the ``key_env``/``api_key_env`` credential and clear the ladder below it."""
+    monkeypatch.setenv(_V12_KEY_ENV, _V12_KEY)
+    # ``CUSTOM_<SLUG>_API_KEY`` is the next rung of the record's own credential
+    # ladder; leaving a stray one set would mask a record whose declared env var
+    # was never read at all.
+    monkeypatch.delenv("CUSTOM_OMNI_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_MY_OMNI_API_KEY", raising=False)
+
+
+# Each variant is ONE raw record that must resolve to the same (URL, key) pair
+# through a different pair of field spellings. ``api``/``url`` are the Agent's
+# ``_entry_url`` precedence and ``api_key_env`` its ``key_env`` synonym; a config
+# hand-written or migrated either way names the same endpoint.
+_V12_RECORD_VARIANTS = [
+    ({"base_url": _V12_URL, "key_env": _V12_KEY_ENV}, "base_url+key_env"),
+    ({"api": _V12_URL, "api_key_env": _V12_KEY_ENV}, "api+api_key_env"),
+    ({"url": _V12_URL, "key_env": _V12_KEY_ENV}, "url+key_env"),
+    ({"base_url": _V12_URL, "api_key": _V12_KEY}, "base_url+static_api_key"),
+    # Display name AND config key disagree: the key alone still names the slug.
+    (
+        {"name": "My Omni", "base_url": _V12_URL, "key_env": _V12_KEY_ENV},
+        "aliased-display-name",
+    ),
+]
+
+_V12_VARIANT_IDS = [label for _record, label in _V12_RECORD_VARIANTS]
+
+
+@pytest.mark.parametrize("record,label", _V12_RECORD_VARIANTS, ids=_V12_VARIANT_IDS)
+def test_v12_raw_provider_record_owns_its_named_slug(monkeypatch, record, label):
+    """``providers: {omni: ...}`` is the authority for ``custom:omni``.
+
+    The bug: none of these resolved at all. ``custom:omni`` matched no
+    ``custom_providers[]`` row and no ``providers['custom:omni']`` key, so the
+    route was reported unowned and the send refused.
+    """
+    _v12_env(monkeypatch)
+    _with_direct_config(monkeypatch, _v12_raw_cfg(record))
+
+    api_key, base_url = config.resolve_custom_provider_connection("custom:omni")
+    assert base_url == _V12_URL, label
+    assert api_key == _V12_KEY, label
+
+    bundle = config.resolve_custom_provider_bundle("custom:omni")
+    assert bundle["status"] == config.CUSTOM_SELECTION_KEYED, label
+    assert bundle["record"] is not None, label
+    assert bundle["base_url"] == _V12_URL, label
+    assert bundle["api_key"] == _V12_KEY, label
+    # A record that resolved a credential is not keyless, so the route can never
+    # be handed the placeholder that claims the endpoint needs no auth.
+    assert bundle["keyless"] is False, label
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY, label
+
+
+def test_v12_raw_record_is_reached_by_its_display_name_too(monkeypatch):
+    """One record, keyed ``omni`` and named ``My Omni``, answers to BOTH identities.
+
+    The Agent mints its alias set from the display name and the config key
+    together, so ``custom:omni`` and ``custom:my-omni`` are the same provider to
+    it. A WebUI that honoured only one of them would refuse half the sends the
+    picker can emit for a single configured endpoint.
+    """
+    _v12_env(monkeypatch)
+    record = {"name": "My Omni", "base_url": _V12_URL, "key_env": _V12_KEY_ENV}
+
+    for slug in ("custom:omni", "custom:my-omni"):
+        _with_direct_config(monkeypatch, _v12_raw_cfg(record, model_provider=slug))
+        assert config.resolve_custom_provider_connection(slug) == (_V12_KEY, _V12_URL), slug
+
+    # …and an identity the record does NOT name is still refused, so the alias
+    # set widens the vocabulary without widening ownership.
+    _with_direct_config(monkeypatch, _v12_raw_cfg(record, model_provider="custom:omni"))
+    assert config.resolve_custom_provider_connection("custom:ghost") == (None, None)
+    ghost = config.resolve_custom_provider_bundle("custom:ghost")
+    assert ghost["status"] == config.CUSTOM_SELECTION_MISSING
+
+
+# ── the non-active raw record: its endpoint, not the active provider's ───────
+
+
+def test_v12_raw_record_supplies_its_own_endpoint_beside_its_own_key(monkeypatch):
+    """A NON-ACTIVE raw record must not pair its key with the ambient endpoint.
+
+    This is the #1806 split-authority failure mirrored onto the raw shape. The
+    ambient runtime has resolved the ACTIVE provider, so it seeds a truthy
+    ``base_url`` of its own. The merge then takes the credential from the raw
+    record (the runtime is a different authority, so its key is not this
+    provider's) — and, filling only what the runtime had left empty, kept the
+    ACTIVE provider's URL. The send went to the active endpoint carrying the
+    non-active provider's key: a guaranteed 401 at best, and the user's prompt
+    delivered to a provider they did not pick at worst.
+
+    The record declares the endpoint, so the record's endpoint wins.
+    """
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _v12_raw_cfg({"base_url": _V12_URL, "key_env": _V12_KEY_ENV})
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _V12_URL
+    assert bundle["api_key"] == _V12_KEY
+    assert bundle["base_url"] != _AMBIENT_SIDE_FIELD_RUNTIME["base_url"], (
+        "the record's key was paired with the ambient provider's endpoint"
+    )
+    assert bundle["api_key"] != _AMBIENT_SIDE_FIELD_RUNTIME["api_key"]
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+    # The runtime is a proven-foreign authority, so none of its side fields ride
+    # along to the custom HTTP endpoint either.
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, "non-active raw record")
+
+
+def test_v12_raw_record_keeps_the_runtimes_spelling_of_the_same_endpoint(monkeypatch):
+    """Negative control: same authority, so the runtime's normalized URL stands.
+
+    Without this, the test above is equally satisfied by "always overwrite the
+    runtime's endpoint with the config spelling" — which would discard the
+    normalized form the runtime actually resolved (trailing-``/v1``
+    de-duplication and friends) for an endpoint that is provably the same one.
+    """
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _v12_raw_cfg({"base_url": _V12_URL + "/", "key_env": _V12_KEY_ENV})
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        None,
+        _V12_URL,
+        {"provider": "custom:omni", "base_url": _V12_URL},
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _V12_URL, "a same-authority runtime spelling was discarded"
+    assert bundle["api_key"] == _V12_KEY
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+
+
+def test_v12_raw_record_does_not_override_an_endpoint_it_cannot_disprove(monkeypatch):
+    """Second negative control: with NO runtime dict there is no foreign authority.
+
+    The override above is a provenance verdict — "the runtime dict reports a
+    different endpoint" — not a blanket precedence rule. Callers that pass no
+    runtime dict at all (the legacy three-field view, and anything injecting its
+    own ``connection_resolver``) supply no provenance to compare against, so the
+    endpoint they already resolved stands. Reading the absent dict as evidence of
+    a foreign authority would silently re-point those callers at the config
+    spelling, which is #2271's
+    ``test_named_custom_provider_keeps_existing_runtime_base_url``.
+    """
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _v12_raw_cfg({"base_url": _V12_URL, "key_env": _V12_KEY_ENV})
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        None,
+        "https://caller-resolved-sentinel.example/v1",
+        None,
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == "https://caller-resolved-sentinel.example/v1"
+    assert bundle["api_key"] == _V12_KEY
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+
+
+# ── disabled rows are invisible to the Agent, so they own nothing here ───────
+
+
+_V12_DISABLED_FLAGS = [False, "false", "no", "off", "0"]
+
+
+@pytest.mark.parametrize("flag", _V12_DISABLED_FLAGS, ids=[str(f) for f in _V12_DISABLED_FLAGS])
+def test_v12_disabled_raw_record_fails_closed_as_unowned(monkeypatch, flag):
+    """A switched-off row must not quietly keep routing.
+
+    ``is_provider_enabled()`` hides a falsey ``enabled:`` entry from the Agent's
+    resolver, so honouring it here would make the WebUI send through an endpoint
+    the user disabled — and send it through the AMBIENT connection the moment the
+    row itself resolved nothing. Both halves are pinned: the verdict is
+    ``unowned_custom_provider``, and the bundle keeps no endpoint, credential,
+    placeholder or side field from anywhere.
+    """
+    _v12_env(monkeypatch)
+    record = {"enabled": flag, "base_url": _V12_URL, "key_env": _V12_KEY_ENV}
+    _with_direct_config(monkeypatch, _v12_raw_cfg(record))
+
+    assert config.resolve_custom_provider_connection("custom:omni") == (None, None)
+    selection = config.resolve_custom_provider_bundle("custom:omni")
+    assert selection["status"] == config.CUSTOM_SELECTION_MISSING
+    assert selection["record"] is None
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+        lookup_provider="custom:omni",
+    )
+    verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+    assert verdict is not None, "a disabled row left the route looking routable"
+    assert verdict["reason"] == config.CUSTOM_ROUTE_UNOWNED
+    assert verdict["provider"] == "custom:omni"
+    assert bundle["base_url"] is None
+    assert bundle["api_key"] is None
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY
+    assert bundle["provider"] == "custom:omni"
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, f"enabled: {flag!r}")
+    # The disabled row's own endpoint and credential must not leak either.
+    assert _V12_URL not in str(bundle)
+    assert _V12_KEY not in str(bundle)
+
+
+@pytest.mark.parametrize("flag", [True, "true", "yes", "on", "1"], ids=lambda f: str(f))
+def test_v12_explicitly_enabled_raw_record_still_owns_its_slug(monkeypatch, flag):
+    """Negative control: only the FALSEY words hide a row.
+
+    A mirror that read ``enabled`` as "present means off", or that treated any
+    string as truthy-by-presence, would take every explicitly-enabled v12
+    provider offline — the same outage as the bug, from the opposite direction.
+    """
+    _v12_env(monkeypatch)
+    record = {"enabled": flag, "base_url": _V12_URL, "key_env": _V12_KEY_ENV}
+    _with_direct_config(monkeypatch, _v12_raw_cfg(record))
+
+    assert config.resolve_custom_provider_connection("custom:omni") == (_V12_KEY, _V12_URL)
+
+
+# ── two raw records claiming one identity split the authority ────────────────
+
+
+_V12_AMBIGUOUS_CASES = [
+    (
+        # Two config KEYS whose alias sets overlap: ``Omni`` normalizes onto the
+        # other record's key.
+        {
+            "omni": {"base_url": "https://omni-a.example/v1", "api_key": "omni-a-key"},
+            "omni-two": {
+                "name": "Omni",
+                "base_url": "https://omni-b.example/v1",
+                "api_key": "omni-b-key",
+            },
+        },
+        "key-vs-display-name",
+    ),
+    (
+        # Two display NAMES that normalize to the same slug: ``Omni`` and
+        # ``omni`` are one identity to the Agent's alias minting.
+        {
+            "gate-a": {
+                "name": "Omni",
+                "base_url": "https://omni-a.example/v1",
+                "key_env": _V12_KEY_ENV,
+            },
+            "gate-b": {
+                "name": "omni",
+                "base_url": "https://omni-b.example/v1",
+                "api_key": "omni-b-key",
+            },
+        },
+        "display-name-vs-display-name",
+    ),
+    (
+        # The legacy ``custom:``-carrying spelling of a display name is the same
+        # identity as the bare config key.
+        {
+            "omni": {"base_url": "https://omni-a.example/v1", "api_key": "omni-a-key"},
+            "gate-b": {
+                "name": "custom:omni",
+                "base_url": "https://omni-b.example/v1",
+                "api_key": "omni-b-key",
+            },
+        },
+        "bare-key-vs-custom-prefixed-name",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "providers_map,label",
+    [(m, lbl) for m, lbl in _V12_AMBIGUOUS_CASES],
+    ids=[lbl for _m, lbl in _V12_AMBIGUOUS_CASES],
+)
+def test_v12_ambiguous_raw_records_fail_closed(monkeypatch, providers_map, label):
+    """Two raw records naming one slug is a refusal, not a first-match race.
+
+    Config order would decide which endpoint and which credential the send gets,
+    and nothing forces those two to come from the SAME record — the split
+    authority ``_unique_custom_provider_entry`` already refuses for
+    ``custom_providers[]``. Every entry point into the route must raise, because
+    each of them is the first thing some consumer calls.
+    """
+    # The first case's ``omni`` key is ambiguous only because the OTHER record
+    # exists, so build the config by hand rather than via ``_v12_raw_cfg``.
+    cfg_dict = {
+        "model": {"default": "antigravity/gemini-3.7-flash-tiered", "provider": "custom:omni"},
+        "providers": copy.deepcopy(providers_map),
+    }
+    _v12_env(monkeypatch)
+    _with_direct_config(monkeypatch, cfg_dict)
+
+    import api.routes as routes
+
+    entry_points = {
+        "resolve_custom_provider_connection": lambda: config.resolve_custom_provider_connection(
+            "custom:omni"
+        ),
+        "resolve_custom_provider_bundle": lambda: config.resolve_custom_provider_bundle(
+            "custom:omni"
+        ),
+        "merge_custom_provider_runtime_bundle": lambda: (
+            config.merge_custom_provider_runtime_bundle(
+                "custom:omni",
+                _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+                _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+                copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+                lookup_provider="custom:omni",
+            )
+        ),
+        "_resolve_agent_connection_bundle": lambda: routes._resolve_agent_connection_bundle(
+            "custom:omni",
+            _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+            _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+            copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+        ),
+    }
+
+    for name, call in entry_points.items():
+        with pytest.raises(config.AmbiguousCustomProviderError) as excinfo:
+            call()
+        # The refusal has to be actionable: it must name the colliding records
+        # and subclass ValueError, which is what the existing handlers at the
+        # consumer call sites already catch.
+        assert isinstance(excinfo.value, ValueError), f"{label}/{name}"
+        message = str(excinfo.value)
+        for key in providers_map:
+            assert key in message, f"{label}/{name}: {message}"
+
+    # An identity only ONE of them names is unaffected: a collision on ``omni``
+    # must not take an unrelated provider down with it.
+    unique_cfg = {
+        "model": cfg_dict["model"],
+        "providers": {
+            "solo": {"base_url": _V12_URL, "key_env": _V12_KEY_ENV},
+            **copy.deepcopy(providers_map),
+        },
+    }
+    _with_direct_config(monkeypatch, unique_cfg)
+    assert config.resolve_custom_provider_connection("custom:solo") == (_V12_KEY, _V12_URL)
+
+
+def test_v12_record_naming_the_slug_without_a_connection_is_not_a_collision(monkeypatch):
+    """A record that declares nothing is not a competing authority.
+
+    Only a record that could actually supply an endpoint or a credential can
+    split the authority, so a same-slug row holding e.g. a models allowlist and
+    nothing else must neither win the route nor block it. Refusing here would
+    fail closed on configs that are not ambiguous at all.
+    """
+    _v12_env(monkeypatch)
+    cfg_dict = {
+        "model": {"default": "antigravity/gemini-3.7-flash-tiered", "provider": "custom:omni"},
+        "providers": {
+            "omni": {"base_url": _V12_URL, "key_env": _V12_KEY_ENV},
+            "omni-notes": {"name": "Omni", "models": ["antigravity/gemini-3.7-flash-tiered"]},
+        },
+    }
+    _with_direct_config(monkeypatch, cfg_dict)
+
+    assert config.resolve_custom_provider_connection("custom:omni") == (_V12_KEY, _V12_URL)
+
+
+# ── the three streaming regions that build an agent ──────────────────────────
+
+
+def _assert_v12_bundle(init_kwargs, label, *, expected_key=_V12_KEY):
+    """The constructor bundle is wholly owned by the raw v12 record."""
+    assert init_kwargs["base_url"] == _V12_URL, label
+    assert init_kwargs["api_key"] == expected_key, label
+    # ``custom``, not ``custom:omni``: the named provider has supplied a concrete
+    # endpoint, so Agent init must not synthesize ``CUSTOM:OMNI_API_KEY`` hints.
+    assert init_kwargs["provider"] == "custom", label
+    assert init_kwargs["base_url"] != _AMBIENT_SIDE_FIELD_RUNTIME["base_url"], label
+    assert init_kwargs["api_key"] != _AMBIENT_SIDE_FIELD_RUNTIME["api_key"], label
+    assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY, label
+    _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, label)
+
+
+def _assert_explicit_client_only(captured, label):
+    """``_init_openai_client()`` took the explicit branch on EVERY construction.
+
+    The weaker ``base_url is not None`` proxy is satisfied by a bundle that still
+    sends the turn somewhere else: an incomplete pair makes Agent init call
+    ``_routed_client_kwargs()`` and re-resolve a provider through the centralized
+    router. Asserting the branch is what pins "this send reached the endpoint the
+    user picked".
+    """
+    routed = captured.get("routed_client_kwargs_calls", [])
+    assert not routed, f"{label}: _routed_client_kwargs() was reached: {routed}"
+    explicit = captured.get("explicit_client_kwargs_calls", [])
+    assert explicit, f"{label}: no client was configured at all"
+    for call in explicit:
+        assert call["base_url"] == _V12_URL, label
+        assert call["api_key"] == _V12_KEY, label
+
+
+@pytest.mark.parametrize("record,label", _V12_RECORD_VARIANTS, ids=_V12_VARIANT_IDS)
+def test_v12_raw_record_initial_streaming_send_builds_the_agent(monkeypatch, record, label):
+    """Initial send: the stock v12 config routes, and routes to its OWN endpoint.
+
+    Before the fix this send did not merely mis-route — it never happened. The
+    route was refused as ``unowned_custom_provider`` on a config the CLI sends on
+    every day.
+    """
+    import api.streaming as streaming
+
+    _v12_env(monkeypatch)
+    session_id = f"session-1806-v12-initial-{label}"
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch,
+        _v12_raw_cfg(record),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        session_id=session_id,
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+        apperrors = _drain_apperrors(q)
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    assert not apperrors, f"{label}: the send failed closed: {apperrors}"
+    assert captured.get("run_calls"), f"{label}: the turn was never sent"
+    _assert_v12_bundle(captured["init_kwargs"], f"{label}/initial send")
+    _assert_explicit_client_only(captured, f"{label}/initial send")
+
+
+@pytest.mark.parametrize(
+    "fail_first,label",
+    [("returned_error", "returned-error heal"), ("raised", "raised-exception heal")],
+    ids=["returned-error", "raised-exception"],
+)
+def test_v12_raw_record_survives_both_credential_heal_paths(monkeypatch, fail_first, label):
+    """Both 401 self-heal retries rebuild the SAME raw-record bundle.
+
+    The retry paths re-resolve the runtime provider from scratch, so they are
+    where a partial rebuild leaks the ambient authority back in: the heal hands
+    back the ambient dict, and a retry that refreshed only provider/key/base_url
+    would reconstruct the agent with the ambient pool, wire protocol and ACP
+    transport beside the custom endpoint. Every construction in the history is
+    checked, not just the last.
+    """
+    import api.streaming as streaming
+
+    _v12_env(monkeypatch)
+    session_id = f"session-1806-v12-{fail_first}"
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch,
+        _v12_raw_cfg({"base_url": _V12_URL, "key_env": _V12_KEY_ENV}),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        session_id=session_id,
+        fail_first=fail_first,
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    history = captured["init_kwargs_history"]
+    assert len(history) >= 2, f"{label}: the retry constructed no second agent"
+    for index, init_kwargs in enumerate(history):
+        _assert_v12_bundle(init_kwargs, f"{label} construction #{index}")
+    _assert_explicit_client_only(captured, label)
+
+
+def test_v12_disabled_record_refuses_the_streaming_send(monkeypatch):
+    """A disabled v12 row stops the turn instead of routing it anywhere.
+
+    The complement of the two tests above at the same boundary: no agent is
+    constructed, so ``_routed_client_kwargs()`` is never reached, the agent cache
+    is never poisoned, and the turn ends on a controlled ``provider_unroutable``
+    apperror naming the provider and a fix.
+    """
+    _v12_env(monkeypatch)
+    captured, apperrors = _run_composed_send_expecting_refusal(
+        monkeypatch,
+        _v12_raw_cfg({"enabled": False, "base_url": _V12_URL, "key_env": _V12_KEY_ENV}),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        "session-1806-v12-disabled",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+    )
+
+    payload = apperrors[-1]
+    assert "custom:omni" in payload["message"], payload
+    assert "is not configured" in payload["message"], payload
+
+    blob = str(payload) + str(captured)
+    for leaked in (
+        _V12_URL,
+        _V12_KEY,
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        config.KEYLESS_CUSTOM_API_KEY,
+    ):
+        assert leaked not in blob, f"{leaked!r} leaked into the refused route"
+    assert not captured.get("explicit_client_kwargs_calls")
+
+
+# ── the shared non-streaming constructor boundary ────────────────────────────
+
+
+@pytest.mark.parametrize("record,label", _V12_RECORD_VARIANTS, ids=_V12_VARIANT_IDS)
+def test_v12_raw_record_resolves_at_the_non_streaming_chokepoint(monkeypatch, record, label):
+    """``_resolve_agent_connection_bundle()`` returns the record's bundle, unraised.
+
+    POST /api/chat and the four auxiliary consumers all build their agent from
+    here, so a v12 config that only worked on the streaming path would still take
+    compression, commit messages, handoffs and summaries down. The helper RAISES
+    on a terminal verdict, so a clean return is itself half the assertion.
+    """
+    import api.routes as routes
+
+    _v12_env(monkeypatch)
+    _with_direct_config(monkeypatch, _v12_raw_cfg(record))
+
+    # Mirror POST /api/chat's own sequence: resolve the model's provider, then
+    # let the ambient runtime fill the endpoint it did not resolve.
+    _model, provider, base_url = config.resolve_model_provider(
+        "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+    )
+    assert provider == "custom:omni", label
+    runtime = copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME)
+    bundle = routes._resolve_agent_connection_bundle(
+        provider,
+        runtime["api_key"],
+        base_url or runtime["base_url"],
+        runtime,
+    )
+
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None, label
+    _assert_v12_bundle(bundle, f"{label}/non-streaming chokepoint")
+
+
+def test_v12_disabled_record_raises_at_the_non_streaming_chokepoint(monkeypatch):
+    """The same boundary refuses a disabled row, with the actionable reason."""
+    import api.routes as routes
+
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch,
+        _v12_raw_cfg({"enabled": "off", "base_url": _V12_URL, "key_env": _V12_KEY_ENV}),
+    )
+
+    with pytest.raises(config.CustomProviderRouteError) as excinfo:
+        routes._resolve_agent_connection_bundle(
+            "custom:omni",
+            _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+            _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+            copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+        )
+
+    err = excinfo.value
+    assert isinstance(err, ValueError)
+    assert err.reason == config.CUSTOM_ROUTE_UNOWNED
+    assert err.provider == "custom:omni"
+    assert "is not configured" in err.message, err.message
+    assert err.hint, "the refusal named no fix"
+
+
+# ── the agent cache signature is derived from the resolved bundle ────────────
+
+
+def _v12_send_signature(monkeypatch, cfg_dict, runtime_dict, session_id):
+    """Drive one composed send and return the signature its agent was cached under."""
+    import api.streaming as streaming
+
+    stream_id, q, _captured, restore = _setup_production_composed_runtime(
+        monkeypatch, cfg_dict, runtime_dict, session_id=session_id
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+        with config.SESSION_AGENT_CACHE_LOCK:
+            assert session_id in config.SESSION_AGENT_CACHE, "the send cached no agent"
+            return config.SESSION_AGENT_CACHE[session_id][1]
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+
+def test_v12_cache_signature_is_bundle_derived_not_runtime_derived(monkeypatch):
+    """Two sends whose RESOLVED bundle is identical hash identically.
+
+    The raw record clears every ambient side field, so a signature still taken
+    off the raw runtime provider would differ between these two sends even though
+    the agents they build are the same — churning a new agent per send.
+    """
+    _v12_env(monkeypatch)
+    record = {"base_url": _V12_URL, "key_env": _V12_KEY_ENV}
+
+    sig_plain = _v12_send_signature(
+        monkeypatch,
+        _v12_raw_cfg(record),
+        {"provider": "custom:omni", "base_url": "https://ambient.example/v1", "api_key": "amb"},
+        "session-1806-v12-sig-plain",
+    )
+    sig_ambient = _v12_send_signature(
+        monkeypatch,
+        _v12_raw_cfg(record),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        "session-1806-v12-sig-ambient",
+    )
+
+    assert sig_plain == sig_ambient, (
+        "the signature still varies with runtime fields the bundle cleared"
+    )
+
+
+_V12_SIGNATURE_MUTATIONS = [
+    ({"base_url": _V12_URL + "-moved", "key_env": _V12_KEY_ENV}, "endpoint"),
+    ({"base_url": _V12_URL, "api_key": _V12_KEY + "-rotated"}, "credential"),
+    (
+        {"base_url": _V12_URL, "key_env": _V12_KEY_ENV, "api_mode": "anthropic_messages"},
+        "api_mode",
+    ),
+    (
+        {
+            "base_url": _V12_URL,
+            "key_env": _V12_KEY_ENV,
+            "command": "v12-acp-command-sentinel",
+            "args": ["--v12-acp-arg"],
+        },
+        "acp_transport",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "record,label",
+    _V12_SIGNATURE_MUTATIONS,
+    ids=[label for _r, label in _V12_SIGNATURE_MUTATIONS],
+)
+def test_v12_cache_signature_tracks_the_provider_configuration(monkeypatch, record, label):
+    """Editing the raw record mints a NEW agent instead of reusing the cached one.
+
+    The cache is keyed by session, so a signature blind to any part of the
+    provider configuration would keep serving an agent built on the PREVIOUS
+    endpoint, credential, wire protocol or ACP transport for the rest of the
+    session — the user changes a setting and nothing happens.
+    """
+    _v12_env(monkeypatch)
+    baseline = {"base_url": _V12_URL, "key_env": _V12_KEY_ENV}
+
+    sig_before = _v12_send_signature(
+        monkeypatch,
+        _v12_raw_cfg(baseline),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        "session-1806-v12-sig-baseline",
+    )
+    sig_after = _v12_send_signature(
+        monkeypatch,
+        _v12_raw_cfg(record),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        "session-1806-v12-sig-mutated",
+    )
+
+    assert sig_before != sig_after, (
+        f"the signature ignores the record's {label}, so a cached agent built on "
+        f"the previous one would be reused for the rest of the session"
+    )
+
+
+# ── the WebUI and the installed Agent must select the SAME bundle ────────────
+#
+# ``hermes_cli`` is not importable here, so the oracle below is written from the
+# Agent's documented algorithm rather than by calling it — and deliberately NOT
+# by calling ``api.config``'s mirrors of it, which would make the comparison a
+# tautology. Two independent implementations agreeing on the same config is the
+# only evidence available that a v12 send lands in the same place whichever of
+# the two resolves it. That agreement is the entire point of the fix: the bug was
+# precisely the WebUI and the Agent disagreeing about a stock v12 config.
+
+
+def _oracle_agent_aliases(display_name, provider_key):
+    """``hermes_cli.providers.custom_provider_aliases()``, reimplemented."""
+    aliases = set()
+    for value in (display_name, provider_key):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            continue
+        dashed = raw.replace(" ", "-")
+        aliases.add(raw)
+        aliases.add(dashed)
+        aliases.add(dashed if dashed.startswith("custom:") else "custom:" + dashed)
+        if dashed.startswith("custom:"):
+            bare = dashed.split(":", 1)[1]
+            if bare:
+                aliases.add(bare)
+                aliases.add("custom:" + dashed)
+    aliases.discard("")
+    return aliases
+
+
+def _oracle_agent_enabled(record):
+    """``hermes_cli.config_providers.is_provider_enabled()``, reimplemented."""
+    flag = record.get("enabled", True)
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        return flag.strip().lower() not in {"false", "0", "no", "off"}
+    return bool(flag)
+
+
+def _oracle_agent_selection(cfg_dict, requested):
+    """``_match_new_style_provider()``: first ENABLED raw record whose aliases match.
+
+    Returns the complete connection bundle the Agent would construct with, or
+    ``None`` when nothing in ``providers:`` names ``requested``.
+    """
+    wanted = str(requested or "").strip().lower()
+    providers_cfg = cfg_dict.get("providers") or {}
+    for provider_key, record in providers_cfg.items():
+        if not isinstance(record, dict) or not record:
+            continue
+        if not _oracle_agent_enabled(record):
+            continue
+        if wanted not in _oracle_agent_aliases(record.get("name") or provider_key, provider_key):
+            continue
+        url = None
+        for field in ("api", "url", "base_url"):  # _entry_url precedence
+            value = record.get(field)
+            if isinstance(value, str) and value.strip():
+                url = value.strip()
+                break
+        api_key = record.get("api_key")
+        if not api_key:
+            env_name = record.get("key_env") or record.get("api_key_env")
+            if env_name:
+                api_key = os.environ.get(str(env_name))
+        return {
+            # The Agent routes a resolved named endpoint through the generic
+            # OpenAI-compatible custom client, exactly as the WebUI bundle does.
+            "provider": "custom",
+            "base_url": url,
+            "api_key": api_key or None,
+            "api_mode": record.get("api_mode") or record.get("transport") or None,
+            "acp_command": record.get("acp_command") or record.get("command") or None,
+            "acp_args": record.get("acp_args") or record.get("args") or None,
+        }
+    return None
+
+
+_V12_ORACLE_RECORDS = [
+    ({"base_url": _V12_URL, "key_env": _V12_KEY_ENV}, "base_url+key_env"),
+    ({"api": _V12_URL, "api_key_env": _V12_KEY_ENV}, "api+api_key_env"),
+    ({"url": _V12_URL, "api_key": _V12_KEY}, "url+static_api_key"),
+    ({"name": "My Omni", "base_url": _V12_URL, "key_env": _V12_KEY_ENV}, "aliased-name"),
+    (
+        {
+            "base_url": _V12_URL,
+            "key_env": _V12_KEY_ENV,
+            "api_mode": "anthropic_messages",
+            "command": "v12-acp-command-sentinel",
+            "args": ["--v12-acp-arg"],
+        },
+        "side-fields-owned",
+    ),
+    ({"enabled": False, "base_url": _V12_URL, "key_env": _V12_KEY_ENV}, "disabled"),
+]
+
+
+@pytest.mark.parametrize(
+    "record,label",
+    _V12_ORACLE_RECORDS,
+    ids=[label for _r, label in _V12_ORACLE_RECORDS],
+)
+def test_webui_and_agent_select_the_same_complete_bundle(monkeypatch, record, label):
+    """One config, two resolvers, one connection bundle — including the side fields.
+
+    Not just the URL and the key: ``api_mode`` decides the wire protocol and
+    ``acp_command``/``acp_args`` the transport, so a WebUI that agreed on the
+    endpoint and disagreed on those would still talk to it differently than the
+    CLI does. The disabled case is in the same table on purpose — agreeing that
+    a row owns NOTHING is as much a part of the contract as agreeing where it
+    points.
+    """
+    _v12_env(monkeypatch)
+    cfg_dict = _v12_raw_cfg(record)
+    _with_direct_config(monkeypatch, cfg_dict)
+
+    expected = _oracle_agent_selection(cfg_dict, "custom:omni")
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        copy.deepcopy(_AMBIENT_SIDE_FIELD_RUNTIME),
+        lookup_provider="custom:omni",
+    )
+    fields = ("provider", "base_url", "api_key", "api_mode", "acp_command", "acp_args")
+
+    if expected is None:
+        # The Agent routes this nowhere, so neither may the WebUI — and it must
+        # say so terminally rather than hand back a holed bundle.
+        verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+        assert verdict is not None, label
+        assert verdict["reason"] == config.CUSTOM_ROUTE_UNOWNED, label
+        assert bundle["base_url"] is None and bundle["api_key"] is None, label
+        return
+
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None, label
+    actual = {field: bundle[field] for field in fields}
+    assert actual == expected, (
+        f"{label}: the WebUI and the Agent would reach this provider differently"
+    )
+    # ``credential_pool`` has no counterpart in the raw record, so the ambient
+    # provider's must not ride along with an endpoint it does not belong to.
+    assert bundle["credential_pool"] is None, label
+
+
+def test_the_agent_oracle_disagrees_with_the_prefixed_only_reader(monkeypatch):
+    """Guard the oracle: it must actually resolve what the old reader could not.
+
+    If ``_oracle_agent_selection`` quietly returned ``None`` for the raw shape,
+    every comparison above would collapse into the unowned branch and prove
+    nothing. Pin that it resolves the stock v12 record — and that it is reading
+    the RAW key, not a ``custom:``-prefixed one, by checking it also refuses a
+    record that names a different identity.
+    """
+    _v12_env(monkeypatch)
+    cfg_dict = _v12_raw_cfg({"base_url": _V12_URL, "key_env": _V12_KEY_ENV})
+
+    selection = _oracle_agent_selection(cfg_dict, "custom:omni")
+    assert selection is not None, "the oracle cannot resolve the stock v12 shape"
+    assert selection["base_url"] == _V12_URL
+    assert selection["api_key"] == _V12_KEY
+
+    assert _oracle_agent_selection(cfg_dict, "custom:ghost") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reviewer probe: a DISABLED exact-keyed record must not route either
+#
+# ``providers['custom:<slug>']`` is the one candidate that names the slug by its
+# own exact config key, and it was the one rung of the ladder that never ran the
+# ``enabled`` check. A switched-off keyed record therefore kept handing out a
+# complete, routable bundle — its endpoint AND its secret — while every other
+# shape of the same disable failed closed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_EXACT_KEYED_URL = "https://exact-keyed-disabled-sentinel.example/v1"
+_EXACT_KEYED_KEY = "exact-keyed-disabled-key-sentinel"
+
+
+def _exact_keyed_disabled_cfg(flag):
+    """``providers['custom:omni']`` switched off, beside a live ambient provider.
+
+    The generic ``custom`` record and the ``model:`` block are the less-specific
+    candidates the disabled key must NOT fall through to: honouring the disable
+    by routing the turn through the ACTIVE provider's endpoint and credential is
+    the same leak from the other direction.
+    """
+    return {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {
+            "custom:omni": {
+                "enabled": flag,
+                "base_url": _EXACT_KEYED_URL,
+                "api_key": _EXACT_KEYED_KEY,
+            },
+            "custom": {
+                "base_url": _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+                "api_key": _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("flag", _V12_DISABLED_FLAGS, ids=[str(f) for f in _V12_DISABLED_FLAGS])
+def test_exact_keyed_disabled_provider_fails_closed(monkeypatch, flag):
+    """A disabled ``providers['custom:<slug>']`` owns nothing, at every boundary.
+
+    Pinned across all three surfaces a send can enter through — the connection
+    view, the streaming bundle merge and the non-streaming chokepoint — because
+    the selection bug sat below all of them and a fix at one would leave the
+    other two routing a row the user switched off.
+    """
+    import api.routes as routes
+
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _exact_keyed_disabled_cfg(flag))
+    label = f"enabled: {flag!r}"
+
+    # 1. Selection and the connection view: nothing owns the slug.
+    assert config.resolve_custom_provider_connection("custom:omni") == (None, None), label
+    selection = config.resolve_custom_provider_bundle("custom:omni")
+    assert selection["status"] == config.CUSTOM_SELECTION_MISSING, label
+    assert selection["record"] is None, label
+    assert selection["base_url"] is None and selection["api_key"] is None, label
+
+    # 2. The streaming bundle merge: terminal, and stripped of every authority.
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _ambient_runtime(provider="custom:active"),
+        lookup_provider="custom:omni",
+    )
+    verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+    assert verdict is not None, f"{label}: a disabled keyed record still looked routable"
+    assert verdict["reason"] == config.CUSTOM_ROUTE_UNOWNED, label
+    assert verdict["provider"] == "custom:omni", label
+    assert bundle["base_url"] is None and bundle["api_key"] is None, label
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY, label
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, label)
+
+    # Neither the disabled record's own pair nor the ambient one it must not
+    # inherit may survive anywhere in the bundle.
+    blob = str(bundle)
+    for leaked in (
+        _EXACT_KEYED_URL,
+        _EXACT_KEYED_KEY,
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+    ):
+        assert leaked not in blob, f"{label}: {leaked!r} leaked onto the disabled route"
+
+    # 3. The non-streaming chokepoint raises rather than returning a holed bundle.
+    with pytest.raises(config.CustomProviderRouteError) as excinfo:
+        routes._resolve_agent_connection_bundle(
+            "custom:omni",
+            _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+            _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+            _ambient_runtime(provider="custom:active"),
+        )
+    err = excinfo.value
+    assert err.reason == config.CUSTOM_ROUTE_UNOWNED, label
+    assert err.provider == "custom:omni", label
+    assert err.hint, f"{label}: the refusal named no fix"
+
+
+def test_exact_keyed_enabled_provider_still_owns_its_slug(monkeypatch):
+    """Negative control: only a FALSEY ``enabled`` hides the keyed record.
+
+    A guard that read ``enabled`` as "present means off" would take every
+    explicitly-enabled keyed provider offline — the same outage as the leak, from
+    the opposite direction.
+    """
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _exact_keyed_disabled_cfg(True))
+
+    assert config.resolve_custom_provider_connection("custom:omni") == (
+        _EXACT_KEYED_KEY,
+        _EXACT_KEYED_URL,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reviewer probe: a shared endpoint is not shared credential authority
+#
+# ``_custom_bundle_endpoint_matches()`` identified the runtime as same-authority
+# from the URL alone, so a record that merely declared the SAME base_url as the
+# active provider was handed the active provider's key. Two providers sharing a
+# host — a gateway fronting two accounts, a local proxy — is an ordinary setup,
+# and there the record's URL rode out beside somebody else's secret.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_SHARED_HOST_URL = "https://shared.example/v1"
+_SHARED_HOST_AMBIENT_KEY = "ambient-secret-sentinel"
+_SHARED_HOST_RECORD_KEY = "record-secret-sentinel"
+
+
+def _shared_host_cfg(record):
+    """Raw provider ``omni`` on the shared host, while ``active-other`` is live."""
+    return {
+        "model": {"default": "active/model", "provider": "active-other"},
+        "providers": {"omni": copy.deepcopy(record)},
+    }
+
+
+def _shared_host_runtime():
+    """The ambient runtime: a DIFFERENT provider that reached the same host."""
+    return {
+        "provider": "active-other",
+        "base_url": _SHARED_HOST_URL,
+        "api_key": _SHARED_HOST_AMBIENT_KEY,
+    }
+
+
+def test_shared_endpoint_different_provider_does_not_split_credential(monkeypatch):
+    """The record's OWN credential rides with the record's endpoint.
+
+    Identical URLs plus different keys is exactly the case URL-equality cannot
+    tell apart: the ambient runtime names itself ``active-other``, so it is
+    provably a different authority no matter which host it reached.
+    """
+    _clear_credential_env(monkeypatch)
+    record = {"base_url": _SHARED_HOST_URL, "api_key": _SHARED_HOST_RECORD_KEY}
+    _with_direct_config(monkeypatch, _shared_host_cfg(record))
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_HOST_AMBIENT_KEY,
+        _SHARED_HOST_URL,
+        _shared_host_runtime(),
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+    assert bundle["base_url"] == _SHARED_HOST_URL
+    assert bundle["api_key"] == _SHARED_HOST_RECORD_KEY, (
+        "the non-active record inherited the ambient provider's secret across a "
+        "shared endpoint"
+    )
+    assert bundle["api_key"] != _SHARED_HOST_AMBIENT_KEY
+    # The ambient provider is a foreign authority here, so its side fields go too.
+    assert bundle["credential_pool"] is None
+
+
+def test_shared_endpoint_unresolved_key_fails_closed_not_borrow_ambient(monkeypatch):
+    """A declared-but-unresolved credential fails closed; it does not borrow.
+
+    The dangerous shape: the record declares ``key_env`` and the variable is
+    unset, so its own ladder yields nothing. Filling that hole from the ambient
+    runtime just because both name one host is precisely the split-authority
+    send — the active provider's key against the record's route.
+    """
+    _clear_credential_env(monkeypatch)
+    monkeypatch.delenv(_MISSING_ENV_VAR, raising=False)
+    record = {"base_url": _SHARED_HOST_URL, "key_env": _MISSING_ENV_VAR}
+    _with_direct_config(monkeypatch, _shared_host_cfg(record))
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_HOST_AMBIENT_KEY,
+        _SHARED_HOST_URL,
+        _shared_host_runtime(),
+        lookup_provider="custom:omni",
+    )
+
+    verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+    assert verdict is not None, "an unresolvable credential still looked routable"
+    assert verdict["reason"] == config.CUSTOM_ROUTE_NO_CREDENTIAL
+    assert verdict["provider"] == "custom:omni"
+    assert bundle["api_key"] is None
+    assert bundle["api_key"] != _SHARED_HOST_AMBIENT_KEY
+    # Not the keyless placeholder either: the record DOES declare a credential
+    # source, so an unauthenticated send would be a silent 401, not a keyless one.
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY
+    assert _SHARED_HOST_AMBIENT_KEY not in str(bundle)
+
+
+def test_same_provider_sharing_its_endpoint_still_keeps_the_runtime_fields(monkeypatch):
+    """Negative control: the identity test must not orphan the provider's OWN runtime.
+
+    The ambient runtime dict normally names the very slug being resolved (that is
+    the active-custom-provider shape the WebUI writes). A provenance test that
+    rejected it would clear the side fields of every live custom provider.
+    """
+    _clear_credential_env(monkeypatch)
+    record = {"base_url": _SHARED_HOST_URL, "api_key": _SHARED_HOST_RECORD_KEY}
+    _with_direct_config(monkeypatch, _shared_host_cfg(record))
+
+    runtime = _shared_host_runtime()
+    runtime["provider"] = "custom:omni"
+    runtime["api_mode"] = "chat_completions"
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_HOST_AMBIENT_KEY,
+        _SHARED_HOST_URL,
+        runtime,
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+    assert bundle["base_url"] == _SHARED_HOST_URL
+    # Still the record's own credential — same authority does not make the
+    # ambient key authoritative over one the record declares for itself.
+    assert bundle["api_key"] == _SHARED_HOST_RECORD_KEY
+    assert bundle["api_mode"] == "chat_completions", (
+        "the provider's own runtime side field was cleared as foreign"
+    )

@@ -3506,6 +3506,197 @@ def _custom_record_owns_connection(record: dict, pid: str) -> bool:
     return False
 
 
+# ── raw ``providers:<key>`` records (the standard Hermes v12 config shape) ────
+#
+# The installed Agent's authoritative matcher for a named custom route is
+# ``hermes_cli.runtime_provider_custom._match_new_style_provider()``. It scans
+# the ENABLED entries of the RAW ``providers:`` mapping and takes the first
+# whose alias set contains the requested name, where the alias set is minted by
+# ``hermes_cli.providers.custom_provider_aliases()`` from BOTH the entry's
+# display ``name`` and its config KEY. So the standard v12 shape
+#
+#     model:
+#       provider: custom:omni
+#     providers:
+#       omni:
+#         base_url: https://omni.example/v1
+#         key_env: OMNI_GATE_KEY
+#
+# routes through ``providers['omni']``: that record names the identity by its
+# own config key, exactly the way ``providers['custom:<slug>']`` does. Looking
+# only at the ``custom:``-prefixed spellings made every send on that config fail
+# closed as ``unowned_custom_provider`` while the Agent resolved it fine.
+#
+# The alias/enabled rules are MIRRORED here rather than imported for the same
+# reason :data:`_API_MODE_ALIASES` is: selection has to keep working when the
+# installed runtime module is unavailable or replaced by a test double.
+
+
+def _agent_custom_provider_slug(value: object) -> str:
+    """``custom:<name>`` identity the Agent mints for ``value``.
+
+    Mirror of ``hermes_cli.providers.custom_provider_slug()``: lowercase, spaces
+    to dashes, prefixed unless it already carries one. Deliberately NOT
+    :func:`_custom_provider_slug_key`'s normalization — this one reproduces the
+    Agent's alias vocabulary, and both are consulted by
+    :func:`_custom_record_names_identity`.
+    """
+    identity = str(value or "").strip().lower().replace(" ", "-")
+    if not identity:
+        return ""
+    return identity if identity.startswith("custom:") else f"custom:{identity}"
+
+
+def _custom_provider_alias_set(display_name: object, provider_key: object) -> frozenset[str]:
+    """Every identity the Agent accepts for ONE custom-provider record.
+
+    Mirror of ``hermes_cli.providers.custom_provider_aliases()``, including its
+    legacy ``custom:custom:<name>`` spelling, so a record the Agent would route
+    to is not reported unowned here.
+    """
+    aliases: set[str] = set()
+    for value in (display_name, provider_key):
+        raw = str(value or "").strip().lower()
+        if not raw:
+            continue
+        normalized = raw.replace(" ", "-")
+        aliases.update({raw, normalized, _agent_custom_provider_slug(normalized)})
+        if normalized.startswith("custom:"):
+            suffix = normalized.split(":", 1)[1]
+            if suffix:
+                aliases.update({suffix, f"custom:{normalized}"})
+    aliases.discard("")
+    return frozenset(aliases)
+
+
+def _custom_record_names_identity(display_name: object, provider_key: object, pid: str, slug: str) -> bool:
+    """True when a record keyed ``provider_key`` / named ``display_name`` IS ``pid``.
+
+    Two vocabularies, because two producers mint these ids. The Agent's alias set
+    is what decides a CLI send, so honouring it is what keeps the two in
+    agreement. :func:`_custom_provider_slug_key` is what the WebUI itself mints
+    from a friendly name (``Local (127.0.0.1:11434)`` -> ``local-127.0.0.1-11434``),
+    so a record the WebUI wrote is recognised by its own rules too. Both are
+    identity tests on the record's OWN name/key — neither widens selection to a
+    record that names some other provider.
+    """
+    if pid in _custom_provider_alias_set(display_name, provider_key):
+        return True
+    return any(
+        _custom_provider_slug_key(value) == slug
+        for value in (display_name, provider_key)
+        if str(value or "").strip()
+    )
+
+
+# ``enabled:`` words YAML may hand us as strings, matching
+# hermes_cli.config_providers._FALSE_WORDS.
+_PROVIDER_DISABLED_WORDS = frozenset({"false", "0", "no", "off"})
+
+
+def _raw_provider_record_enabled(record: object) -> bool:
+    """Mirror of ``hermes_cli.config_providers.is_provider_enabled()``.
+
+    Default True; only an explicit falsey ``enabled`` hides the entry. A disabled
+    entry is invisible to the Agent's resolver, so it must not own a WebUI route
+    either — the route fails closed instead of quietly using a row the user
+    switched off.
+    """
+    if not isinstance(record, dict):
+        return False
+    flag = record.get("enabled", True)
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        return flag.strip().lower() not in _PROVIDER_DISABLED_WORDS
+    return bool(flag)
+
+
+# ``_entry_url``'s precedence in hermes_cli.runtime_provider_custom.
+_RAW_PROVIDER_URL_FIELDS = ("api", "url", "base_url")
+
+
+def _normalized_raw_provider_record(record: dict, ep_name: str) -> dict:
+    """Return ``record`` respelled in the field names this module's readers use.
+
+    ONE record in, ONE record out: every value is copied from ``record`` and
+    nothing is sourced from anywhere else, so the endpoint, the credential, the
+    wire protocol, the pool, the ACP transport, the capabilities and the request
+    fields the caller then lifts all still belong to that single authority. Only
+    the SPELLINGS differ between the raw ``providers:<key>`` shape and the
+    ``custom_providers[]`` shape the field readers were written against:
+
+    ``api`` / ``url`` -> ``base_url`` (the Agent's ``_entry_url`` precedence)
+    ``api_key_env``   -> ``key_env``
+    ``<key>``         -> ``provider_key``, when the record names none itself
+
+    ``transport`` -> ``api_mode`` and ``command`` / ``args`` -> ``acp_*`` need no
+    rewrite: :func:`_custom_record_api_mode` and
+    :func:`_custom_record_acp_transport` already accept both spellings in place.
+
+    Respelling a COPY rather than the live record keeps the config snapshot
+    unmutated, so a second resolution of the same slug sees the same input.
+    """
+    normalized = dict(record)
+    for field in _RAW_PROVIDER_URL_FIELDS:
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            normalized["base_url"] = value.strip()
+            break
+    if not str(normalized.get("key_env") or "").strip():
+        api_key_env = record.get("api_key_env")
+        if isinstance(api_key_env, str) and api_key_env.strip():
+            normalized["key_env"] = api_key_env.strip()
+    if not str(normalized.get("provider_key") or "").strip() and str(ep_name or "").strip():
+        # The record's OWN config key is its identity. Stamping it keeps the
+        # credential-pool lookup and the ``key_cmd`` token process labelled with
+        # this provider instead of the generic ``custom``.
+        normalized["provider_key"] = str(ep_name).strip()
+    return normalized
+
+
+def _unique_raw_provider_record(providers_cfg: object, pid: str, slug: str) -> dict | None:
+    """The ONE enabled raw ``providers:<key>`` record that owns ``pid``, else None.
+
+    Skips the two keys that already have dedicated, higher-precedence candidates
+    in :func:`_select_custom_provider_record` — ``providers['custom:<slug>']``
+    and the generic ``providers['custom']`` — so one record can never be counted
+    as two authorities, nor collide with itself.
+
+    Fails closed on a genuine collision: when two DISTINCT raw records both name
+    this identity and both declare connection fields, an endpoint and a
+    credential could be lifted from different rows, which is the same
+    split-authority pairing :func:`_unique_custom_provider_entry` raises on. A
+    record that names the identity but declares nothing is not a competing
+    authority, so it neither wins nor blocks — selection simply falls through to
+    the next candidate, and to the terminal verdict when there is none.
+    """
+    if not isinstance(providers_cfg, dict):
+        return None
+    owning: list[tuple[str, dict]] = []
+    for ep_name, record in providers_cfg.items():
+        key = str(ep_name or "").strip()
+        if not key or key.lower() in {pid, "custom"}:
+            continue
+        if not isinstance(record, dict) or not record:
+            continue
+        if not _raw_provider_record_enabled(record):
+            continue
+        if not _custom_record_names_identity(record.get("name") or key, key, pid, slug):
+            continue
+        normalized = _normalized_raw_provider_record(record, key)
+        if _custom_record_owns_connection(normalized, pid):
+            owning.append((key, normalized))
+    if len(owning) >= 2:
+        keys = [key for key, _record in owning]
+        raise AmbiguousCustomProviderError(
+            f"Custom provider records {keys!r} under providers: all name the provider "
+            f"slug {slug!r}; an endpoint and API key could be resolved from different "
+            f"records. Rename one so each custom provider has a unique slug."
+        )
+    return owning[0][1] if owning else None
+
+
 def _select_custom_provider_record(
     pid: str,
     slug: str,
@@ -3521,8 +3712,12 @@ def _select_custom_provider_record(
     1. the exact ``custom_providers[]`` row whose name normalizes to ``slug``
        (authoritative for its slug even against a same-slug keyed record, and
        even when its ``base_url`` is blank — see #1806);
-    2. otherwise the keyed ``providers['custom:<slug>']`` record, a record that
-       NAMES this slug (the generic ``providers['custom']`` entry whose own
+    2. otherwise the keyed ``providers['custom:<slug>']`` record, then the raw
+       ``providers:<key>`` record that names this identity by its own config key
+       or display name (``providers: {omni: ...}`` for ``custom:omni`` — the
+       standard Hermes v12 shape, matched with the installed Agent's own alias
+       rules; see :func:`_unique_raw_provider_record`), then a record that NAMES
+       this slug (the generic ``providers['custom']`` entry whose own
        name/provider_key normalizes to it, or a ``model:`` block whose provider
        is ``custom:<slug>``), and last the generic ``providers['custom']`` entry
        when ``model.provider`` names this slug — the active-provider shape the
@@ -3569,6 +3764,20 @@ def _select_custom_provider_record(
     provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
     provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
 
+    if (
+        isinstance(provider_specific, dict)
+        and provider_specific
+        and not _raw_provider_record_enabled(provider_specific)
+    ):
+        # ``providers['custom:<slug>']`` names THIS slug by its own exact key, so
+        # switching it off is a statement about this route and not merely about
+        # one candidate among several. Falling through to the generic ``custom``
+        # record or the ``model:`` block would honour the disable by routing the
+        # turn somewhere ELSE — the ambient provider's endpoint and credential
+        # under the name the user just took offline. The slug's own authority
+        # said no, so the route is terminal here.
+        return None, "", False, CUSTOM_SELECTION_MISSING
+
     model_cfg = cfg_data.get("model", {})
     model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
 
@@ -3580,7 +3789,14 @@ def _select_custom_provider_record(
     # user's prompt and a credential sent to a provider they never named.
     # Candidates are ordered by how specifically they name THIS identity.
     named_by_model = model_provider in {pid, slug}
-    has_generic_custom = isinstance(provider_custom, dict) and bool(provider_custom)
+    # A disabled record is invisible to the Agent's resolver, so it is not an
+    # authority here either — at EVERY rung, not just the raw-``providers:`` scan
+    # that already filtered for it.
+    has_generic_custom = (
+        isinstance(provider_custom, dict)
+        and bool(provider_custom)
+        and _raw_provider_record_enabled(provider_custom)
+    )
     # The generic record is keyed ``custom`` in ``providers:``, so it names the
     # literal ``custom:custom`` route by its own key; for any other slug it has
     # to say so itself.
@@ -3588,33 +3804,55 @@ def _select_custom_provider_record(
         slug == "custom" or _custom_record_claims_slug(provider_custom, slug)
     )
 
-    candidates: list[tuple[dict, str]] = []
-    if isinstance(provider_specific, dict) and provider_specific:
-        # Keyed by this provider's own id: ``providers['custom:<slug>']``.
-        candidates.append((provider_specific, "providers"))
-    if generic_claims_slug:
-        candidates.append((provider_custom, "providers"))
-    if isinstance(model_cfg, dict) and model_cfg and (
-        named_by_model
-        or (model_provider == "custom" and _custom_record_claims_slug(model_cfg, slug, allow_name=False))
-    ):
-        candidates.append((model_cfg, "model"))
-    if has_generic_custom and named_by_model and not generic_claims_slug:
-        # Last: the active-provider shape the WebUI itself writes, where the
-        # generic record holds the configuration of whichever custom provider
-        # ``model.provider`` names — here, THIS slug. That is a provenance tie
-        # rather than a declaration, so anything naming the slug outright
-        # (above) outranks it.
-        candidates.append((provider_custom, "providers"))
+    def _candidates():
+        """Identity-owned candidates, most specific first — evaluated LAZILY.
 
-    for cand, source in candidates:
+        Laziness is load-bearing for the raw-``providers:`` scan alone: that one
+        RAISES on an alias collision, and a config whose route is already decided
+        by the exact ``providers['custom:<slug>']`` key must not be failed closed
+        by a collision further down a list it never reaches.
+        """
+        if isinstance(provider_specific, dict) and provider_specific:
+            # Keyed by this provider's own id: ``providers['custom:<slug>']``.
+            yield provider_specific, "providers"
+        # The standard v12 shape: a raw ``providers:<key>`` record that names
+        # this identity by its own config key or display name (``providers:
+        # {omni: ...}`` for ``custom:omni``), matched with the installed Agent's
+        # alias rules. This is identity ownership, not an ambient-field escape —
+        # a record that names some OTHER provider never appears here, and an
+        # unknown slug still matches nothing and falls through to the terminal
+        # verdict below.
+        raw_record = _unique_raw_provider_record(providers_cfg, pid, slug)
+        if raw_record is not None:
+            yield raw_record, "providers"
+        if generic_claims_slug:
+            yield provider_custom, "providers"
+        if isinstance(model_cfg, dict) and model_cfg and _raw_provider_record_enabled(model_cfg) and (
+            named_by_model
+            or (model_provider == "custom" and _custom_record_claims_slug(model_cfg, slug, allow_name=False))
+        ):
+            yield model_cfg, "model"
+        if has_generic_custom and named_by_model and not generic_claims_slug:
+            # Last: the active-provider shape the WebUI itself writes, where the
+            # generic record holds the configuration of whichever custom provider
+            # ``model.provider`` names — here, THIS slug. That is a provenance
+            # tie rather than a declaration, so anything naming the slug outright
+            # (above) outranks it.
+            yield provider_custom, "providers"
+
+    for cand, source in _candidates():
         # A record that names this slug is its authority as soon as it declares
         # ANY connection field — a static key and a base_url are not the only
         # things a record can own. One that declares only ``key_cmd``, a
         # credential pool, an ``api_mode`` or an ACP transport is still THIS
         # slug's record; reporting it missing would clear those very fields as
         # foreign in merge_custom_provider_runtime_bundle.
-        if _custom_record_owns_connection(cand, pid):
+        #
+        # The ``enabled`` re-check is the single chokepoint every candidate has
+        # to pass: each branch above gates on it too, and one selection path
+        # added later without that gate is exactly how a switched-off row's
+        # endpoint and secret got back onto a live route.
+        if _raw_provider_record_enabled(cand) and _custom_record_owns_connection(cand, pid):
             return cand, source, False, CUSTOM_SELECTION_KEYED
 
     return None, "", False, CUSTOM_SELECTION_MISSING
@@ -4040,9 +4278,31 @@ def _custom_bundle_endpoint_matches(bundle: dict, runtime_provider: dict) -> boo
     fields are same-authority (keep) or foreign (clear). A record that declares
     no endpoint of its own cannot prove the runtime is foreign, so its runtime
     fields stand.
+
+    Endpoint equality alone is NOT provenance. Two providers are free to share a
+    base_url — a gateway fronting several accounts, a local proxy, the same host
+    reached with different keys — so a URL match between a record and the ambient
+    runtime says only that both point at one host, never that one authority
+    resolved both. When the runtime dict NAMES itself and that name is some other
+    provider, the identities settle it directly and the shared URL proves
+    nothing.
     """
     if not isinstance(runtime_provider, dict) or not runtime_provider:
         return False
+    rt_provider = str(runtime_provider.get("provider") or "").strip().lower()
+    if rt_provider:
+        slug = str(bundle.get("slug") or "").strip().lower()
+        owned_names = {
+            str(bundle.get("provider_id") or "").strip().lower(),
+            slug,
+            f"custom:{slug}" if slug else "",
+            # The generic ``custom`` runtime is the shape the WebUI writes for
+            # whichever custom provider is active, so it is not a competing name.
+            "custom",
+        }
+        owned_names.discard("")
+        if rt_provider not in owned_names:
+            return False
     record_base_url = bundle.get("base_url")
     rt_base_url = runtime_provider.get("base_url")
     if not record_base_url and not rt_base_url:
@@ -4243,14 +4503,50 @@ def _custom_provider_runtime_bundle_with_provenance(
         bundle["base_url"] = custom["base_url"]
         bundle["api_key"] = custom["api_key"] or None
     else:
-        # No exact row: the keyed/``model:`` record fills only what the runtime
-        # did not already resolve — and it was picked as one complete record, so
-        # the two fields still cannot split across authorities.
-        if same_authority and _rt.get("api_key"):
+        # No exact row: a keyed / raw ``providers:<key>`` / ``model:`` record was
+        # picked as ONE complete record, so the endpoint and the credential must
+        # still come from it together.
+        #
+        # When the record DECLARES an endpoint, that endpoint and the credential
+        # sent to it are one authority's pair, so the record's credential is the
+        # only one that may accompany it — including when the ambient runtime
+        # happens to report the SAME URL. A shared base_url is not shared
+        # provenance: a gateway fronting two accounts hands both providers one
+        # host and two different keys, and taking ``_rt["api_key"]`` there sends
+        # the ACTIVE provider's secret to the non-active record's endpoint. A
+        # record whose declared credential source resolved nothing keeps
+        # ``api_key`` None and falls through to the terminal verdict naming the
+        # setting to fix, rather than borrowing the ambient key across that host.
+        if custom["base_url"]:
+            bundle["api_key"] = custom["api_key"] or None
+        elif same_authority and _rt.get("api_key"):
+            # The record declares NO endpoint of its own, so the runtime's URL is
+            # filling a hole rather than being displaced — and the ambient
+            # endpoint's own credential is the coherent partner for it. Pairing
+            # the ambient URL with anything else is the split this branch avoids.
             bundle["api_key"] = _rt.get("api_key")
         elif custom["api_key"]:
             bundle["api_key"] = custom["api_key"]
-        if not bundle["base_url"] and custom["base_url"]:
+        if custom["base_url"] and _rt.get("base_url") and not same_authority:
+            # The record DECLARES its own endpoint and the runtime dict reports a
+            # DIFFERENT one, so the runtime is provably a foreign authority here —
+            # the same verdict that clears the side fields just below. Filling
+            # only the hole would leave the foreign endpoint in place beside the
+            # credential the branch above just took from this record: a non-active
+            # named provider's key pointed at the ACTIVE provider's URL. That is
+            # the split-authority pairing this function exists to stop, mirrored.
+            # The record's endpoint wins instead.
+            #
+            # ``not same_authority`` alone is NOT that evidence: it is also False
+            # when there is no runtime dict to compare against (the legacy
+            # three-field view and the injected-``connection_resolver`` callers
+            # pass none). Absent provenance is not proof of a foreign authority,
+            # so those keep the endpoint their caller already resolved.
+            bundle["base_url"] = custom["base_url"]
+        elif not bundle["base_url"] and custom["base_url"]:
+            # Nothing seeded the endpoint, so take the record's. When the runtime
+            # DID seed it from the same authority, its spelling stands — a
+            # normalized form of the same endpoint is the one it can reach.
             bundle["base_url"] = custom["base_url"]
 
     for field in CUSTOM_CONNECTION_SIDE_FIELDS:
