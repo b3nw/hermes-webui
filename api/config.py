@@ -3340,6 +3340,64 @@ CUSTOM_SELECTION_AMBIGUOUS = "ambiguous"
 CUSTOM_SELECTION_UNOWNED = (CUSTOM_SELECTION_MISSING, CUSTOM_SELECTION_MALFORMED)
 
 
+# Identity fields a record can use to NAME the custom provider it belongs to.
+# ``name`` is the friendly name a ``custom_providers[]`` entry carries, so a
+# ``providers:`` record spelled the same way is claiming the same identity. A
+# ``model:`` block's ``name`` is the MODEL's name and never claims a provider,
+# which is why that call site passes ``allow_name=False``.
+_CUSTOM_RECORD_IDENTITY_FIELDS = ("provider_key", "provider", "custom_provider", "name")
+
+
+def _custom_record_claims_slug(record: object, slug: str, *, allow_name: bool = True) -> bool:
+    """True when ``record`` names ``slug`` as its OWN identity.
+
+    A generic record — ``providers['custom']`` or a ``model:`` block whose
+    provider is the bare string ``custom`` — belongs to no slug by itself, so it
+    is an authority for ``custom:<slug>`` only when it names that slug. Without
+    this test any unknown route adopts whichever generic record happens to be
+    configured, which is a credential handed to an endpoint the user never named.
+    """
+    if not isinstance(record, dict) or not slug:
+        return False
+    for field in _CUSTOM_RECORD_IDENTITY_FIELDS:
+        if field == "name" and not allow_name:
+            continue
+        value = record.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if _custom_provider_slug_key(value) == slug:
+            return True
+    return False
+
+
+def _custom_record_owns_connection(record: dict, pid: str) -> bool:
+    """True when ``record`` declares ANY field the connection bundle carries.
+
+    The bundle is more than a URL/key pair: ``key_cmd`` mints a per-request
+    bearer, ``credential_pool`` supplies a rotating one, and ``api_mode`` and the
+    ACP command/args decide the wire protocol and the transport process. A record
+    keyed to this slug that declares ONLY those still owns the route — reporting
+    it ``missing`` would fail the route closed and then clear the very fields it
+    declares (see :func:`merge_custom_provider_runtime_bundle`).
+    """
+    base_url = _custom_record_base_url(record)
+    if base_url:
+        return True
+    # DECLARATION, not resolution: a ``key_env`` naming an unset variable or a
+    # pool that is momentarily empty still names this slug's credential source.
+    # Judging by "did a static key resolve?" hands the route to the ambient
+    # authority instead of surfacing the misconfiguration.
+    if _custom_record_declares_credential(record, base_url, None):
+        return True
+    if _resolve_custom_record_key(record.get("api_key"), record.get("key_env"), pid):
+        return True
+    if _custom_record_api_mode(record):
+        return True
+    if _custom_record_acp_transport(record):
+        return True
+    return False
+
+
 def _select_custom_provider_record(
     pid: str,
     slug: str,
@@ -3355,10 +3413,22 @@ def _select_custom_provider_record(
     1. the exact ``custom_providers[]`` row whose name normalizes to ``slug``
        (authoritative for its slug even against a same-slug keyed record, and
        even when its ``base_url`` is blank — see #1806);
-    2. otherwise the keyed ``providers['custom:<slug>']`` record, the bare
-       ``providers['custom']`` authority, or a ``model:`` block that explicitly
-       names this provider — each taken as a COMPLETE record rather than
-       field-by-field.
+    2. otherwise the keyed ``providers['custom:<slug>']`` record, a record that
+       NAMES this slug (the generic ``providers['custom']`` entry whose own
+       name/provider_key normalizes to it, or a ``model:`` block whose provider
+       is ``custom:<slug>``), and last the generic ``providers['custom']`` entry
+       when ``model.provider`` names this slug — the active-provider shape the
+       WebUI itself writes. Each is taken as a COMPLETE record rather than
+       field-by-field, and each is eligible as soon as it declares ANY field the
+       connection bundle carries, not just a static key or a base_url (see
+       :func:`_custom_record_owns_connection`).
+
+    What is deliberately NOT eligible is the generic ``providers['custom']``
+    record or a bare-``custom`` ``model:`` block that names no slug at all. Those
+    are catch-alls, and while they matched every lookup, ``custom:ghost`` took
+    whichever one was configured and inherited its endpoint, credential, pool,
+    ``api_mode`` and ACP transport — the same wrong-authority pairing as the
+    sole-row fallback below, sourced from ``providers:``/``model:`` instead.
 
     There is deliberately NO "the list holds exactly one row, so use it"
     fallback. That rule resolved ``custom:ghost`` to the endpoint AND credential
@@ -3394,17 +3464,49 @@ def _select_custom_provider_record(
     model_cfg = cfg_data.get("model", {})
     model_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
 
+    # The generic ``providers['custom']`` record and a ``model:`` block whose
+    # provider is the bare string ``custom`` are catch-alls: they name no slug of
+    # their own. While they were eligible for EVERY ``custom:<slug>`` lookup,
+    # ``custom:ghost`` selected whichever one happened to be configured and
+    # inherited its endpoint, credential, pool, api_mode and ACP transport — the
+    # user's prompt and a credential sent to a provider they never named.
+    # Candidates are ordered by how specifically they name THIS identity.
+    named_by_model = model_provider in {pid, slug}
+    has_generic_custom = isinstance(provider_custom, dict) and bool(provider_custom)
+    # The generic record is keyed ``custom`` in ``providers:``, so it names the
+    # literal ``custom:custom`` route by its own key; for any other slug it has
+    # to say so itself.
+    generic_claims_slug = has_generic_custom and (
+        slug == "custom" or _custom_record_claims_slug(provider_custom, slug)
+    )
+
     candidates: list[tuple[dict, str]] = []
     if isinstance(provider_specific, dict) and provider_specific:
+        # Keyed by this provider's own id: ``providers['custom:<slug>']``.
         candidates.append((provider_specific, "providers"))
-    if isinstance(provider_custom, dict) and provider_custom:
+    if generic_claims_slug:
         candidates.append((provider_custom, "providers"))
-    if isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
+    if isinstance(model_cfg, dict) and model_cfg and (
+        named_by_model
+        or (model_provider == "custom" and _custom_record_claims_slug(model_cfg, slug, allow_name=False))
+    ):
         candidates.append((model_cfg, "model"))
+    if has_generic_custom and named_by_model and not generic_claims_slug:
+        # Last: the active-provider shape the WebUI itself writes, where the
+        # generic record holds the configuration of whichever custom provider
+        # ``model.provider`` names — here, THIS slug. That is a provenance tie
+        # rather than a declaration, so anything naming the slug outright
+        # (above) outranks it.
+        candidates.append((provider_custom, "providers"))
 
     for cand, source in candidates:
-        cand_key = _resolve_custom_record_key(cand.get("api_key"), cand.get("key_env"), pid)
-        if cand_key or _custom_record_base_url(cand):
+        # A record that names this slug is its authority as soon as it declares
+        # ANY connection field — a static key and a base_url are not the only
+        # things a record can own. One that declares only ``key_cmd``, a
+        # credential pool, an ``api_mode`` or an ACP transport is still THIS
+        # slug's record; reporting it missing would clear those very fields as
+        # foreign in merge_custom_provider_runtime_bundle.
+        if _custom_record_owns_connection(cand, pid):
             return cand, source, False, CUSTOM_SELECTION_KEYED
 
     return None, "", False, CUSTOM_SELECTION_MISSING

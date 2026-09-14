@@ -2291,3 +2291,406 @@ def test_row_declaring_no_credential_is_still_keyless(monkeypatch):
     assert init_kwargs["api_key"] == config.KEYLESS_CUSTOM_API_KEY
     assert init_kwargs["base_url"] == _LIST_ROW_URL
     assert init_kwargs["provider"] == "custom"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The generic bare-``custom`` authority owns NO named slug
+#
+# ``providers['custom']`` and a ``model:`` block whose provider is the bare
+# string ``custom`` name no slug at all. While they were still eligible
+# candidates for every ``custom:<slug>`` lookup, ``custom:ghost`` selected one of
+# them and inherited its endpoint, credential, credential pool, ``api_mode`` and
+# ACP transport — the same wrong-authority pairing the sole-unrelated-row rule
+# above exists to prevent, only sourced from ``providers:``/``model:`` instead of
+# ``custom_providers[]``. A named route is identity-owned: exact slug match, or
+# nothing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_BARE_CUSTOM_PROVIDERS_RECORD = {
+    "base_url": "https://bare-providers-sentinel.example/v1",
+    "api_key": "bare-providers-key-sentinel",
+    "api_mode": "anthropic_messages",
+    "credential_pool": ["bare-pool-sentinel"],
+    "acp_command": "bare-acp-sentinel",
+    "acp_args": ["--bare-arg-sentinel"],
+}
+
+_BARE_CUSTOM_MODEL_BLOCK = {
+    "provider": "custom",
+    "base_url": "https://bare-model-sentinel.example/v1",
+    "api_key": "bare-model-key-sentinel",
+}
+
+
+def _bare_custom_cfg(*, providers_record=True, model_block=True):
+    """Config carrying the generic bare-``custom`` authority, but no ``ghost``."""
+    cfg_dict = {
+        "model": {"default": "ghostly/model"},
+        "providers": {},
+        "custom_providers": [
+            {
+                "name": "omni",
+                "base_url": "https://omni.example/v1",
+                "api_key": "omni-key",
+            },
+        ],
+    }
+    if providers_record:
+        cfg_dict["providers"]["custom"] = copy.deepcopy(_BARE_CUSTOM_PROVIDERS_RECORD)
+    if model_block:
+        cfg_dict["model"].update(copy.deepcopy(_BARE_CUSTOM_MODEL_BLOCK))
+    return cfg_dict
+
+
+def _clear_ghost_credential_env(monkeypatch):
+    """Keep the ``CUSTOM_<SLUG>_API_KEY`` convention out of these verdicts."""
+    monkeypatch.delenv("CUSTOM_GHOST_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_OMNI_API_KEY", raising=False)
+
+
+_BARE_CUSTOM_SHAPES = [
+    (True, False, "providers['custom'] only"),
+    (False, True, "model.provider: custom only"),
+    (True, True, "both bare-custom authorities"),
+]
+
+
+@pytest.mark.parametrize(
+    "providers_record,model_block,label",
+    _BARE_CUSTOM_SHAPES,
+    ids=["providers-custom", "model-provider-custom", "both"],
+)
+def test_unknown_named_slug_never_claims_the_bare_custom_authority(
+    monkeypatch, providers_record, model_block, label
+):
+    """``custom:ghost`` must fail closed even with a generic ``custom`` record present.
+
+    Neither authority names ``ghost``, so neither owns the route. Selecting one
+    would pair the user's prompt with an endpoint and a credential they never
+    pointed this slug at.
+    """
+    _clear_ghost_credential_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _bare_custom_cfg(providers_record=providers_record, model_block=model_block)
+    )
+
+    assert config.resolve_custom_provider_connection("custom:ghost") == (None, None), label
+
+    ghost = config.resolve_custom_provider_bundle("custom:ghost")
+    assert ghost["status"] == config.CUSTOM_SELECTION_MISSING, label
+    assert ghost["source"] == "", label
+    assert ghost["record"] is None, f"{label}: a bare-custom record was selected for a named slug"
+    assert ghost["base_url"] is None, label
+    assert ghost["api_key"] is None, label
+    assert ghost["keyless"] is False, f"{label}: an unowned route was reported keyless"
+    assert ghost["owned"] == {}, f"{label}: an unowned route claimed side fields"
+
+    # The named row is still authoritative for its OWN slug.
+    owned = config.resolve_custom_provider_bundle("custom:omni")
+    assert owned["status"] == config.CUSTOM_SELECTION_EXACT, label
+    assert owned["base_url"] == "https://omni.example/v1", label
+
+
+@pytest.mark.parametrize(
+    "providers_record,model_block,label",
+    _BARE_CUSTOM_SHAPES,
+    ids=["providers-custom", "model-provider-custom", "both"],
+)
+def test_unknown_named_slug_inherits_no_bare_custom_connection_or_side_fields(
+    monkeypatch, providers_record, model_block, label
+):
+    """The merge carries nothing from the bare-``custom`` record onto ``ghost``.
+
+    Not the endpoint, not the credential, and — because a bare record's
+    ``api_mode``/pool/ACP transport are as unowned as its URL — none of the side
+    fields either.
+    """
+    _clear_ghost_credential_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _bare_custom_cfg(providers_record=providers_record, model_block=model_block)
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:ghost",
+        "ambient-key-sentinel",
+        "https://ambient.example/v1",
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        lookup_provider="custom:ghost",
+    )
+
+    _assert_ghost_bundle_failed_closed(bundle, label)
+    assert bundle["base_url"] != _BARE_CUSTOM_PROVIDERS_RECORD["base_url"], label
+    assert bundle["base_url"] != _BARE_CUSTOM_MODEL_BLOCK["base_url"], label
+    assert bundle["api_key"] != _BARE_CUSTOM_PROVIDERS_RECORD["api_key"], label
+    assert bundle["api_key"] != _BARE_CUSTOM_MODEL_BLOCK["api_key"], label
+
+
+def test_unknown_named_slug_connection_view_ignores_the_bare_custom_record(monkeypatch):
+    """The three-field view reaches the same verdict, and reports ``custom_owned`` False."""
+    _clear_ghost_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _bare_custom_cfg())
+
+    provider, api_key, base_url, custom_owned = (
+        config.apply_custom_provider_connection_authority(
+            "custom:ghost",
+            "ambient-key-sentinel",
+            "https://ambient.example/v1",
+            lookup_provider="custom:ghost",
+            runtime_provider=copy.deepcopy(_SELF_LABELLED_GHOST_RUNTIME),
+        )
+    )
+
+    assert base_url is None
+    assert api_key is None
+    assert provider == "custom:ghost"
+    assert custom_owned is False
+
+
+def test_bare_custom_route_still_uses_the_bare_custom_authority(monkeypatch):
+    """The carve-out: closing the generic path for NAMED slugs, not for bare ``custom``.
+
+    ``providers['custom']`` is the bare route's own identity record, so it stays
+    eligible there — the tightening above is about a named slug borrowing an
+    authority that never named it.
+    """
+    _clear_ghost_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _bare_custom_cfg(model_block=False))
+
+    bare = config.resolve_custom_provider_bundle("custom:custom")
+    assert bare["status"] == config.CUSTOM_SELECTION_KEYED
+    assert bare["source"] == "providers"
+    assert bare["base_url"] == _BARE_CUSTOM_PROVIDERS_RECORD["base_url"]
+    assert bare["api_key"] == _BARE_CUSTOM_PROVIDERS_RECORD["api_key"]
+    assert bare["owned"]["api_mode"] == "anthropic_messages"
+    assert bare["owned"]["credential_pool"] == ["bare-pool-sentinel"]
+    assert bare["owned"]["acp_command"] == "bare-acp-sentinel"
+
+
+def test_model_block_naming_the_slug_outright_still_owns_it(monkeypatch):
+    """Only the GENERIC ``custom`` spelling is refused, not an explicit slug.
+
+    A ``model:`` block whose provider is ``custom:ghost`` names this identity, so
+    it remains the route's authority.
+    """
+    _clear_ghost_credential_env(monkeypatch)
+    cfg_dict = _bare_custom_cfg(model_block=False)
+    cfg_dict["model"].update(
+        {
+            "provider": "custom:ghost",
+            "base_url": "https://named-model-sentinel.example/v1",
+            "api_key": "named-model-key-sentinel",
+        }
+    )
+    _with_direct_config(monkeypatch, cfg_dict)
+
+    ghost = config.resolve_custom_provider_bundle("custom:ghost")
+    assert ghost["status"] == config.CUSTOM_SELECTION_KEYED
+    assert ghost["source"] == "model"
+    assert ghost["base_url"] == "https://named-model-sentinel.example/v1"
+    assert ghost["api_key"] == "named-model-key-sentinel"
+    # And it beats the bare-custom record that is still sitting in providers:.
+    assert ghost["base_url"] != _BARE_CUSTOM_PROVIDERS_RECORD["base_url"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# An identity-keyed record owning ONLY side fields or a dynamic credential
+#
+# ``providers['custom:<slug>']`` names this provider outright, so whatever it
+# declares, it owns. Judging it by "did a STATIC api_key resolve, or is there a
+# base_url?" classified a perfectly valid ``key_cmd``-only / ``api_mode``-only /
+# pool-only / ACP-only record as ``missing`` — and the merge then CLEARED the
+# very fields that record exists to supply, reverting them to the ambient
+# runtime's.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _keyed_side_field_cfg(record):
+    """Config whose only authority for ``omni`` is the keyed record ``record``."""
+    return {
+        "model": {"default": "active/model", "provider": "custom:active"},
+        "providers": {"custom:omni": copy.deepcopy(record)},
+        "custom_providers": [
+            {
+                "name": "active",
+                "base_url": "https://active.example/v1",
+                "api_key": "active-key",
+            },
+        ],
+    }
+
+
+_KEYED_SIDE_FIELD_ONLY_RECORDS = [
+    (
+        {"api_mode": "anthropic_messages"},
+        {"api_mode": "anthropic_messages"},
+        True,
+        "api_mode only",
+    ),
+    (
+        {"transport": "anthropic"},
+        {"api_mode": "anthropic_messages"},
+        True,
+        "transport alias only",
+    ),
+    (
+        {"credential_pool": ["keyed-pool-sentinel"]},
+        {"credential_pool": ["keyed-pool-sentinel"]},
+        # A configured pool is a declared credential source, so NOT keyless.
+        False,
+        "credential_pool only",
+    ),
+    (
+        {"acp_command": "keyed-acp-sentinel", "acp_args": ["--keyed-arg-sentinel"]},
+        {"acp_command": "keyed-acp-sentinel", "acp_args": ["--keyed-arg-sentinel"]},
+        True,
+        "ACP transport only",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "record,expected_owned,expected_keyless,label",
+    _KEYED_SIDE_FIELD_ONLY_RECORDS,
+    ids=["api-mode", "transport-alias", "credential-pool", "acp"],
+)
+def test_keyed_record_owning_only_side_fields_is_not_missing(
+    monkeypatch, record, expected_owned, expected_keyless, label
+):
+    """A keyed record with no static URL/key still OWNS what it declares."""
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _keyed_side_field_cfg(record))
+
+    bundle = config.resolve_custom_provider_bundle("custom:omni")
+    assert bundle["status"] == config.CUSTOM_SELECTION_KEYED, (
+        f"{label}: a keyed record that owns side fields was classified as missing"
+    )
+    assert bundle["source"] == "providers", label
+    assert bundle["record"] is not None, label
+    assert bundle["owned"] == expected_owned, label
+    assert bundle["is_exact"] is False, label
+    # It declares no endpoint of its own; that is unowned, not invalid.
+    assert bundle["base_url"] is None, label
+    assert bundle["keyless"] is expected_keyless, label
+
+
+def test_keyed_record_owning_only_key_cmd_is_not_missing(monkeypatch):
+    """``key_cmd`` is a real credential source, so a ``key_cmd``-only record owns the route.
+
+    It resolves no STATIC key by design — the command mints a short-lived bearer
+    per request — so a static-key test reported the record as missing and the
+    route fell back to the ambient authority.
+    """
+    _clear_credential_env(monkeypatch)
+
+    def _token_provider():
+        return "minted-bearer-sentinel"
+
+    _fake_command_token_source(monkeypatch, lambda _key_cmd, _name: _token_provider)
+    _with_direct_config(monkeypatch, _keyed_side_field_cfg({"key_cmd": "print-omni-bearer"}))
+
+    bundle = config.resolve_custom_provider_bundle("custom:omni")
+    assert bundle["status"] == config.CUSTOM_SELECTION_KEYED
+    assert bundle["source"] == "providers"
+    assert bundle["api_key"] is _token_provider, "the keyed record's key_cmd token source was lost"
+    assert bundle["keyless"] is False, "a declared key_cmd must never be reported keyless"
+
+
+def test_keyed_record_owning_only_unresolved_env_credential_is_not_missing(monkeypatch):
+    """A declared-but-unset ``key_env`` still names this slug's credential source.
+
+    Treating it as missing sends the route to the ambient endpoint instead of
+    surfacing the misconfiguration.
+    """
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _keyed_side_field_cfg({"key_env": _MISSING_ENV_VAR}))
+
+    bundle = config.resolve_custom_provider_bundle("custom:omni")
+    assert bundle["status"] == config.CUSTOM_SELECTION_KEYED
+    assert bundle["api_key"] is None
+    assert bundle["keyless"] is False, "a declared-but-unresolved credential is not keyless"
+
+
+_KEYED_SIDE_FIELDS_ONLY_CFG = {
+    "model": {"default": "active/model", "provider": "custom:active"},
+    "providers": {
+        "custom:omni": {
+            # No base_url, no api_key: side fields are ALL this record declares.
+            "api_mode": "anthropic_messages",
+            "credential_pool": ["keyed-pool-sentinel"],
+            "acp_command": "keyed-acp-sentinel",
+            "acp_args": ["--keyed-arg-sentinel"],
+        },
+    },
+    "custom_providers": [
+        {
+            "name": "active",
+            "base_url": "https://active.example/v1",
+            "api_key": "active-key",
+        },
+    ],
+}
+
+
+def test_keyed_record_side_fields_survive_the_merge_without_a_static_pair(monkeypatch):
+    """The merge applies the record's owned fields instead of clearing them."""
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, copy.deepcopy(_KEYED_SIDE_FIELDS_ONLY_CFG))
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        "ambient-key-sentinel",
+        "https://ambient.example/v1",
+        _ambient_runtime(
+            api_mode="chat_completions",
+            command="ambient-acp-sentinel",
+            args=["--ambient-arg-sentinel"],
+            credential_pool=["ambient-pool-sentinel"],
+        ),
+        lookup_provider="custom:omni",
+    )
+
+    _assert_side_fields(
+        bundle,
+        {
+            "api_mode": "anthropic_messages",
+            "credential_pool": ["keyed-pool-sentinel"],
+            "acp_command": "keyed-acp-sentinel",
+            "acp_args": ["--keyed-arg-sentinel"],
+        },
+        "keyed record owning only side fields",
+    )
+
+
+def test_keyed_record_side_fields_survive_the_runtime_bundle(monkeypatch):
+    """End to end: the production-composed send constructs with the record's fields.
+
+    The record declares no endpoint, so the runtime's stands (the keyed
+    fill-only rule) — but every constructor field the record DOES own reaches
+    the agent instead of the ambient provider's value.
+    """
+    _clear_credential_env(monkeypatch)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        copy.deepcopy(_KEYED_SIDE_FIELDS_ONLY_CFG),
+        _ambient_runtime(
+            api_mode="chat_completions",
+            command="ambient-acp-sentinel",
+            args=["--ambient-arg-sentinel"],
+            credential_pool=["ambient-pool-sentinel"],
+        ),
+        "session-1806-keyed-side-fields-only",
+    )
+
+    _assert_side_fields(
+        init_kwargs,
+        {
+            "api_mode": "anthropic_messages",
+            "credential_pool": ["keyed-pool-sentinel"],
+            "acp_command": "keyed-acp-sentinel",
+            "acp_args": ["--keyed-arg-sentinel"],
+        },
+        "keyed side-field-only record through the runtime bundle",
+    )
+    assert init_kwargs["provider"] == "custom"
