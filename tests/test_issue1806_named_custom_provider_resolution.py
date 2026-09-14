@@ -8,6 +8,7 @@ model selection and send runtime auth down an impossible env-var path.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import sys
@@ -1368,11 +1369,29 @@ class _RouteAgentCaptured(Exception):
     """
 
 
-def _setup_route_consumer_runtime(monkeypatch, session_messages=None):
+# The runtime dict the route consumers see by default: production shape, where
+# ``resolve_runtime_provider`` scans ``providers:`` first and so hands back the
+# KEYED endpoint and the KEYED key for this slug.
+_ROUTE_KEYED_RUNTIME = {
+    "provider": "custom:omni",
+    "base_url": "https://keyed-url-sentinel.example/v1",
+    "api_key": "keyed-key-sentinel-abc",
+}
+
+
+def _setup_route_consumer_runtime(
+    monkeypatch, session_messages=None, cfg_dict=None, runtime_dict=None
+):
     """Compose the keyed-vs-list config around a capturing route agent.
 
     Returns ``(captured, fake_session)``. ``captured["init_kwargs"]`` holds the
     FINAL constructor bundle the consumer under test built.
+
+    ``cfg_dict``/``runtime_dict`` override the defaults so a test can hand the
+    consumers an exact row that OWNS side fields (``api_mode``,
+    ``credential_pool``, ACP transport) and an ambient runtime that reports
+    different ones -- the probe for whether the complete bundle, or just its
+    three connection fields, reaches the constructor.
     """
     import types as _types
     from unittest import mock
@@ -1381,18 +1400,16 @@ def _setup_route_consumer_runtime(monkeypatch, session_messages=None):
     import api.oauth
     import api.routes as routes
 
-    monkeypatch.setattr(_config, "cfg", dict(_KEYED_VS_LIST_CFG), raising=False)
-    monkeypatch.setattr(_config, "get_config", lambda: dict(_KEYED_VS_LIST_CFG))
+    cfg_dict = copy.deepcopy(_KEYED_VS_LIST_CFG if cfg_dict is None else cfg_dict)
+    monkeypatch.setattr(_config, "cfg", dict(cfg_dict), raising=False)
+    monkeypatch.setattr(_config, "get_config", lambda: copy.deepcopy(cfg_dict))
 
-    # Production shape: resolve_runtime_provider scans providers: first, so it
-    # hands back the KEYED endpoint and the KEYED key for this slug.
+    runtime_dict = copy.deepcopy(
+        _ROUTE_KEYED_RUNTIME if runtime_dict is None else runtime_dict
+    )
     fake_runtime_module = _types.ModuleType("hermes_cli.runtime_provider")
     fake_runtime_module.resolve_runtime_provider = mock.Mock(
-        return_value={
-            "provider": "custom:omni",
-            "base_url": "https://keyed-url-sentinel.example/v1",
-            "api_key": "keyed-key-sentinel-abc",
-        }
+        return_value=runtime_dict
     )
     fake_hermes_cli = _types.ModuleType("hermes_cli")
     fake_hermes_cli.__path__ = []
@@ -1408,8 +1425,34 @@ def _setup_route_consumer_runtime(monkeypatch, session_messages=None):
     captured = {}
 
     class CapturingRouteAgent:
-        def __init__(self, **kwargs):
-            captured["init_kwargs"] = dict(kwargs)
+        # Every constructor-routing field must be a NAMED parameter, for the
+        # same reason as the streaming double: the route consumers gate each
+        # optional kwarg on ``inspect.signature(AIAgent.__init__)``, so a double
+        # that swallowed them into ``**kwargs`` would filter out exactly the
+        # fields these tests pin and pass vacuously.
+        def __init__(
+            self,
+            model=None,
+            provider=None,
+            base_url=None,
+            api_key=None,
+            api_mode=None,
+            acp_command=None,
+            acp_args=None,
+            credential_pool=None,
+            **kwargs,
+        ):
+            captured["init_kwargs"] = {
+                "model": model,
+                "provider": provider,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+                "acp_command": acp_command,
+                "acp_args": acp_args,
+                "credential_pool": credential_pool,
+                **kwargs,
+            }
             raise _RouteAgentCaptured("captured")
 
     monkeypatch.setattr(routes, "require_ai_agent_class", lambda: CapturingRouteAgent)
@@ -1457,18 +1500,28 @@ def _four_route_messages():
     ]
 
 
-def test_sync_chat_route_applies_exact_list_row_atomically(monkeypatch):
-    """Consumer 1/4: POST /api/chat."""
+# Each driver composes the harness the way its consumer needs it and returns the
+# FINAL constructor kwargs. Sharing them keeps the two contracts below --
+# "the endpoint and credential are one record's" and "the record's side fields
+# reach the constructor too" -- asserted over the SAME five consumers, so a new
+# consumer cannot be added to one list and forgotten in the other.
+
+
+def _drive_sync_chat_route(monkeypatch, cfg_dict=None, runtime_dict=None):
+    """Consumer 1/5: POST /api/chat."""
     import api.routes as routes
 
     captured, fake_session = _setup_route_consumer_runtime(
-        monkeypatch, session_messages=_four_route_messages()
+        monkeypatch,
+        session_messages=_four_route_messages(),
+        cfg_dict=cfg_dict,
+        runtime_dict=runtime_dict,
     )
     monkeypatch.setattr(routes, "get_session", lambda _sid: fake_session)
     monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **_k: None)
     monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda ws: "/tmp")
     monkeypatch.setattr(
-        routes, "_get_session_agent_lock", lambda _sid: __import__("contextlib").nullcontext()
+        routes, "_get_session_agent_lock", lambda _sid: contextlib.nullcontext()
     )
     monkeypatch.setattr(
         routes, "_read_profile_model_config", lambda *_a, **_k: (None, None, None)
@@ -1485,19 +1538,19 @@ def test_sync_chat_route_applies_exact_list_row_atomically(monkeypatch):
         routes._handle_chat_sync(
             object(), {"session_id": "session-1806-route", "message": "hi"}
         )
+    return captured["init_kwargs"]
 
-    _assert_list_row_not_keyed(captured["init_kwargs"], "sync chat (/api/chat)")
 
-
-def test_manual_compression_route_applies_exact_list_row_atomically(monkeypatch):
-    """Consumer 2/4: POST /api/session/{sid}/compress."""
-    import contextlib
-
+def _drive_manual_compression_route(monkeypatch, cfg_dict=None, runtime_dict=None):
+    """Consumer 2/5: POST /api/session/{sid}/compress."""
     import api.config as _config
     import api.routes as routes
 
     captured, fake_session = _setup_route_consumer_runtime(
-        monkeypatch, session_messages=_four_route_messages()
+        monkeypatch,
+        session_messages=_four_route_messages(),
+        cfg_dict=cfg_dict,
+        runtime_dict=runtime_dict,
     )
     monkeypatch.setattr(routes, "get_session", lambda _sid: fake_session)
     monkeypatch.setattr(
@@ -1507,36 +1560,54 @@ def test_manual_compression_route_applies_exact_list_row_atomically(monkeypatch)
     monkeypatch.setattr(routes, "bad", lambda _handler, message, *_a, **_k: {"error": message})
 
     routes._handle_session_compress(object(), {"session_id": "session-1806-route"})
+    return captured["init_kwargs"]
 
-    _assert_list_row_not_keyed(captured["init_kwargs"], "manual compression (/compress)")
 
+def _decline_auxiliary_client(monkeypatch, recorded_main_runtime=None):
+    """Force the auxiliary-model shortcut to decline.
 
-def test_commit_message_route_applies_exact_list_row_atomically(monkeypatch):
-    """Consumer 3/4: LLM git commit-message generation."""
+    The consumers that have one would otherwise return before constructing the
+    main-model agent -- and that constructor is the bundle under test.
+    """
     import types as _types
 
+    fake_aux = _types.ModuleType("agent.auxiliary_client")
+
+    def _get_text_auxiliary_client(_task, main_runtime=None):
+        if recorded_main_runtime is not None:
+            recorded_main_runtime.update(main_runtime or {})
+        return (None, None)
+
+    fake_aux.get_text_auxiliary_client = _get_text_auxiliary_client
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+
+
+def _drive_commit_message_route(
+    monkeypatch, cfg_dict=None, runtime_dict=None, recorded_main_runtime=None
+):
+    """Consumer 3/5: LLM git commit-message generation."""
     import api.routes as routes
 
-    captured, fake_session = _setup_route_consumer_runtime(monkeypatch)
-    # Force the auxiliary-client shortcut to decline so the main-model
-    # constructor (the bundle under test) is the one that runs.
-    fake_aux = _types.ModuleType("agent.auxiliary_client")
-    fake_aux.get_text_auxiliary_client = lambda *_a, **_k: (None, None)
-    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+    captured, fake_session = _setup_route_consumer_runtime(
+        monkeypatch, cfg_dict=cfg_dict, runtime_dict=runtime_dict
+    )
+    _decline_auxiliary_client(monkeypatch, recorded_main_runtime)
 
     with pytest.raises(_RouteAgentCaptured):
         routes._llm_git_commit_message("sys", "user", session=fake_session)
+    return captured["init_kwargs"]
 
-    _assert_list_row_not_keyed(captured["init_kwargs"], "git commit message")
 
-
-def test_handoff_summary_route_applies_exact_list_row_atomically(monkeypatch):
-    """Consumer 4/4: on-demand handoff summary."""
+def _drive_handoff_summary_route(monkeypatch, cfg_dict=None, runtime_dict=None):
+    """Consumer 4/5: on-demand handoff summary."""
     import api.models as models
     import api.routes as routes
 
     captured, fake_session = _setup_route_consumer_runtime(
-        monkeypatch, session_messages=_four_route_messages()
+        monkeypatch,
+        session_messages=_four_route_messages(),
+        cfg_dict=cfg_dict,
+        runtime_dict=runtime_dict,
     )
     monkeypatch.setattr(models, "get_session", lambda _sid: fake_session)
     monkeypatch.setattr(
@@ -1551,40 +1622,269 @@ def test_handoff_summary_route_applies_exact_list_row_atomically(monkeypatch):
     monkeypatch.setattr(routes, "bad", lambda _handler, message, *_a, **_k: {"error": message})
 
     routes._handle_handoff_summary(object(), {"session_id": "session-1806-route"})
+    return captured["init_kwargs"]
 
-    _assert_list_row_not_keyed(captured["init_kwargs"], "handoff summary")
 
+def _drive_update_summary_route(
+    monkeypatch, cfg_dict=None, runtime_dict=None, recorded_main_runtime=None
+):
+    """Consumer 5/5: update summary (``_llm_update_summary``).
 
-def test_update_summary_route_applies_exact_list_row_atomically(monkeypatch):
-    """Consumer: update summary (_llm_update_summary)."""
-    import types as _types
+    This one resolves ``get_effective_default_model()`` rather than the session's
+    model, so the default has to name the slug under test.
+    """
     import api.routes as routes
 
-    cfg = dict(_KEYED_VS_LIST_CFG)
-    cfg["model"] = {
+    cfg_dict = copy.deepcopy(_KEYED_VS_LIST_CFG if cfg_dict is None else cfg_dict)
+    cfg_dict["model"] = {
         "default": "@custom:omni:antigravity/gemini-3.7-flash-tiered",
         "provider": "custom:omni",
     }
-    captured, fake_session = _setup_route_consumer_runtime(monkeypatch)
-    monkeypatch.setattr("api.config.cfg", cfg, raising=False)
-    monkeypatch.setattr("api.config.get_config", lambda: dict(cfg))
-
-    fake_aux = _types.ModuleType("agent.auxiliary_client")
-    recorded_main_runtime = {}
-
-    def fake_get_aux(task, main_runtime=None):
-        recorded_main_runtime.update(main_runtime or {})
-        return (None, None)
-
-    fake_aux.get_text_auxiliary_client = fake_get_aux
-    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_aux)
+    captured, _fake_session = _setup_route_consumer_runtime(
+        monkeypatch, cfg_dict=cfg_dict, runtime_dict=runtime_dict
+    )
+    _decline_auxiliary_client(monkeypatch, recorded_main_runtime)
 
     with pytest.raises(_RouteAgentCaptured):
         routes._llm_update_summary("sys", "user", active_profile=None)
+    return captured["init_kwargs"]
 
-    _assert_list_row_not_keyed(captured["init_kwargs"], "update summary (AIAgent)")
-    assert recorded_main_runtime.get("base_url") == "https://list-url-sentinel.example/v1"
-    assert recorded_main_runtime.get("api_key") == "list-key-sentinel-xyz"
+
+_ROUTE_CONSUMER_DRIVERS = [
+    (_drive_sync_chat_route, "sync chat (/api/chat)"),
+    (_drive_manual_compression_route, "manual compression (/compress)"),
+    (_drive_commit_message_route, "git commit message"),
+    (_drive_handoff_summary_route, "handoff summary"),
+    (_drive_update_summary_route, "update summary"),
+]
+
+
+@pytest.mark.parametrize(
+    "driver,label", _ROUTE_CONSUMER_DRIVERS, ids=[d[1] for d in _ROUTE_CONSUMER_DRIVERS]
+)
+def test_route_consumers_apply_exact_list_row_atomically(monkeypatch, driver, label):
+    """Every non-streaming consumer applies the exact row's URL *and* its key."""
+    _assert_list_row_not_keyed(driver(monkeypatch), label)
+
+
+# The two consumers whose auxiliary-client shortcut can answer the request
+# outright -- for them ``main_runtime`` is the only carrier of the resolved
+# authority, because AIAgent is never built.
+_AUXILIARY_ROUTE_DRIVERS = [
+    (_drive_commit_message_route, "git commit message"),
+    (_drive_update_summary_route, "update summary"),
+]
+
+
+@pytest.mark.parametrize(
+    "driver,label",
+    _AUXILIARY_ROUTE_DRIVERS,
+    ids=[d[1] for d in _AUXILIARY_ROUTE_DRIVERS],
+)
+def test_auxiliary_routes_hand_the_row_connection_to_the_auxiliary_client(
+    monkeypatch, driver, label
+):
+    """The aux-client shortcut must see the row's connection, not the keyed one.
+
+    It runs BEFORE the main-model constructor, so a consumer that resolved the
+    bundle only on the fallback path would still send this request to the keyed
+    endpoint.
+    """
+    recorded_main_runtime = {}
+    driver(monkeypatch, recorded_main_runtime=recorded_main_runtime)
+
+    assert recorded_main_runtime.get("base_url") == _LIST_ROW_URL, label
+    assert recorded_main_runtime.get("api_key") == _LIST_ROW_KEY, label
+
+
+# ── The complete bundle, not just its three connection fields ────────────────
+#
+# ``apply_custom_provider_connection_authority`` returns ``(provider, api_key,
+# base_url)``. Every consumer above used to apply exactly that and construct the
+# agent from it, so an exact row's ``api_mode`` and ``credential_pool`` -- the
+# wire protocol the send speaks and the credential source it rotates -- were
+# truncated away before AIAgent ever saw them, while the streaming path carried
+# them through. The row below OWNS both, and the ambient runtime reports
+# different values for all four side fields, so a truncating consumer fails on
+# ``None`` and a pass-through consumer fails on the ambient sentinel.
+
+
+_ROUTE_ROW_POOL_SENTINEL = ["list-row-pool-sentinel"]
+
+_ROUTE_OWNED_SIDE_FIELD_CFG = _exact_list_row_cfg(
+    api_mode="anthropic_messages",
+    credential_pool=_ROUTE_ROW_POOL_SENTINEL,
+)
+
+# The ambient runtime disagrees on every side field it reports.
+_ROUTE_AMBIENT_RUNTIME = {
+    **_ROUTE_KEYED_RUNTIME,
+    "api_mode": "chat_completions",
+    "credential_pool": ["ambient-pool-sentinel"],
+    "command": "ambient-acp-sentinel",
+    "args": ["--ambient-arg-sentinel"],
+}
+
+
+@pytest.mark.parametrize(
+    "driver,label", _ROUTE_CONSUMER_DRIVERS, ids=[d[1] for d in _ROUTE_CONSUMER_DRIVERS]
+)
+def test_route_consumers_pass_the_exact_rows_side_fields_to_the_constructor(
+    monkeypatch, driver, label
+):
+    """The exact row's ``api_mode``/``credential_pool`` reach the FINAL constructor."""
+    init_kwargs = driver(
+        monkeypatch,
+        cfg_dict=copy.deepcopy(_ROUTE_OWNED_SIDE_FIELD_CFG),
+        runtime_dict=copy.deepcopy(_ROUTE_AMBIENT_RUNTIME),
+    )
+
+    _assert_list_row_not_keyed(init_kwargs, label)
+    _assert_side_fields(
+        init_kwargs,
+        {
+            "api_mode": "anthropic_messages",
+            "credential_pool": _ROUTE_ROW_POOL_SENTINEL,
+            # The row declares no ACP transport and owns a different endpoint
+            # than the runtime, so the ambient subprocess is provably foreign.
+            "acp_command": None,
+            "acp_args": None,
+        },
+        f"{label}: exact row side fields",
+    )
+    assert init_kwargs["api_mode"] != _ROUTE_AMBIENT_RUNTIME["api_mode"], (
+        f"{label}: the ambient wire protocol reached the constructor"
+    )
+    assert init_kwargs["credential_pool"] != _ROUTE_AMBIENT_RUNTIME["credential_pool"], (
+        f"{label}: the ambient credential pool reached the constructor"
+    )
+
+
+@pytest.mark.parametrize(
+    "driver,label", _ROUTE_CONSUMER_DRIVERS, ids=[d[1] for d in _ROUTE_CONSUMER_DRIVERS]
+)
+def test_route_consumers_clear_foreign_ambient_side_fields(monkeypatch, driver, label):
+    """A row that owns NO side fields still strips the ambient provider's.
+
+    Complement of the test above: "carry the complete bundle" must not degrade
+    into "pass the runtime's side fields through". The row here declares none of
+    them and owns a different endpoint, so all four are provably foreign.
+    """
+    init_kwargs = driver(
+        monkeypatch, runtime_dict=copy.deepcopy(_ROUTE_AMBIENT_RUNTIME)
+    )
+
+    _assert_list_row_not_keyed(init_kwargs, label)
+    _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, f"{label}: foreign ambient")
+
+
+@pytest.mark.parametrize(
+    "driver,label",
+    _AUXILIARY_ROUTE_DRIVERS,
+    ids=[d[1] for d in _AUXILIARY_ROUTE_DRIVERS],
+)
+def test_auxiliary_routes_hand_the_complete_bundle_to_the_auxiliary_client(
+    monkeypatch, driver, label
+):
+    """``main_runtime`` carries the WHOLE bundle, not its three connection fields.
+
+    When the auxiliary client answers, AIAgent is bypassed entirely, so the
+    side fields that never entered ``main_runtime`` were simply lost: the exact
+    row's ``api_mode: anthropic_messages`` silently degraded to the aux client's
+    default wire protocol, and the credential pool/ACP transport the row owns
+    never reached the send. The aux dict must therefore agree with the fallback
+    constructor field for field -- same authority, whichever path answers.
+    """
+    import api.routes as routes
+
+    recorded_main_runtime = {}
+    init_kwargs = driver(
+        monkeypatch,
+        cfg_dict=copy.deepcopy(_ROUTE_OWNED_SIDE_FIELD_CFG),
+        runtime_dict=copy.deepcopy(_ROUTE_AMBIENT_RUNTIME),
+        recorded_main_runtime=recorded_main_runtime,
+    )
+
+    _assert_list_row_not_keyed(recorded_main_runtime, f"{label}: aux main_runtime")
+    _assert_side_fields(
+        recorded_main_runtime,
+        {
+            "api_mode": "anthropic_messages",
+            "credential_pool": _ROUTE_ROW_POOL_SENTINEL,
+            # The row declares no ACP transport and owns a different endpoint
+            # than the runtime, so the ambient subprocess is provably foreign.
+            "acp_command": None,
+            "acp_args": None,
+        },
+        f"{label}: aux main_runtime side fields",
+    )
+    assert recorded_main_runtime["api_mode"] != _ROUTE_AMBIENT_RUNTIME["api_mode"], (
+        f"{label}: the ambient wire protocol reached the auxiliary client"
+    )
+    assert (
+        recorded_main_runtime["credential_pool"]
+        != _ROUTE_AMBIENT_RUNTIME["credential_pool"]
+    ), f"{label}: the ambient credential pool reached the auxiliary client"
+
+    for field in ("provider", "model", "base_url", "api_key") + tuple(
+        routes._AGENT_BUNDLE_SIDE_FIELDS
+    ):
+        assert recorded_main_runtime.get(field) == init_kwargs[field], (
+            f"{label}: aux {field} disagrees with the fallback constructor, so "
+            "which path answers decides the authority"
+        )
+    assert recorded_main_runtime["model"], f"{label}: aux main_runtime lost the model"
+
+
+@pytest.mark.parametrize(
+    "driver,label",
+    _AUXILIARY_ROUTE_DRIVERS,
+    ids=[d[1] for d in _AUXILIARY_ROUTE_DRIVERS],
+)
+def test_auxiliary_routes_clear_foreign_ambient_side_fields(monkeypatch, driver, label):
+    """A row owning no side fields strips the ambient provider's from the aux dict too.
+
+    Complement of the test above: "carry the complete bundle into
+    ``main_runtime``" must not degrade into "pass the runtime's side fields
+    through" on the path where nothing downstream re-resolves them.
+    """
+    recorded_main_runtime = {}
+    driver(
+        monkeypatch,
+        runtime_dict=copy.deepcopy(_ROUTE_AMBIENT_RUNTIME),
+        recorded_main_runtime=recorded_main_runtime,
+    )
+
+    _assert_list_row_not_keyed(recorded_main_runtime, f"{label}: aux main_runtime")
+    _assert_side_fields(
+        recorded_main_runtime,
+        _FOREIGN_AMBIENT_SIDE_FIELDS,
+        f"{label}: aux foreign ambient",
+    )
+
+
+def test_capturing_route_agent_exposes_every_runtime_constructor_field(monkeypatch):
+    """Guard the guard, route edition.
+
+    The consumers gate each optional kwarg on
+    ``inspect.signature(AIAgent.__init__).parameters``. A double that swallowed
+    ``api_mode`` / ``credential_pool`` / ``acp_command`` / ``acp_args`` into
+    ``**kwargs`` would make every assertion above pass vacuously, because the
+    fields would never be passed at all.
+    """
+    import inspect
+
+    import api.routes as routes
+
+    _captured, _fake_session = _setup_route_consumer_runtime(monkeypatch)
+    agent_cls = routes.require_ai_agent_class()
+    params = set(inspect.signature(agent_cls.__init__).parameters)
+
+    for field in routes._AGENT_BUNDLE_SIDE_FIELDS:
+        assert field in params, (
+            f"the route double hides {field} behind **kwargs, so the "
+            "signature gate would filter it out and the assertions would be vacuous"
+        )
 
 
 def test_production_composed_retry_caches_agent_under_recomputed_signature(monkeypatch):
@@ -1636,3 +1936,358 @@ def test_production_composed_retry_caches_agent_under_recomputed_signature(monke
         streaming.STREAMS.pop(stream_id, None)
         streaming.AGENT_INSTANCES.pop(stream_id, None)
         restore()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identity-owned selection, and the two ways a route can be "keyless"
+#
+# Selection for a named ``custom:<slug>`` must be owned by that identity: an
+# exact normalized ``custom_providers[]`` row, an exact keyed record, or an
+# explicitly matching ``model:``/bare-``custom`` authority. "The list happens to
+# hold exactly one row, so use it" is NOT ownership — it resolved ``custom:ghost``
+# to the endpoint AND credential of a sole unrelated row named ``omni``, sending
+# the prompt and that credential to a provider the user never named.
+#
+# The second half of the same contract is ``dummy-key``. It asserts "this
+# endpoint is UNAUTHENTICATED", so it may only appear when the record declares no
+# credential source at all. A DECLARED credential that failed to resolve (unset
+# ``${ENV}``, ``key_env`` naming a missing variable, a pool that yielded nothing)
+# is a misconfiguration to surface, not an unauthenticated endpoint: substituting
+# the placeholder there reports it as an opaque 401 from the endpoint instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_SOLE_UNRELATED_ROW_CFG = {
+    "model": {"default": "active/model", "provider": "custom:omni"},
+    "custom_providers": [
+        {
+            "name": "omni",
+            "base_url": "https://omni.example/v1",
+            "api_key": "omni-key",
+        },
+    ],
+}
+
+
+def _with_direct_config(monkeypatch, cfg_dict):
+    """Point both ``config.cfg`` and ``get_config()`` at ``cfg_dict``."""
+    monkeypatch.setattr(config, "get_config", lambda: copy.deepcopy(cfg_dict))
+    monkeypatch.setitem(config.cfg, "custom_providers", cfg_dict.get("custom_providers", []))
+    monkeypatch.setitem(config.cfg, "model", cfg_dict.get("model", {}))
+    monkeypatch.setitem(config.cfg, "providers", cfg_dict.get("providers", {}))
+
+
+def test_unknown_named_slug_does_not_select_a_sole_unrelated_list_row(monkeypatch):
+    """The reviewer's probe: ``custom:ghost`` must not inherit sole row ``omni``.
+
+    ``_select_custom_provider_record`` used to append ``custom_providers[0]``
+    whenever the list held exactly one row, then accept it merely because it had
+    a key or a URL. Neither test is ownership: ``ghost`` and ``omni`` are
+    different identities, so the pair belongs to ``omni`` alone.
+    """
+    _with_direct_config(monkeypatch, _SOLE_UNRELATED_ROW_CFG)
+
+    assert config.resolve_custom_provider_connection("custom:ghost") == (None, None)
+    # The row is still authoritative for its OWN slug.
+    assert config.resolve_custom_provider_connection("custom:omni") == (
+        "omni-key",
+        "https://omni.example/v1",
+    )
+
+
+def test_unknown_named_slug_reports_an_explicit_missing_selection(monkeypatch):
+    """The bundle carries the missing verdict instead of an ambiguous ``None``.
+
+    ``keyless`` must be False on it: "nothing owns this route" is not a claim
+    that the route is unauthenticated, and it is ``keyless`` alone that gates
+    ``dummy-key``.
+    """
+    _with_direct_config(monkeypatch, _SOLE_UNRELATED_ROW_CFG)
+
+    ghost = config.resolve_custom_provider_bundle("custom:ghost")
+    assert ghost is not None, "a named custom route must report its selection outcome"
+    assert ghost["status"] == config.CUSTOM_SELECTION_MISSING
+    assert ghost["record"] is None
+    assert ghost["base_url"] is None
+    assert ghost["api_key"] is None
+    assert ghost["keyless"] is False, "a missing route must not be reported keyless"
+    assert ghost["owned"] == {}
+
+    owned = config.resolve_custom_provider_bundle("custom:omni")
+    assert owned["status"] == config.CUSTOM_SELECTION_EXACT
+    assert owned["base_url"] == "https://omni.example/v1"
+
+
+def test_unknown_named_slug_keeps_no_ambient_connection(monkeypatch):
+    """The merge refuses the ambient provider's URL/key/pool for an unowned slug."""
+    _with_direct_config(monkeypatch, _SOLE_UNRELATED_ROW_CFG)
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:ghost",
+        "ambient-key-sentinel",
+        "https://ambient.example/v1",
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        lookup_provider="custom:ghost",
+    )
+
+    assert bundle["base_url"] is None
+    assert bundle["api_key"] is None
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY
+    # The provider must NOT be rewritten to generic ``custom``: that would
+    # present an unresolvable route as a resolved one.
+    assert bundle["provider"] == "custom:ghost"
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, "unowned named slug")
+
+
+# A provider LABEL is not proof of ownership. These two cases are how an unowned
+# slug could still walk away with the ambient connection:
+#
+#   1. the runtime dict names ITSELF ``custom:ghost`` -- a self-assigned string
+#      on a connection the process authenticated for some other reason; and
+#   2. no runtime dict at all, the non-streaming consumers' shape, where
+#      ``_connection_identity`` falls back to ``resolved_provider`` -- the very
+#      slug being looked up -- so the route would match itself.
+#
+# Both must fail closed exactly as the differently-labelled ambient runtime does:
+# ownership is decided by config records, and here there are none.
+
+
+_SELF_LABELLED_GHOST_RUNTIME = {
+    **_AMBIENT_SIDE_FIELD_RUNTIME,
+    "provider": "custom:ghost",
+    "base_url": "https://ambient.example/v1",
+    "api_key": "ambient-key-sentinel",
+}
+
+
+def _assert_ghost_bundle_failed_closed(bundle, label):
+    """No endpoint, no credential, no placeholder, no ambient side fields."""
+    assert bundle["base_url"] is None, f"{label}: an unowned slug kept an endpoint"
+    assert bundle["api_key"] is None, f"{label}: an unowned slug kept a credential"
+    assert bundle["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
+        f"{label}: an unresolvable route was handed the keyless placeholder"
+    )
+    # Still the NAMED slug: rewriting it to generic ``custom`` would present an
+    # unresolvable route as a resolved one.
+    assert bundle["provider"] == "custom:ghost", label
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, label)
+
+
+@pytest.mark.parametrize(
+    "runtime_dict,label",
+    [
+        (_SELF_LABELLED_GHOST_RUNTIME, "runtime labels itself custom:ghost"),
+        (None, "no runtime dict (non-streaming caller shape)"),
+    ],
+    ids=["self-labelled-runtime", "no-runtime-dict"],
+)
+def test_unknown_named_slug_fails_closed_even_when_the_runtime_claims_the_slug(
+    monkeypatch, runtime_dict, label
+):
+    """A matching provider label must not resurrect the ambient connection.
+
+    Nothing in config owns ``custom:ghost``: not an exact ``custom_providers[]``
+    row, not a keyed ``providers:`` record, not a ``model:`` authority. The only
+    thing pointing at the slug is a string the caller supplied, so keeping the
+    URL, key, wire protocol and credential pool that came with it would send the
+    user's prompt and that credential to a provider they never configured.
+    """
+    _with_direct_config(monkeypatch, _SOLE_UNRELATED_ROW_CFG)
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:ghost",
+        "ambient-key-sentinel",
+        "https://ambient.example/v1",
+        copy.deepcopy(runtime_dict) if runtime_dict else runtime_dict,
+        lookup_provider="custom:ghost",
+    )
+
+    _assert_ghost_bundle_failed_closed(bundle, label)
+    assert bundle["base_url"] != "https://ambient.example/v1", label
+    assert bundle["api_key"] != "ambient-key-sentinel", label
+
+
+def test_unknown_named_slug_connection_view_also_fails_closed(monkeypatch):
+    """The three-field view reports the same verdict, and ``custom_owned`` False.
+
+    Callers that genuinely construct nothing else still take this view, so the
+    self-labelled runtime must not reach them with a connection either.
+    """
+    _with_direct_config(monkeypatch, _SOLE_UNRELATED_ROW_CFG)
+
+    provider, api_key, base_url, custom_owned = (
+        config.apply_custom_provider_connection_authority(
+            "custom:ghost",
+            "ambient-key-sentinel",
+            "https://ambient.example/v1",
+            lookup_provider="custom:ghost",
+            runtime_provider=copy.deepcopy(_SELF_LABELLED_GHOST_RUNTIME),
+        )
+    )
+
+    assert base_url is None
+    assert api_key is None
+    assert provider == "custom:ghost"
+    assert custom_owned is False, "nothing owns the slug, so the record cannot be reported as owning it"
+
+
+@pytest.mark.parametrize(
+    "fail_first,label",
+    [
+        (None, "initial send"),
+        ("returned_error", "returned-error retry"),
+        ("raised", "raised-exception retry"),
+    ],
+)
+def test_unowned_named_slug_fails_closed_across_streaming_lifecycle(
+    monkeypatch, fail_first, label
+):
+    """All three streaming lifecycle regions refuse the unrelated row.
+
+    The ambient runtime seeds a truthy URL, key and pool (plus api_mode and an
+    ACP transport), and config holds exactly ONE custom row — named ``omni``,
+    with a truthy URL and key of its own. The send asks for ``custom:ghost``.
+    Every agent constructed on this path must come out with no endpoint, no
+    credential and no ambient side fields: not ``omni``'s pair, not the ambient
+    provider's, and never ``dummy-key``.
+    """
+    import api.streaming as streaming
+
+    session_id = f"session-1806-ghost-{fail_first or 'initial'}"
+    stream_id, q, captured, restore = _setup_production_composed_runtime(
+        monkeypatch,
+        copy.deepcopy(_SOLE_UNRELATED_ROW_CFG),
+        dict(_AMBIENT_SIDE_FIELD_RUNTIME),
+        session_id=session_id,
+        fail_first=fail_first,
+    )
+    try:
+        streaming.STREAMS[stream_id] = q
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text="hello",
+            model="@custom:ghost:antigravity/gemini-3.7-flash-tiered",
+            workspace="/tmp",
+            stream_id=stream_id,
+        )
+    finally:
+        streaming.STREAMS.pop(stream_id, None)
+        streaming.AGENT_INSTANCES.pop(stream_id, None)
+        restore()
+
+    history = captured.get("init_kwargs_history", [])
+    assert history, f"{label}: no agent was constructed"
+    if fail_first is not None:
+        assert len(history) >= 2, f"{label} did not construct a second agent"
+
+    for index, init_kwargs in enumerate(history):
+        where = f"{label} construction #{index}"
+        assert init_kwargs["base_url"] != "https://omni.example/v1", (
+            f"{where}: unrelated sole row supplied the endpoint"
+        )
+        assert init_kwargs["api_key"] != "omni-key", (
+            f"{where}: unrelated sole row supplied the credential"
+        )
+        assert init_kwargs["base_url"] != _AMBIENT_SIDE_FIELD_RUNTIME["base_url"], where
+        assert init_kwargs["api_key"] != _AMBIENT_SIDE_FIELD_RUNTIME["api_key"], where
+        assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
+            f"{where}: an unresolvable route was handed the keyless placeholder"
+        )
+        assert init_kwargs["base_url"] is None, where
+        assert init_kwargs["api_key"] is None, where
+        assert init_kwargs["provider"] == "custom:ghost", (
+            f"{where}: unresolvable route was rewritten to generic custom"
+        )
+        _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, where)
+
+
+# ── declared-but-unresolved credentials are NOT keyless ──────────────────────
+
+
+_MISSING_ENV_VAR = "HERMES_TEST_1806_UNSET_CREDENTIAL"
+
+
+def _clear_credential_env(monkeypatch):
+    """Remove every env var the credential ladder could still mint a key from."""
+    monkeypatch.delenv(_MISSING_ENV_VAR, raising=False)
+    monkeypatch.delenv("CUSTOM_OMNI_API_KEY", raising=False)
+
+
+_UNRESOLVED_CREDENTIAL_ROWS = [
+    # A declared ``${ENV}`` reference whose variable is unset.
+    ({"api_key": "${" + _MISSING_ENV_VAR + "}"}, "env-reference"),
+    # A declared ``key_env`` naming a variable that does not exist.
+    ({"key_env": _MISSING_ENV_VAR}, "key-env"),
+    # A configured credential pool that yields nothing for this endpoint.
+    ({"credential_pool": ["configured-pool-sentinel"]}, "unavailable-pool"),
+]
+
+
+@pytest.mark.parametrize("row_fields,label", _UNRESOLVED_CREDENTIAL_ROWS)
+def test_declared_but_unresolved_credential_is_not_keyless(monkeypatch, row_fields, label):
+    """``keyless`` means "declares no credential", not "resolved no credential".
+
+    Each row here DECLARES a credential source that produces nothing. Reporting
+    that as keyless is what let ``dummy-key`` be substituted for a genuinely
+    missing credential, turning a fixable misconfiguration into an opaque 401.
+    """
+    _clear_credential_env(monkeypatch)
+    cfg_dict = _exact_list_row_cfg(drop=("api_key",), **row_fields)
+    _with_direct_config(monkeypatch, cfg_dict)
+
+    bundle = config.resolve_custom_provider_bundle("custom:omni")
+
+    assert bundle["api_key"] is None, f"{label}: the credential must not resolve here"
+    assert bundle["keyless"] is False, (
+        f"{label}: a declared credential source was reported as keyless"
+    )
+
+
+@pytest.mark.parametrize("row_fields,label", _UNRESOLVED_CREDENTIAL_ROWS)
+def test_declared_but_unresolved_credential_never_gets_the_dummy_key(
+    monkeypatch, row_fields, label
+):
+    """End to end: the send goes out with NO key rather than the placeholder.
+
+    The endpoint still resolves (the row owns it), so the request is made — it
+    just carries no credential, and the resulting error names the real cause
+    instead of an authentication failure the placeholder invented.
+    """
+    _clear_credential_env(monkeypatch)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(drop=("api_key",), **row_fields),
+        _ambient_runtime(),
+        f"session-1806-unresolved-{label}",
+    )
+
+    assert init_kwargs["api_key"] != config.KEYLESS_CUSTOM_API_KEY, (
+        f"{label}: keyless placeholder masked a declared-but-missing credential"
+    )
+    assert init_kwargs["api_key"] is None, f"{label}: unexpected credential"
+    assert init_kwargs["api_key"] != "keyed-key-sentinel-abc", (
+        f"{label}: the ambient keyed record supplied the credential"
+    )
+    assert init_kwargs["base_url"] == _LIST_ROW_URL, f"{label}: the row still owns its endpoint"
+
+
+def test_row_declaring_no_credential_is_still_keyless(monkeypatch):
+    """The negative control: a genuinely unauthenticated endpoint keeps ``dummy-key``.
+
+    Local OpenAI-compatible servers routinely run without auth, and tightening
+    the keyless rule must not take that away — otherwise every keyless setup
+    regresses into an agent built with no credential at all.
+    """
+    _clear_credential_env(monkeypatch)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _exact_list_row_cfg(drop=("api_key",)),
+        _ambient_runtime(),
+        "session-1806-genuinely-keyless",
+    )
+
+    assert init_kwargs["api_key"] == config.KEYLESS_CUSTOM_API_KEY
+    assert init_kwargs["base_url"] == _LIST_ROW_URL
+    assert init_kwargs["provider"] == "custom"

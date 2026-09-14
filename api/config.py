@@ -3306,24 +3306,61 @@ def _resolve_custom_record_key(
     return api_key
 
 
+# Explicit outcomes of a named ``custom:<slug>`` selection.
+#
+# The status travels with the resolved bundle so a caller can tell "a record
+# OWNS this route" from "nothing owns this route" instead of inferring it from
+# an empty URL/key pair. That difference is load-bearing: an unowned named route
+# must fail closed — no ambient endpoint, no ambient credential, no ambient
+# pool/transport, no rewrite to the generic ``custom`` provider and no keyless
+# placeholder — rather than borrow whatever the ambient runtime resolved.
+CUSTOM_SELECTION_EXACT = "exact"           # exact custom_providers[] row
+CUSTOM_SELECTION_KEYED = "keyed"           # identity-owned providers:/model: record
+CUSTOM_SELECTION_RESOLVER = "resolver"     # injected connection_resolver reported a pair
+CUSTOM_SELECTION_MISSING = "missing"       # no authority owns this slug
+CUSTOM_SELECTION_MALFORMED = "malformed"   # ``custom:`` with no slug behind it
+# ``ambiguous`` is never RETURNED: a slug collision raises
+# AmbiguousCustomProviderError out of _unique_custom_provider_entry, so the
+# actionable rename message reaches the user (routes turn it into a 400) instead
+# of being silently degraded into a keyless or ambient-authority send.
+CUSTOM_SELECTION_AMBIGUOUS = "ambiguous"
+# Statuses for which NO authority owns the route.
+CUSTOM_SELECTION_UNOWNED = (CUSTOM_SELECTION_MISSING, CUSTOM_SELECTION_MALFORMED)
+
+
 def _select_custom_provider_record(
     pid: str,
     slug: str,
     cfg_data: dict,
-) -> tuple[dict | None, str, bool]:
-    """Return ``(record, source, is_exact)`` — the ONE authoritative record for ``pid``.
+) -> tuple[dict | None, str, bool, str]:
+    """Return ``(record, source, is_exact, status)`` — the ONE authority for ``pid``.
 
-    Selection order is the WebUI routing contract:
+    Selection is IDENTITY-OWNED: a candidate qualifies only by naming this slug
+    (or by being the bare-``custom`` / explicitly-matching ``model:`` authority),
+    never by being the only row around. Selection order is the WebUI routing
+    contract:
 
     1. the exact ``custom_providers[]`` row whose name normalizes to ``slug``
        (authoritative for its slug even against a same-slug keyed record, and
        even when its ``base_url`` is blank — see #1806);
-    2. otherwise the first keyed/``model:`` record that actually declares a
-       connection, taken as a COMPLETE record rather than field-by-field.
+    2. otherwise the keyed ``providers['custom:<slug>']`` record, the bare
+       ``providers['custom']`` authority, or a ``model:`` block that explicitly
+       names this provider — each taken as a COMPLETE record rather than
+       field-by-field.
+
+    There is deliberately NO "the list holds exactly one row, so use it"
+    fallback. That rule resolved ``custom:ghost`` to the endpoint AND credential
+    of a sole unrelated row named ``omni`` — the same wrong-authority pairing the
+    exact-row rule exists to prevent, and a credential leak to an endpoint the
+    user never named. An unknown slug owns nothing, so it reports ``missing``
+    and the caller fails closed. This matches the point-of-return rule
+    ``resolve_model_provider`` already applies (#4728: no unique entry -> no
+    base_url, never a guess).
 
     ``source`` is ``custom_providers`` / ``providers`` / ``model`` (or ``""``
     when nothing matched) and names the authority that owns every field the
-    caller then lifts off ``record``.
+    caller then lifts off ``record``. ``status`` is one of the
+    ``CUSTOM_SELECTION_*`` values (``ambiguous`` raises instead of returning).
     """
     custom_providers = cfg_data.get("custom_providers", [])
     if not isinstance(custom_providers, list):
@@ -3334,9 +3371,10 @@ def _select_custom_provider_record(
     # and credential are always resolved from the SAME entry.
     matched_entry = _unique_custom_provider_entry(custom_providers, slug)
     if matched_entry is not None:
-        return matched_entry, "custom_providers", True
+        return matched_entry, "custom_providers", True, CUSTOM_SELECTION_EXACT
 
-    # Fallbacks for setups that don't use custom_providers names directly.
+    # Fallbacks for setups that don't use custom_providers names directly. Every
+    # one of them is keyed on this provider's OWN identity.
     providers_cfg = cfg_data.get("providers", {})
     provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
     provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
@@ -3347,8 +3385,6 @@ def _select_custom_provider_record(
     candidates: list[tuple[dict, str]] = []
     if isinstance(provider_specific, dict) and provider_specific:
         candidates.append((provider_specific, "providers"))
-    if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
-        candidates.append((custom_providers[0], "custom_providers"))
     if isinstance(provider_custom, dict) and provider_custom:
         candidates.append((provider_custom, "providers"))
     if isinstance(model_cfg, dict) and model_provider in {"custom", pid, slug}:
@@ -3357,9 +3393,9 @@ def _select_custom_provider_record(
     for cand, source in candidates:
         cand_key = _resolve_custom_record_key(cand.get("api_key"), cand.get("key_env"), pid)
         if cand_key or _custom_record_base_url(cand):
-            return cand, source, False
+            return cand, source, False, CUSTOM_SELECTION_KEYED
 
-    return None, "", False
+    return None, "", False, CUSTOM_SELECTION_MISSING
 
 
 def resolve_custom_provider_connection(
@@ -3396,8 +3432,11 @@ def resolve_custom_provider_connection(
 
     # Read the live config snapshot to avoid stale module-level cache edge
     # cases after profile switches or runtime config edits.
-    record, _source, is_exact = _select_custom_provider_record(pid, slug, get_config())
+    record, _source, is_exact, _status = _select_custom_provider_record(pid, slug, get_config())
     if record is None:
+        # Nothing owns this slug. Returning ``(None, None)`` is the whole point:
+        # an unknown named route must not inherit an unrelated row's endpoint or
+        # credential (see _select_custom_provider_record).
         if return_provenance:
             return None, None, False
         return None, None
@@ -3560,6 +3599,63 @@ def _custom_record_key_cmd_provider(base_url: str | None, record: dict, pid: str
         return None
 
 
+def _custom_record_declares_credential(
+    record: dict,
+    base_url: str | None,
+    pool_runtime: dict | None,
+) -> bool:
+    """True when the record DECLARES any credential source, resolved or not.
+
+    "Keyless" is a positive claim that an endpoint wants no authentication, and
+    it is the only gate on :data:`KEYLESS_CUSTOM_API_KEY`. Deriving it from
+    "``api_key`` came back empty" conflates two opposite situations: an
+    unauthenticated local server, and an authenticated endpoint whose declared
+    credential did not resolve (an ``${ENV}`` that is unset, a ``key_env``
+    naming a missing variable, a configured pool that yielded nothing, an
+    unbuildable ``key_cmd``). The second must NOT be handed the placeholder —
+    that turns a missing-credential misconfiguration into an opaque 401 from the
+    endpoint and hides the real cause.
+
+    So the question asked here is declaration, not resolution: the RAW
+    ``api_key`` (literal or ``${ENV}``), ``key_env``, ``key_cmd``, a configured
+    ``credential_pool``, a pool that actually resolved for this endpoint, and a
+    host-gated env credential the runtime would accept for it.
+    """
+    for field in ("api_key", "key_env", "key_cmd"):
+        if str(record.get(field) or "").strip():
+            return True
+    # A configured pool is a declaration even when empty or exhausted: the user
+    # pointed this endpoint at a credential source.
+    if record.get("credential_pool") is not None:
+        return True
+    if pool_runtime:
+        return True
+    if _host_gated_env_key(base_url):
+        return True
+    return False
+
+
+def _unowned_custom_provider_bundle(pid: str, slug: str, status: str) -> dict:
+    """Bundle for a named ``custom:*`` route that NO authority owns.
+
+    Every connection field is empty and ``keyless`` is False, so the merge below
+    cannot substitute :data:`KEYLESS_CUSTOM_API_KEY`: "nobody owns this route" is
+    not a claim that the route is unauthenticated.
+    """
+    return {
+        "provider_id": pid,
+        "slug": slug,
+        "source": "",
+        "status": status,
+        "is_exact": False,
+        "record": None,
+        "base_url": None,
+        "api_key": None,
+        "keyless": False,
+        "owned": {},
+    }
+
+
 def resolve_custom_provider_bundle(
     provider_id: str,
     *,
@@ -3567,8 +3663,12 @@ def resolve_custom_provider_bundle(
 ) -> dict | None:
     """Return the COMPLETE connection bundle a named ``custom:*`` record owns.
 
-    ``None`` when ``provider_id`` is not a named custom provider or no record
-    matches. Otherwise a dict with:
+    ``None`` only when ``provider_id`` is not a named custom provider at all.
+    When it IS one but nothing owns it, the result is an explicit unowned bundle
+    (``status`` ``missing``/``malformed``, every connection field empty and
+    ``keyless`` False) rather than ``None``, so the merge below can fail the
+    route closed instead of silently leaving the ambient runtime's endpoint,
+    credential and pool in place. Otherwise a dict with:
 
     ``base_url``
         the record's own endpoint (``None`` when it declares none).
@@ -3579,17 +3679,22 @@ def resolve_custom_provider_bundle(
         env key — with ``key_cmd`` overriding the static forms because it mints a
         fresh bearer per request. May be a callable (``key_cmd`` token provider).
     ``keyless``
-        True only when that whole ladder produced nothing, i.e. the endpoint is
-        genuinely unauthenticated. This is the ONLY gate on
+        True only when the record DECLARES no credential source at all, i.e. the
+        endpoint is genuinely unauthenticated. A declared-but-unresolved
+        credential (unset ``${ENV}``, missing ``key_env`` variable, empty pool,
+        unbuildable ``key_cmd``) leaves this False — see
+        :func:`_custom_record_declares_credential`. This is the ONLY gate on
         :data:`KEYLESS_CUSTOM_API_KEY`.
     ``owned``
         the subset of :data:`CUSTOM_CONNECTION_SIDE_FIELDS` this record supplies
         itself. Callers keep these and must not overwrite them with the ambient
         runtime's values; fields ABSENT here are simply unowned, not proven
         foreign (see :func:`merge_custom_provider_runtime_bundle`).
-    ``source`` / ``is_exact`` / ``record``
+    ``source`` / ``is_exact`` / ``record`` / ``status``
         the provenance of the selection, so a caller can tell an exact
-        ``custom_providers[]`` row from a keyed fallback.
+        ``custom_providers[]`` row from a keyed fallback — and either of them
+        from a route nothing owns (``status`` in
+        :data:`CUSTOM_SELECTION_UNOWNED`).
 
     ``connection_resolver`` lets a caller inject its own module-bound reference
     to :func:`resolve_custom_provider_connection`, so monkeypatching that name in
@@ -3602,7 +3707,11 @@ def resolve_custom_provider_bundle(
         return None
     slug = _custom_provider_slug_key(pid)
     if not slug:
-        return None
+        # ``custom:`` with nothing behind it names no provider, so no record can
+        # own it. Report it explicitly rather than as "not a custom route": the
+        # caller asked to route somewhere and must fail closed, not inherit the
+        # ambient connection.
+        return _unowned_custom_provider_bundle(pid, slug, CUSTOM_SELECTION_MALFORMED)
 
     if connection_resolver is not None and connection_resolver is not resolve_custom_provider_connection:
         # Tolerate resolvers that predate/omit the provenance kwarg (older builds
@@ -3617,22 +3726,28 @@ def resolve_custom_provider_bundle(
             api_key, base_url = conn
             is_exact = False
         if not (is_exact or api_key or base_url):
-            return None
+            # The injected resolver is the whole authority on this path, and it
+            # reported nothing for the slug — so nothing owns the route.
+            return _unowned_custom_provider_bundle(pid, slug, CUSTOM_SELECTION_MISSING)
         return {
             "provider_id": pid,
             "slug": slug,
             "source": "resolver",
+            "status": CUSTOM_SELECTION_RESOLVER,
             "is_exact": bool(is_exact),
             "record": None,
             "base_url": base_url,
             "api_key": api_key,
+            # A resolver reports a URL/key pair and nothing else; with no record
+            # behind it there is no declaration to inspect, so an absent key is
+            # the only keyless signal available here.
             "keyless": not api_key,
             "owned": {},
         }
 
-    record, source, is_exact = _select_custom_provider_record(pid, slug, get_config())
+    record, source, is_exact, status = _select_custom_provider_record(pid, slug, get_config())
     if record is None:
-        return None
+        return _unowned_custom_provider_bundle(pid, slug, status)
 
     base_url = _custom_record_base_url(record)
     owned: dict = {}
@@ -3671,13 +3786,29 @@ def resolve_custom_provider_bundle(
         "provider_id": pid,
         "slug": slug,
         "source": source,
+        "status": status,
         "is_exact": is_exact,
         "record": record,
         "base_url": base_url,
         "api_key": api_key,
-        "keyless": not api_key and not record.get("key_cmd"),
+        "keyless": not api_key
+        and not _custom_record_declares_credential(record, base_url, pool_runtime),
         "owned": owned,
     }
+
+
+def _connection_identity(runtime_provider: dict, resolved_provider: str | None) -> str | None:
+    """Name the provider the already-resolved connection fields belong to.
+
+    The runtime provider dict names itself, so it wins when present. With no
+    runtime dict the caller resolved the connection for ``resolved_provider``
+    (every such call site passes ``requested=resolved_provider``), so that is
+    the identity behind the fields.
+    """
+    rt_provider = str((runtime_provider or {}).get("provider") or "").strip()
+    if rt_provider:
+        return rt_provider.lower()
+    return str(resolved_provider or "").strip().lower() or None
 
 
 def _custom_bundle_endpoint_matches(bundle: dict, runtime_provider: dict) -> bool:
@@ -3737,11 +3868,19 @@ def merge_custom_provider_runtime_bundle(
       cleared, because passing it through is what let a custom HTTP endpoint
       inherit Anthropic credential pooling and a Claude ACP subprocess.
 
-    :data:`KEYLESS_CUSTOM_API_KEY` is substituted only once the selected record's
-    COMPLETE credential ladder has reported the endpoint genuinely keyless. A
-    record that declares a credential source which produced nothing here (an
-    unbuildable ``key_cmd``, say) is sent without a key rather than with a
-    placeholder that guarantees a 401 and hides the real cause.
+    :data:`KEYLESS_CUSTOM_API_KEY` is substituted only once the selected record
+    reports that it DECLARES no credential source at all. A record that declares
+    one which produced nothing here (an unset ``${ENV}``, a ``key_env`` naming a
+    missing variable, an empty pool, an unbuildable ``key_cmd``) is sent without
+    a key rather than with a placeholder that guarantees a 401 and hides the
+    real cause.
+
+    A named ``custom:<slug>`` route that NO authority owns fails closed: the
+    returned bundle keeps the named provider but carries no endpoint, no
+    credential, no pool/transport and no placeholder key, so an unknown slug can
+    never be routed through the ambient provider's connection. This holds even
+    when the ambient runtime LABELS itself with that same slug — a provider
+    string is self-assigned, not proof that the connection belongs to the slug.
     """
     return _custom_provider_runtime_bundle_with_provenance(
         resolved_provider,
@@ -3789,6 +3928,42 @@ def _custom_provider_runtime_bundle_with_provenance(
     custom = resolve_custom_provider_bundle(lookup, connection_resolver=connection_resolver)
     if custom is None:
         return bundle, None
+
+    if custom["status"] in CUSTOM_SELECTION_UNOWNED:
+        # NO authority owns this slug: not an exact ``custom_providers[]`` row,
+        # not a keyed ``providers:`` record, not a ``model:`` authority. Whatever
+        # is already in ``bundle`` was resolved by someone else and reached us as
+        # ambient state, so the whole bundle fails closed.
+        #
+        # A provider LABEL is not proof of ownership. The runtime dict's
+        # ``provider: "custom:ghost"`` is a self-assigned string on a connection
+        # this process authenticated for some other reason, and
+        # :func:`_connection_identity` falls back to ``resolved_provider`` — the
+        # very slug being looked up — so a caller that passes no runtime dict at
+        # all would match itself. Trusting either would let any unknown slug
+        # claim the ambient endpoint, credential, pool and transport simply by
+        # naming itself. Ownership is decided by config records, and there are
+        # none here.
+        #
+        # So: no endpoint and no credential; no ambient pool/transport/
+        # wire-protocol carried alongside them; the provider stays the NAMED
+        # slug, because rewriting it to the generic ``custom`` would present an
+        # unresolvable route as a resolved one; and no KEYLESS_CUSTOM_API_KEY —
+        # ``keyless`` is False on an unowned bundle precisely so the placeholder
+        # cannot claim that an endpoint we never found is unauthenticated.
+        logger.warning(
+            "custom provider %s matches no custom_providers[] row, keyed "
+            "providers[] record or model: authority, and the resolved connection "
+            "belongs to %s; refusing to route it through that provider's "
+            "endpoint and credential",
+            lookup,
+            _connection_identity(_rt, resolved_provider) or "an unnamed provider",
+        )
+        bundle["base_url"] = None
+        bundle["api_key"] = None
+        for field in CUSTOM_CONNECTION_SIDE_FIELDS:
+            bundle[field] = None
+        return bundle, custom
 
     same_authority = _custom_bundle_endpoint_matches(custom, _rt)
 
@@ -3872,9 +4047,11 @@ def apply_custom_provider_connection_authority(
 
     Returns ``(provider, api_key, base_url, custom_owned)``, where
     ``custom_owned`` reports whether a config-owned custom record supplied the
-    connection. Kept for callers that genuinely construct nothing else; anything
-    that builds an AIAgent should take the whole bundle instead, because the
-    three connection fields alone are not a complete constructor contract.
+    connection — False for a named route nothing owns, whose key and base_url
+    come back ``None`` rather than as the ambient runtime's. Kept for callers
+    that genuinely construct nothing else; anything that builds an AIAgent
+    should take the whole bundle instead, because the three connection fields
+    alone are not a complete constructor contract.
     """
     bundle, custom = _custom_provider_runtime_bundle_with_provenance(
         resolved_provider,
@@ -3884,7 +4061,8 @@ def apply_custom_provider_connection_authority(
         lookup_provider=lookup_provider,
         connection_resolver=connection_resolver,
     )
-    return bundle["provider"], bundle["api_key"], bundle["base_url"], custom is not None
+    custom_owned = custom is not None and custom["status"] not in CUSTOM_SELECTION_UNOWNED
+    return bundle["provider"], bundle["api_key"], bundle["base_url"], custom_owned
 
 
 # Subprocess ACP transports (Cursor/Copilot CLI). Model IDs often contain '/'
