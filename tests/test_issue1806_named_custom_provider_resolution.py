@@ -5028,8 +5028,52 @@ def test_credential_only_record_refuses_the_active_providers_endpoint(monkeypatc
     _assert_no_borrowed_pair(str(bundle), "merged bundle")
 
 
+def test_credential_only_record_refuses_the_production_composed_send(monkeypatch):
+    """Refuse on initial send before any constructor, client, or cache write.
+
+    A raw record declaring only a credential and no endpoint must fail closed
+    at initial resolution as ``CUSTOM_ROUTE_NO_ENDPOINT``
+    (custom_provider_endpoint_unresolved), constructing no agent, making no
+    explicit client call, sending no turn, and writing no cache entry.
+    """
+    _clear_credential_env(monkeypatch)
+
+    captured, apperrors = _run_composed_send_expecting_refusal(
+        monkeypatch,
+        _credential_only_cfg(),
+        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+        "session-1806-credential-only-omni",
+        model=_CREDENTIAL_ONLY_MODEL,
+    )
+
+    payload = apperrors[-1]
+    # The STRUCTURED verdict, not the prose: a generic failure whose message
+    # happens to read "resolved no endpoint" would pass a message-only check,
+    # and the message is free to be reworded. This is the same terminal reason
+    # the merge-level and auxiliary-client regressions assert.
+    # The literal is pinned alongside the constant because it is the wire value
+    # the client branches on; renaming it silently would be a breaking change.
+    assert payload["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT == (
+        "custom_provider_endpoint_unresolved"
+    ), f"the failure did not carry {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
+    assert "custom:omni" in payload["message"], payload
+    assert "resolved no endpoint" in payload["message"], (
+        f"the failure did not name {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
+    )
+    assert "base_url" in payload["hint"], payload
+
+    assert not captured.get("init_kwargs_history"), (
+        "an agent was constructed for a record that declares no endpoint"
+    )
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        "a client was configured with the active provider's borrowed connection"
+    )
+
+    _assert_no_borrowed_pair(str(payload) + str(captured), "composed send")
+
+
 @pytest.mark.parametrize("fail_first", ["returned_error", "raised"])
-def test_credential_only_record_refuses_the_production_composed_send(
+def test_credential_only_record_refuses_the_production_composed_retry(
     monkeypatch, fail_first
 ):
     """A standard-v12 record losing only its endpoint stops a 401 self-heal.
@@ -5051,7 +5095,7 @@ def test_credential_only_record_refuses_the_production_composed_send(
         _run_composed_retry_expecting_abandoned_heal(
             monkeypatch,
             cfg_dict,
-            _ambient_runtime(),
+            copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
             session_id,
             fail_first=fail_first,
             heal_mutate=remove_only_the_endpoint,
@@ -5073,6 +5117,7 @@ def test_credential_only_record_refuses_the_production_composed_send(
     payload = apperrors[-1]
     assert payload["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT, payload
     assert "base_url" in payload["hint"], payload
+    assert _V12_KEY not in str(payload), f"{label}: leaked the record's own key into payload"
     blob = str(captured) + str(apperrors)
     for leaked in _ACTIVE_OTHER_SENTINELS:
         assert leaked not in blob, f"{label}: {leaked!r} leaked into the retry path"
