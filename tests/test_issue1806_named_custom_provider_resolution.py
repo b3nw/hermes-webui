@@ -2578,6 +2578,58 @@ def test_exact_row_declaring_no_credential_ignores_the_shared_endpoint_key(monke
     assert config.custom_provider_route_error(bundle) is None, bundle
 
 
+# The exact row's ENDPOINT obeys the same positive-tie rule as every other
+# record branch. "Complete record" decides whose endpoint and whose credential
+# the route gets; it does not decide the SPELLING of an endpoint both sides
+# already agree on.
+_ROW_OWN_KEY = "row-own-key-sentinel-ghi"
+_FOREIGN_AMBIENT_URL = "https://ambient-sentinel.example/v1"
+
+
+@pytest.mark.parametrize(
+    "runtime_base_url,label",
+    [
+        (_SHARED_ENDPOINT_URL, "same normalized URL from distinct keyed record"),
+        (_FOREIGN_AMBIENT_URL, "foreign ambient endpoint"),
+    ],
+    ids=["same-normalized-url", "foreign-endpoint"],
+)
+def test_exact_row_preserves_own_endpoint_beside_distinct_keyed_runtime(
+    monkeypatch, runtime_base_url, label
+):
+    """An exact row preserves its own declared endpoint spelling beside a distinct record.
+
+    Endpoint equality alone is NOT selected-record provenance. When the runtime
+    carries credentials from a same-slug keyed record (_SHARED_ENDPOINT_KEYED_KEY)
+    while the exact row declares _ROW_OWN_KEY, matching normalized URL spelling
+    does not tie the runtime to this row. The selected exact row's own endpoint
+    spelling stands in both cases.
+    """
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch,
+        _shared_endpoint_cfg(base_url=_SHARED_ENDPOINT_URL + "/", api_key=_ROW_OWN_KEY),
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _SHARED_ENDPOINT_KEYED_KEY,
+        runtime_base_url,
+        _ambient_runtime(base_url=runtime_base_url, api_key=_SHARED_ENDPOINT_KEYED_KEY),
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _SHARED_ENDPOINT_URL + "/", f"{label}: {bundle!r}"
+    assert bundle["base_url"] != _FOREIGN_AMBIENT_URL, (
+        f"{label}: the row was pointed at the ambient provider's endpoint"
+    )
+    assert bundle["api_key"] == _ROW_OWN_KEY, (
+        f"{label}: the exact row did not supply its own credential: {bundle!r}"
+    )
+    assert bundle["api_key"] != _SHARED_ENDPOINT_KEYED_KEY, f"{label}: {bundle!r}"
+    assert config.custom_provider_route_error(bundle) is None, f"{label}: {bundle!r}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The two 401 self-heal RETRIES are route boundaries too
 #
@@ -3294,7 +3346,14 @@ _KEYED_SIDE_FIELDS_ONLY_CFG = {
 
 
 def test_keyed_record_side_fields_survive_the_merge_without_a_static_pair(monkeypatch):
-    """The merge applies the record's owned fields instead of clearing them."""
+    """The merge applies the record's owned fields instead of clearing them.
+
+    The route itself is terminal — this record declares no endpoint, so it
+    borrows none — but "fail the route closed" must not degrade into "blank the
+    whole bundle". The fields the record declares for ITSELF are still its own
+    statement about itself, and only the ambient authority's values go with the
+    endpoint that was refused.
+    """
     _clear_credential_env(monkeypatch)
     _with_direct_config(monkeypatch, copy.deepcopy(_KEYED_SIDE_FIELDS_ONLY_CFG))
 
@@ -3321,18 +3380,31 @@ def test_keyed_record_side_fields_survive_the_merge_without_a_static_pair(monkey
         },
         "keyed record owning only side fields",
     )
+    # The record owns no endpoint, so the route is terminal and keeps neither the
+    # ambient URL nor a credential to pair with it.
+    verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+    assert verdict is not None and verdict["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT
+    assert bundle["base_url"] is None
+    assert bundle["api_key"] is None
 
 
 def test_keyed_record_side_fields_survive_the_runtime_bundle(monkeypatch):
-    """End to end: the production-composed send constructs with the record's fields.
+    """End to end: the production-composed send REFUSES, keeping no ambient pair.
 
-    The record declares no endpoint, so the runtime's stands (the keyed
-    fill-only rule) — but every constructor field the record DOES own reaches
-    the agent instead of the ambient provider's value.
+    This record owns side fields and nothing else — no endpoint of its own. It
+    used to reach the constructor on the ambient provider's URL under the "keyed
+    fill-only" rule, which is exactly the defect: the record's own authority
+    decided the wire protocol, pool and transport while the ACTIVE provider
+    decided where the prompt went. Owning ``api_mode`` is not owning an endpoint.
+
+    So the send stops at the terminal verdict instead, and the merge-level test
+    above keeps pinning that the record's owned fields still ride on the bundle
+    it hands back. ``custom:omni``'s own side fields therefore never arrive at a
+    constructor here, because no constructor runs at all.
     """
     _clear_credential_env(monkeypatch)
 
-    init_kwargs = _run_composed_send(
+    captured, apperrors = _run_composed_send_expecting_refusal(
         monkeypatch,
         copy.deepcopy(_KEYED_SIDE_FIELDS_ONLY_CFG),
         _ambient_runtime(
@@ -3342,19 +3414,23 @@ def test_keyed_record_side_fields_survive_the_runtime_bundle(monkeypatch):
             credential_pool=["ambient-pool-sentinel"],
         ),
         "session-1806-keyed-side-fields-only",
+        model="@custom:omni:antigravity/gemini-3.7-flash-tiered",
     )
 
-    _assert_side_fields(
-        init_kwargs,
-        {
-            "api_mode": "anthropic_messages",
-            "credential_pool": ["keyed-pool-sentinel"],
-            "acp_command": "keyed-acp-sentinel",
-            "acp_args": ["--keyed-arg-sentinel"],
-        },
-        "keyed side-field-only record through the runtime bundle",
-    )
-    assert init_kwargs["provider"] == "custom"
+    payload = apperrors[-1]
+    assert config.CUSTOM_ROUTE_NO_ENDPOINT in str(payload) or "resolved no endpoint" in (
+        payload.get("message", "")
+    ), payload
+    blob = str(payload) + str(captured)
+    for leaked in (
+        _AMBIENT_SIDE_FIELD_RUNTIME["base_url"],
+        _AMBIENT_SIDE_FIELD_RUNTIME["api_key"],
+        "ambient-pool-sentinel",
+        "ambient-acp-sentinel",
+    ):
+        assert leaked not in blob, (
+            f"the ambient provider's {leaked!r} survived a route with no endpoint"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3753,7 +3829,7 @@ def test_v12_raw_record_keeps_the_runtimes_spelling_of_the_same_endpoint(monkeyp
         "custom:omni",
         None,
         _V12_URL,
-        {"provider": "custom:omni", "base_url": _V12_URL},
+        {"provider": "custom:omni", "base_url": _V12_URL, "api_key": _V12_KEY},
         lookup_provider="custom:omni",
     )
 
@@ -3762,17 +3838,50 @@ def test_v12_raw_record_keeps_the_runtimes_spelling_of_the_same_endpoint(monkeyp
     assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
 
 
-def test_v12_raw_record_does_not_override_an_endpoint_it_cannot_disprove(monkeypatch):
-    """Second negative control: with NO runtime dict there is no foreign authority.
+def test_matching_identity_metadata_with_conflicting_credential_rejects_tie(monkeypatch):
+    """Even when identity metadata matches, conflicting credentials strictly reject a tie."""
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _v12_raw_cfg({"base_url": _V12_URL + "/", "key_env": _V12_KEY_ENV})
+    )
 
-    The override above is a provenance verdict — "the runtime dict reports a
-    different endpoint" — not a blanket precedence rule. Callers that pass no
-    runtime dict at all (the legacy three-field view, and anything injecting its
-    own ``connection_resolver``) supply no provenance to compare against, so the
-    endpoint they already resolved stands. Reading the absent dict as evidence of
-    a foreign authority would silently re-point those callers at the config
-    spelling, which is #2271's
-    ``test_named_custom_provider_keeps_existing_runtime_base_url``.
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        None,
+        _V12_URL,
+        {
+            "provider": "custom:omni",
+            "base_url": _V12_URL,
+            "record_id": "omni",
+            "api_key": "conflicting-foreign-key",
+        },
+        lookup_provider="custom:omni",
+    )
+
+    assert bundle["base_url"] == _V12_URL + "/"
+    assert bundle["api_key"] == _V12_KEY
+
+
+_CALLER_RESOLVED_URL = "https://caller-resolved-sentinel.example/v1"
+
+
+def test_v12_raw_record_supplies_the_endpoint_nothing_is_positively_tied_to(monkeypatch):
+    """With NO runtime dict there is no TIE, so the record's own endpoint wins.
+
+    The endpoint the caller arrived with was resolved before this slug was ever
+    looked up, so it says nothing about the record selected for it. Keeping it
+    only because no runtime dict arrived to contradict it reads silence as
+    provenance — and pairs the record's own credential with whatever endpoint
+    happened to be in flight, which is the split-authority send this module
+    exists to stop.
+
+    So the rule is positive: an endpoint survives the merge only when the
+    SELECTED record supplied it, or when a runtime dict is positively tied to
+    that same record (:func:`_custom_runtime_endpoint_is_record_owned`, pinned by
+    the same-authority control above). An absent runtime dict is neither, so the
+    record's ``base_url`` displaces the caller's. The #2271 fill-only shape lives
+    on the injected-``connection_resolver`` path, where there IS no record to
+    take provenance from — see the control below.
     """
     _v12_env(monkeypatch)
     _with_direct_config(
@@ -3782,13 +3891,49 @@ def test_v12_raw_record_does_not_override_an_endpoint_it_cannot_disprove(monkeyp
     bundle = config.merge_custom_provider_runtime_bundle(
         "custom:omni",
         None,
-        "https://caller-resolved-sentinel.example/v1",
+        _CALLER_RESOLVED_URL,
         None,
         lookup_provider="custom:omni",
     )
 
-    assert bundle["base_url"] == "https://caller-resolved-sentinel.example/v1"
+    assert bundle["base_url"] == _V12_URL, (
+        "the record's credential was left beside an endpoint it never declared"
+    )
+    assert bundle["base_url"] != _CALLER_RESOLVED_URL
     assert bundle["api_key"] == _V12_KEY
+    assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
+
+
+def test_injected_connection_resolver_still_keeps_the_callers_base_url(monkeypatch):
+    """Negative control for #2271: no record, so the fill-only shape is unchanged.
+
+    An injected ``connection_resolver`` reports a bare (key, URL) pair and IS the
+    whole authority on that path — there is no config record whose endpoint
+    provenance could displace anything. Applying the record rule here would
+    silently re-point every such caller at the resolver's spelling, which is
+    #2271's ``test_named_custom_provider_keeps_existing_runtime_base_url``.
+    """
+    _v12_env(monkeypatch)
+    _with_direct_config(
+        monkeypatch, _v12_raw_cfg({"base_url": _V12_URL, "key_env": _V12_KEY_ENV})
+    )
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        None,
+        _CALLER_RESOLVED_URL,
+        None,
+        lookup_provider="custom:omni",
+        connection_resolver=lambda _pid, **_kw: (
+            "resolver-key-sentinel",
+            "https://resolver-config-sentinel.example/v1",
+        ),
+    )
+
+    assert bundle["base_url"] == _CALLER_RESOLVED_URL, (
+        "the resolver path lost #2271's fill-only base_url handling"
+    )
+    assert bundle["api_key"] == "resolver-key-sentinel"
     assert bundle[config.CUSTOM_ROUTE_ERROR_FIELD] is None
 
 
@@ -4734,3 +4879,298 @@ def test_same_provider_sharing_its_endpoint_still_keeps_the_runtime_fields(monke
     assert bundle["api_mode"] == "chat_completions", (
         "the provider's own runtime side field was cleared as foreign"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A credential-only record borrows NO endpoint (PR #7319)
+#
+# The shape that started this: ``providers: {omni: {api_key: ...}}`` — a raw v12
+# record that declares a CREDENTIAL and no ``base_url`` — while the process is
+# already talking to a different, ACTIVE provider whose URL and key are sitting
+# in the runtime dict. Selection legitimately picks the omni record (it owns the
+# slug, and a declared-but-endpoint-less record is not "missing"), and the merge
+# then had no positive statement about where that record's endpoint came from.
+# The seeded ``base_url`` was simply still there, so the bundle handed the
+# constructor the ACTIVE provider's URL beside the omni record's secret: a
+# non-active provider's credential, and the user's prompt, delivered to an
+# endpoint neither the record nor the user ever named.
+#
+# ``endpoint_owned`` is the positive half of that provenance, and it is False
+# here. Absence of contradiction is not a tie: the caller's ``resolved_base_url``
+# and a missing runtime dict are both silence. So the route is terminal on its
+# own name — :data:`config.CUSTOM_ROUTE_NO_ENDPOINT` — and keeps neither the
+# ambient endpoint nor a credential to pair with it, because pairing them is the
+# whole defect.
+#
+# These assert the property at the boundaries that can actually send: the
+# production-composed streaming send (all three agent-constructing regions), the
+# non-streaming chokepoint, and the auxiliary client — which bypasses AIAgent
+# entirely, so ``main_runtime`` would be the only place the stolen pair reached
+# the wire. The last two tests are the controls that keep the refusal narrow: a
+# COMPLETE record still sends, and a genuinely keyless one still gets the
+# placeholder.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# The non-active record's own secret: the thing that must never leave with the
+# active provider's URL.
+_CREDENTIAL_ONLY_KEY = "credential-only-omni-key-sentinel"
+# The endpoint the record declares in the two control cases below.
+_OMNI_OWN_URL = "https://omni-own-endpoint-sentinel.example/v1"
+
+# The ACTIVE provider: truthy URL and key, plus truthy side fields, all resolved
+# for somebody else entirely. Named ``custom:active-other`` so identity settles
+# the provenance question without relying on the URLs differing.
+_ACTIVE_OTHER_URL = "https://active-other-sentinel.example/v1"
+_ACTIVE_OTHER_KEY = "active-other-key-sentinel"
+_ACTIVE_OTHER_POOL = ["active-other-pool-sentinel"]
+_ACTIVE_OTHER_ACP = "active-other-acp-sentinel"
+
+_ACTIVE_OTHER_RUNTIME = {
+    "provider": "custom:active-other",
+    "base_url": _ACTIVE_OTHER_URL,
+    "api_key": _ACTIVE_OTHER_KEY,
+    "api_mode": "chat_completions",
+    "command": _ACTIVE_OTHER_ACP,
+    "args": ["--active-other-arg-sentinel"],
+    "credential_pool": _ACTIVE_OTHER_POOL,
+}
+
+# Everything the refused route could have walked away with. Asserted as a set
+# over the whole captured harness, so a leak through ANY field — bundle, error
+# payload, constructor kwargs, aux handoff — fails rather than only the fields a
+# test remembered to name.
+_ACTIVE_OTHER_SENTINELS = (
+    _ACTIVE_OTHER_URL,
+    _ACTIVE_OTHER_KEY,
+    _ACTIVE_OTHER_POOL[0],
+    _ACTIVE_OTHER_ACP,
+)
+
+_CREDENTIAL_ONLY_MODEL = "@custom:omni:antigravity/gemini-3.7-flash-tiered"
+
+
+def _credential_only_cfg():
+    """The raw v12 record that declares a credential and NO endpoint."""
+    return _v12_raw_cfg({"api_key": _CREDENTIAL_ONLY_KEY})
+
+
+def _assert_no_borrowed_pair(blob, label):
+    """Neither the record's own secret nor the active provider's connection."""
+    for leaked in _ACTIVE_OTHER_SENTINELS:
+        assert leaked not in blob, (
+            f"{label}: the ACTIVE provider's {leaked!r} survived a route whose "
+            "record declares no endpoint"
+        )
+    assert _CREDENTIAL_ONLY_KEY not in blob, (
+        f"{label}: the non-active record's credential was handed on without an "
+        "endpoint of its own to send it to"
+    )
+    assert config.KEYLESS_CUSTOM_API_KEY not in blob, (
+        f"{label}: a record that DECLARES a credential was called keyless"
+    )
+
+
+def test_credential_only_record_refuses_the_active_providers_endpoint(monkeypatch):
+    """The merge verdict itself: terminal, and holding neither half of the pair."""
+    _clear_credential_env(monkeypatch)
+    _with_direct_config(monkeypatch, _credential_only_cfg())
+
+    selection = config.resolve_custom_provider_bundle("custom:omni")
+    assert selection["record"] is not None, (
+        "a credential-only record must still OWN its slug — treating it as "
+        "missing is a different bug with the same symptom"
+    )
+    assert selection["endpoint_owned"] is False
+    assert selection["api_key"] == _CREDENTIAL_ONLY_KEY
+    assert selection["keyless"] is False
+
+    bundle = config.merge_custom_provider_runtime_bundle(
+        "custom:omni",
+        _ACTIVE_OTHER_KEY,
+        _ACTIVE_OTHER_URL,
+        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+        lookup_provider="custom:omni",
+    )
+
+    verdict = bundle[config.CUSTOM_ROUTE_ERROR_FIELD]
+    assert verdict is not None, "an endpoint-less record still looked routable"
+    assert verdict["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT
+    assert verdict["provider"] == "custom:omni"
+    assert verdict["hint"], "the refusal named no setting to fix"
+    assert bundle["base_url"] is None
+    assert bundle["api_key"] is None
+    # Still the NAMED slug: rewriting it to generic ``custom`` would present an
+    # unresolvable route as a resolved one.
+    assert bundle["provider"] == "custom:omni"
+    # The refused endpoint's side fields go with it; this record declares none.
+    _assert_side_fields(bundle, _FOREIGN_AMBIENT_SIDE_FIELDS, "credential-only record")
+    _assert_no_borrowed_pair(str(bundle), "merged bundle")
+
+
+def test_credential_only_record_refuses_the_production_composed_send(monkeypatch):
+    """End to end: no agent is constructed in ANY of the three streaming regions.
+
+    The real defect is not "the bundle had a hole in it" — an incomplete pair is
+    what makes ``_init_openai_client()`` call ``_routed_client_kwargs()`` and
+    resolve a provider all over again. So this asserts the send STOPS: no
+    constructor on the initial resolution and none on either 401 self-heal retry
+    (``init_kwargs_history`` records every construction across all three), no
+    explicit client, no turn sent, a controlled ``provider_unroutable`` failure,
+    and an agent cache that was never written — a poisoned cache would hand the
+    borrowed pair to every later turn in the session.
+    """
+    _clear_credential_env(monkeypatch)
+
+    captured, apperrors = _run_composed_send_expecting_refusal(
+        monkeypatch,
+        _credential_only_cfg(),
+        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+        "session-1806-credential-only-omni",
+        model=_CREDENTIAL_ONLY_MODEL,
+    )
+
+    payload = apperrors[-1]
+    # The STRUCTURED verdict, not the prose: a generic failure whose message
+    # happens to read "resolved no endpoint" would pass a message-only check,
+    # and the message is free to be reworded. This is the same terminal reason
+    # the merge-level and auxiliary-client regressions assert.
+    # The literal is pinned alongside the constant because it is the wire value
+    # the client branches on; renaming it silently would be a breaking change.
+    assert payload["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT == (
+        "custom_provider_endpoint_unresolved"
+    ), f"the failure did not carry {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
+    assert "custom:omni" in payload["message"], payload
+    assert "resolved no endpoint" in payload["message"], (
+        f"the failure did not name {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
+    )
+    assert "base_url" in payload["hint"], payload
+
+    # ``_assert_route_refused`` already pinned "no constructor, no run, no cache";
+    # restate the two that this defect turns on so a future relaxation of that
+    # helper cannot quietly un-cover them.
+    assert not captured.get("init_kwargs_history"), (
+        "an agent was constructed for a record that declares no endpoint — on "
+        "the initial send or on a self-heal retry"
+    )
+    assert not captured.get("explicit_client_kwargs_calls"), (
+        "a client was configured with the active provider's borrowed connection"
+    )
+
+    _assert_no_borrowed_pair(str(payload) + str(captured), "composed send")
+
+
+# The two consumers whose auxiliary client can answer outright. There AIAgent is
+# never built, so ``main_runtime`` is the ONLY carrier of the resolved authority
+# — and the only place a borrowed pair could still reach the wire after every
+# constructor assertion above passes.
+_CREDENTIAL_ONLY_AUX_DRIVERS = [
+    (
+        "git commit message",
+        lambda routes, session: routes._llm_git_commit_message("sys", "user", session=session),
+    ),
+    (
+        "update summary",
+        lambda routes, _session: routes._llm_update_summary("sys", "user", active_profile=None),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,invoke",
+    _CREDENTIAL_ONLY_AUX_DRIVERS,
+    ids=[d[0] for d in _CREDENTIAL_ONLY_AUX_DRIVERS],
+)
+def test_credential_only_record_reaches_no_auxiliary_client(monkeypatch, label, invoke):
+    """The refusal is terminal BEFORE ``main_runtime`` is built, so the aux client
+    is never handed the active provider's connection.
+
+    ``_resolve_agent_connection_bundle`` raises at the chokepoint, which is
+    upstream of ``_auxiliary_main_runtime``. Returning the holed bundle instead
+    would let the aux path send with the borrowed pair while bypassing every
+    AIAgent-side guard entirely.
+    """
+    import api.routes as routes
+
+    _clear_credential_env(monkeypatch)
+    cfg_dict = _credential_only_cfg()
+    cfg_dict["model"] = {"default": _CREDENTIAL_ONLY_MODEL, "provider": "custom:omni"}
+
+    captured, fake_session = _setup_route_consumer_runtime(
+        monkeypatch,
+        cfg_dict=cfg_dict,
+        runtime_dict=copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+    )
+    recorded_main_runtime = {}
+    _decline_auxiliary_client(monkeypatch, recorded_main_runtime)
+
+    with pytest.raises(config.CustomProviderRouteError) as excinfo:
+        invoke(routes, fake_session)
+
+    assert excinfo.value.reason == config.CUSTOM_ROUTE_NO_ENDPOINT, label
+    assert excinfo.value.provider == "custom:omni", label
+    assert excinfo.value.hint, f"{label}: the refusal named no setting to fix"
+
+    assert not recorded_main_runtime, (
+        f"{label}: the auxiliary client was handed {recorded_main_runtime!r} for a "
+        "route with no endpoint of its own"
+    )
+    assert "init_kwargs" not in captured, f"{label}: an agent was constructed anyway"
+    _assert_no_borrowed_pair(
+        str(excinfo.value) + str(recorded_main_runtime) + str(captured), label
+    )
+
+
+# ── controls: the refusal is about MISSING provenance, not about raw records ──
+
+
+def test_complete_raw_record_still_sends_through_its_own_endpoint(monkeypatch):
+    """Control: the same record WITH a ``base_url`` routes exactly as before.
+
+    Without this, "refuse when ``endpoint_owned`` is False" is equally satisfied
+    by refusing every raw ``providers:<key>`` record — which would break the
+    standard v12 shape outright.
+    """
+    _clear_credential_env(monkeypatch)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _v12_raw_cfg({"base_url": _OMNI_OWN_URL, "api_key": _CREDENTIAL_ONLY_KEY}),
+        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+        "session-1806-credential-only-control-complete",
+    )
+
+    assert init_kwargs["base_url"] == _OMNI_OWN_URL
+    assert init_kwargs["api_key"] == _CREDENTIAL_ONLY_KEY
+    assert init_kwargs["provider"] == "custom"
+    # The record owns an endpoint the active provider did not resolve, so the
+    # active provider's side fields are provably foreign and go.
+    _assert_side_fields(init_kwargs, _FOREIGN_AMBIENT_SIDE_FIELDS, "complete raw record")
+    for leaked in _ACTIVE_OTHER_SENTINELS:
+        assert leaked not in str(init_kwargs), (
+            f"the active provider's {leaked!r} reached a record-owned route"
+        )
+
+
+def test_genuinely_keyless_raw_record_still_sends_with_the_placeholder(monkeypatch):
+    """Control: a record declaring an endpoint and NO credential is still keyless.
+
+    The mirror of the case under test — endpoint but no credential, rather than
+    credential but no endpoint. This one is a complete statement about the route
+    ("that endpoint is unauthenticated"), so it must still route with
+    :data:`config.KEYLESS_CUSTOM_API_KEY` and must NOT borrow the active
+    provider's key on the way.
+    """
+    _clear_credential_env(monkeypatch)
+
+    init_kwargs = _run_composed_send(
+        monkeypatch,
+        _v12_raw_cfg({"base_url": _OMNI_OWN_URL}),
+        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
+        "session-1806-credential-only-control-keyless",
+    )
+
+    assert init_kwargs["base_url"] == _OMNI_OWN_URL
+    assert init_kwargs["api_key"] == config.KEYLESS_CUSTOM_API_KEY
+    assert init_kwargs["api_key"] != _ACTIVE_OTHER_KEY
+    assert init_kwargs["provider"] == "custom"

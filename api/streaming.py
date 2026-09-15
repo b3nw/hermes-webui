@@ -1532,6 +1532,12 @@ def _custom_provider_route_classification(error) -> dict:
     return {
         'label': label,
         'type': 'provider_unroutable',
+        # The STRUCTURED verdict (``custom_provider_endpoint_unresolved`` /
+        # ``custom_provider_no_credential``) travels beside the prose so the
+        # emitted apperror can carry it too. ``type`` alone says only "this route
+        # is unroutable"; which of the two settings to fix lives here, and the
+        # non-streaming /api/chat refusal already answers it as ``reason``.
+        'reason': reason,
         'hint': hint,
         'message': message,
     }
@@ -12973,6 +12979,11 @@ def _run_agent_streaming(
         )
         _exc_is_provider_unroutable = _classification['type'] == 'provider_unroutable'
 
+        # The structured terminal reason for an unroutable named custom route,
+        # stamped onto the emitted payload below. Kept separate from _exc_type
+        # because every unroutable route shares one type and differs only here.
+        _exc_route_reason = None
+
         # The user hint still points to Settings / `hermes model` from _classify_provider_error().
         if _exc_is_provider_unroutable:
             # Checked FIRST so the terminal route verdict can never be flattened
@@ -12982,6 +12993,7 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
             )
+            _exc_route_reason = _classification.get('reason')
         elif _exc_is_quota:
             _exc_label, _exc_type, _exc_hint = (
                 _classification['label'], _classification['type'], _classification['hint'],
@@ -13230,6 +13242,7 @@ def _run_agent_streaming(
                 _exc_label = _heal_route_classification['label']
                 _exc_type = _heal_route_classification['type']
                 _exc_hint = _heal_route_classification['hint']
+                _exc_route_reason = _heal_route_classification.get('reason')
                 if _heal_route_classification['message']:
                     err_str = _heal_route_classification['message']
             elif _heal_stale_classification is not None:
@@ -13270,6 +13283,10 @@ def _run_agent_streaming(
                 'The conversation changed while context compression was being prepared.'
             )
         _error_payload = _provider_error_payload(err_str, _exc_type, _exc_hint)
+        if _exc_route_reason:
+            # Clients (and regressions) branch on the exact verdict rather than
+            # on the human-readable message, which is free to be reworded.
+            _error_payload['reason'] = _exc_route_reason
         if s is not None:
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()

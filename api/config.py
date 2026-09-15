@@ -4123,6 +4123,10 @@ def _unowned_custom_provider_bundle(pid: str, slug: str, status: str) -> dict:
         "record": None,
         "base_url": None,
         "api_key": None,
+        # Nothing owns the route, so nothing positively owns an endpoint for it
+        # either. Stated rather than inferred: the merge must never read an
+        # endpoint that reached it from somewhere else as this route's own.
+        "endpoint_owned": False,
         "keyless": False,
         "owned": {},
     }
@@ -4144,6 +4148,13 @@ def resolve_custom_provider_bundle(
 
     ``base_url``
         the record's own endpoint (``None`` when it declares none).
+    ``endpoint_owned``
+        True only when the SELECTED record supplied that endpoint itself. It is
+        the positive half of the provenance the merge needs: an endpoint already
+        sitting in a caller's bundle, an endpoint that merely compares equal, and
+        an absent runtime dict are all silence, and silence must never be read as
+        "this endpoint belongs to the selected record". False here means the
+        route has no endpoint of its own, whatever else is in flight.
     ``api_key``
         the record's own credential, resolved through the SAME ladder the
         runtime uses for a named custom provider: pool credential, then literal
@@ -4210,6 +4221,7 @@ def resolve_custom_provider_bundle(
             "record": None,
             "base_url": base_url,
             "api_key": api_key,
+            "endpoint_owned": bool(base_url),
             # A resolver reports a URL/key pair and nothing else; with no record
             # behind it there is no declaration to inspect, so an absent key is
             # the only keyless signal available here.
@@ -4263,6 +4275,10 @@ def resolve_custom_provider_bundle(
         "record": record,
         "base_url": base_url,
         "api_key": api_key,
+        # POSITIVE endpoint provenance, resolved from the selected record and
+        # from nothing else. The merge below pairs this record's credential with
+        # an endpoint only while this is True.
+        "endpoint_owned": bool(base_url),
         "keyless": not api_key
         and not _custom_record_declares_credential(record, base_url, pool_runtime),
         "owned": owned,
@@ -4326,6 +4342,38 @@ def _custom_bundle_endpoint_matches(bundle: dict, runtime_provider: dict) -> boo
     )
 
 
+def _custom_runtime_endpoint_is_record_owned(bundle: dict, runtime_provider: dict) -> bool:
+    """True when the runtime dict positively originated from the selected RECORD.
+
+    Endpoint equality alone is NOT selected-record provenance: two distinct
+    records (e.g. an exact list row and a same-slug keyed record) can share a
+    normalized URL while carrying different credentials. A tie requires either
+    an explicit source-record identity or matching record credentials;
+    silence, missing runtime dicts, and distinct records sharing an endpoint
+    never establish that the runtime spelling belongs to the selected record.
+    """
+    if not bundle.get("base_url"):
+        return False
+    if not isinstance(runtime_provider, dict) or not runtime_provider.get("base_url"):
+        return False
+    # Credential conflict strictly rejects a tie before checking identity metadata
+    bundle_key = bundle.get("api_key")
+    rt_key = runtime_provider.get("api_key")
+    if bundle_key and rt_key and bundle_key != rt_key:
+        return False
+    rec = bundle.get("record")
+    rt_rec = runtime_provider.get("record") or runtime_provider.get("source_record")
+    if rt_rec is not None:
+        return rt_rec == rec and _custom_bundle_endpoint_matches(bundle, runtime_provider)
+    rec_id = bundle.get("record_id") or (rec.get("id") if isinstance(rec, dict) else None)
+    rt_id = runtime_provider.get("record_id")
+    if rt_id is not None:
+        return rt_id == rec_id and _custom_bundle_endpoint_matches(bundle, runtime_provider)
+    if bundle_key and rt_key and bundle_key == rt_key:
+        return _custom_bundle_endpoint_matches(bundle, runtime_provider)
+    return False
+
+
 def merge_custom_provider_runtime_bundle(
     resolved_provider: str | None,
     resolved_api_key: str | None,
@@ -4372,6 +4420,18 @@ def merge_custom_provider_runtime_bundle(
     * otherwise the runtime resolved a DIFFERENT authority -> the field is
       cleared, because passing it through is what let a custom HTTP endpoint
       inherit Anthropic credential pooling and a Claude ACP subprocess.
+
+    The ENDPOINT itself is decided by positive provenance only. A selected
+    config record supplies the endpoint its credential is sent to, and the one
+    exception is a runtime dict positively tied to that same record (same
+    identity, same normalized URL), whose spelling is the one it can reach.
+    Everything else is silence: the ``resolved_base_url`` the caller arrived
+    with, a URL that merely compares equal, and a missing runtime dict say
+    nothing about the record selected for this slug. So a record that declares
+    no usable ``base_url`` does not borrow one — the route is terminal with
+    :data:`CUSTOM_ROUTE_NO_ENDPOINT` and the bundle keeps neither the incoming
+    endpoint nor this record's credential, because pairing them is precisely how
+    a non-active provider's secret reached the ACTIVE provider's URL.
 
     The CREDENTIAL of an exact ``custom_providers[]`` row is exempt from the
     same-endpoint rule above: it is resolved from that row's own ladder and is
@@ -4488,11 +4548,58 @@ def _custom_provider_runtime_bundle_with_provenance(
         return bundle, custom
 
     same_authority = _custom_bundle_endpoint_matches(custom, _rt)
+    # The positive tie: the runtime dict resolved the very endpoint the selected
+    # record declares. Never True on absence of evidence, so it is the only
+    # signal allowed to keep an endpoint this record did not supply itself.
+    endpoint_tied = _custom_runtime_endpoint_is_record_owned(custom, _rt)
+
+    if custom["record"] is not None and not custom["endpoint_owned"]:
+        # A CONFIG RECORD owns this slug — an exact ``custom_providers[]`` row, a
+        # keyed ``providers['custom:<slug>']``, a raw ``providers:<key>`` row (the
+        # standard v12 shape) or a ``model:`` authority — and it declares no
+        # usable endpoint. So this route HAS no endpoint: the one sitting in
+        # ``bundle`` was resolved for whoever the process was already talking to
+        # (the ACTIVE provider) and reached us as ambient state.
+        #
+        # Keeping it would pair THIS record's credential with THAT provider's
+        # URL — the user's prompt and a non-active provider's secret delivered to
+        # an endpoint neither the record nor the user named. The installed
+        # Agent's ``_match_new_style_provider()`` skips an endpoint-less raw
+        # record for exactly this reason.
+        #
+        # Nothing here may stand in for the missing endpoint: not the caller's
+        # ``resolved_base_url``, not a URL that merely compares equal (a gateway
+        # fronting two accounts is one host and two authorities), and not an
+        # absent runtime dict. Absence of contrary evidence is not provenance.
+        # So the route fails closed on its OWN name — the terminal
+        # ``custom_provider_endpoint_unresolved``, naming the setting to fix —
+        # rather than degrading into a send through the active provider.
+        bundle["base_url"] = None
+        bundle["api_key"] = None
+        for field in CUSTOM_CONNECTION_SIDE_FIELDS:
+            # The record keeps what it declares for ITSELF; every other side
+            # field belongs to the ambient authority whose endpoint was just
+            # refused, so it goes with it. Leaving those behind would hand the
+            # refused provider's credential pool and ACP transport to a route
+            # that is about to be reported unresolvable.
+            bundle[field] = custom["owned"].get(field)
+        bundle[CUSTOM_ROUTE_ERROR_FIELD] = _custom_route_verdict(
+            CUSTOM_ROUTE_NO_ENDPOINT, custom["provider_id"]
+        )
+        logger.warning(
+            "custom provider %s resolved no endpoint of its own; refusing to pair "
+            "its credential with the connection resolved for %s",
+            custom["provider_id"],
+            _connection_identity(_rt, resolved_provider) or "another provider",
+        )
+        return bundle, custom
 
     if custom["is_exact"]:
         # An exact ``custom_providers[]`` row is authoritative for its slug: BOTH
         # the endpoint (including None when the row's base_url is blank) and the
-        # credential are replaced, never merged. The credential comes from the
+        # credential are replaced, never merged — the sole exception being the
+        # runtime's spelling of the row's OWN endpoint, handled below. The
+        # credential comes from the
         # ROW's own ladder (pool, api_key/``${ENV}``/``key_env``/
         # ``CUSTOM_<SLUG>_API_KEY``, ``key_cmd``, host-gated env) and from
         # nowhere else — including when ``same_authority`` holds.
@@ -4512,53 +4619,61 @@ def _custom_provider_runtime_bundle_with_provenance(
         # reported ``keyless`` by the resolution above and gets
         # :data:`KEYLESS_CUSTOM_API_KEY` there — that is the row's own statement
         # that the endpoint is unauthenticated, not an inherited key either.
-        bundle["base_url"] = custom["base_url"]
         bundle["api_key"] = custom["api_key"] or None
-    else:
-        # No exact row: a keyed / raw ``providers:<key>`` / ``model:`` record was
-        # picked as ONE complete record, so the endpoint and the credential must
-        # still come from it together.
+        # Same endpoint rule as the keyed branch below: the row's endpoint wins
+        # unless the runtime dict is POSITIVELY tied to it — same identity, same
+        # normalized URL — in which case the runtime's spelling of the ROW's own
+        # endpoint is kept, because that is the form it can actually reach. This
+        # is not a merge: an endpoint the row did not declare can never survive
+        # here, since ``endpoint_tied`` is False whenever the row supplied none.
+        bundle["base_url"] = _rt.get("base_url") if endpoint_tied else custom["base_url"]
+    elif custom["record"] is not None:
+        # No exact row, but a CONFIG RECORD was selected: a keyed
+        # ``providers['custom:<slug>']``, a raw ``providers:<key>`` row (the
+        # standard v12 shape) or a ``model:`` authority, picked as ONE complete
+        # record. The endpoint and the credential must therefore come from it
+        # together, decided by that record's OWN endpoint provenance and by
+        # nothing that happened to be in flight when it was selected. A record
+        # that declares NO endpoint never reaches here — the terminal branch
+        # above already refused it rather than let it borrow one.
         #
-        # When the record DECLARES an endpoint, that endpoint and the credential
-        # sent to it are one authority's pair, so the record's credential is the
+        # The record DECLARES an endpoint, so that endpoint and the credential
+        # sent to it are one authority's pair and the record's credential is the
         # only one that may accompany it — including when the ambient runtime
-        # happens to report the SAME URL. A shared base_url is not shared
-        # provenance: a gateway fronting two accounts hands both providers one
-        # host and two different keys, and taking ``_rt["api_key"]`` there sends
-        # the ACTIVE provider's secret to the non-active record's endpoint. A
-        # record whose declared credential source resolved nothing keeps
-        # ``api_key`` None and falls through to the terminal verdict naming the
-        # setting to fix, rather than borrowing the ambient key across that host.
+        # reports the SAME URL. A shared base_url is not shared provenance: a
+        # gateway fronting two accounts hands both providers one host and two
+        # different keys, and taking ``_rt["api_key"]`` there sends the ACTIVE
+        # provider's secret to the non-active record's endpoint. A record whose
+        # declared credential source resolved nothing keeps ``api_key`` None and
+        # falls through to the terminal verdict naming the setting to fix, rather
+        # than borrowing the ambient key across that host.
+        bundle["api_key"] = custom["api_key"] or None
+        # The record's endpoint wins unless the runtime dict is POSITIVELY tied
+        # to it — same identity, same normalized URL — in which case the
+        # runtime's spelling is kept, because a normalized form of the same
+        # endpoint is the one it can actually reach. Any other endpoint already
+        # in the bundle was resolved before this record was selected: absent
+        # provenance is not a tie, so it is displaced rather than left beside the
+        # credential this record just supplied.
+        bundle["base_url"] = _rt.get("base_url") if endpoint_tied else custom["base_url"]
+    else:
+        # No record behind the selection: an injected ``connection_resolver``
+        # reported a bare URL/key pair and IS the whole authority on this path.
+        # There is no record to take endpoint provenance from, so this keeps the
+        # historical fill-only shape — the caller's already-resolved endpoint
+        # stands and the resolver fills only what it left empty (#2271).
         if custom["base_url"]:
             bundle["api_key"] = custom["api_key"] or None
         elif same_authority and _rt.get("api_key"):
-            # The record declares NO endpoint of its own, so the runtime's URL is
-            # filling a hole rather than being displaced — and the ambient
-            # endpoint's own credential is the coherent partner for it. Pairing
-            # the ambient URL with anything else is the split this branch avoids.
+            # The resolver reported NO endpoint, so the runtime's URL is filling
+            # a hole rather than being displaced — and the ambient endpoint's own
+            # credential is the coherent partner for it.
             bundle["api_key"] = _rt.get("api_key")
         elif custom["api_key"]:
             bundle["api_key"] = custom["api_key"]
         if custom["base_url"] and _rt.get("base_url") and not same_authority:
-            # The record DECLARES its own endpoint and the runtime dict reports a
-            # DIFFERENT one, so the runtime is provably a foreign authority here —
-            # the same verdict that clears the side fields just below. Filling
-            # only the hole would leave the foreign endpoint in place beside the
-            # credential the branch above just took from this record: a non-active
-            # named provider's key pointed at the ACTIVE provider's URL. That is
-            # the split-authority pairing this function exists to stop, mirrored.
-            # The record's endpoint wins instead.
-            #
-            # ``not same_authority`` alone is NOT that evidence: it is also False
-            # when there is no runtime dict to compare against (the legacy
-            # three-field view and the injected-``connection_resolver`` callers
-            # pass none). Absent provenance is not proof of a foreign authority,
-            # so those keep the endpoint their caller already resolved.
             bundle["base_url"] = custom["base_url"]
         elif not bundle["base_url"] and custom["base_url"]:
-            # Nothing seeded the endpoint, so take the record's. When the runtime
-            # DID seed it from the same authority, its spelling stands — a
-            # normalized form of the same endpoint is the one it can reach.
             bundle["base_url"] = custom["base_url"]
 
     for field in CUSTOM_CONNECTION_SIDE_FIELDS:
