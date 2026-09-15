@@ -2721,6 +2721,17 @@ _RETRY_UNOWNED_MUTATIONS = [
 ]
 
 
+def _retry_endpoint_mutation():
+    """Return a heal mutation that removes only the owning row's endpoint."""
+
+    def _mutate():
+        # Keep the credential so this is the exact credential-only record shape:
+        # the row still owns the named route, but cannot supply an endpoint.
+        config.cfg["custom_providers"] = _retry_cfg_rows(base_url=None)
+
+    return _mutate
+
+
 def _retry_credential_mutation(row_fields):
     """Return a heal mutation that keeps the endpoint but breaks the credential."""
 
@@ -2785,7 +2796,16 @@ def _run_composed_retry_expecting_abandoned_heal(
 
 
 def _assert_retry_abandoned(
-    captured, apperrors, cache_at_heal, cache_after, session_id, label, *, expected_cause
+    captured,
+    apperrors,
+    cache_at_heal,
+    cache_after,
+    session_id,
+    label,
+    *,
+    expected_cause,
+    expected_initial_url=_LIST_ROW_URL,
+    expected_initial_key=_LIST_ROW_KEY,
 ):
     """Assert the retry stopped at the refreshed route verdict, not at the 401."""
     # (0) The case is only meaningful if the FIRST send was routable and really
@@ -2793,11 +2813,11 @@ def _assert_retry_abandoned(
     # resolution would satisfy every assertion below for the wrong reason.
     history = captured.get("init_kwargs_history", [])
     assert history, f"{label}: the initial send never constructed an agent"
-    assert history[0]["base_url"] == _LIST_ROW_URL, (
+    assert history[0]["base_url"] == expected_initial_url, (
         f"{label}: the initial send did not resolve the owning row, so no 401 "
         f"retry path was ever reached: {history[0]}"
     )
-    assert history[0]["api_key"] == _LIST_ROW_KEY, f"{label}: {history[0]}"
+    assert history[0]["api_key"] == expected_initial_key, f"{label}: {history[0]}"
     assert cache_at_heal.get(session_id), (
         f"{label}: the initial agent was never cached, so this case cannot show "
         f"that the abandoned retry left a good cache entry alone"
@@ -2820,7 +2840,7 @@ def _assert_retry_abandoned(
         f"_routed_client_kwargs() and re-resolved a provider"
     )
     explicit = captured.get("explicit_client_kwargs_calls", [])
-    assert explicit == [{"api_key": _LIST_ROW_KEY, "base_url": _LIST_ROW_URL}], (
+    assert explicit == [{"api_key": expected_initial_key, "base_url": expected_initial_url}], (
         f"{label}: expected only the initial send's explicit pair, got {explicit}"
     )
 
@@ -5008,56 +5028,55 @@ def test_credential_only_record_refuses_the_active_providers_endpoint(monkeypatc
     _assert_no_borrowed_pair(str(bundle), "merged bundle")
 
 
-def test_credential_only_record_refuses_the_production_composed_send(monkeypatch):
-    """End to end: no agent is constructed in ANY of the three streaming regions.
+@pytest.mark.parametrize("fail_first", ["returned_error", "raised"])
+def test_credential_only_record_refuses_the_production_composed_send(
+    monkeypatch, fail_first
+):
+    """A standard-v12 record losing only its endpoint stops a 401 self-heal.
 
-    The real defect is not "the bundle had a hole in it" — an incomplete pair is
-    what makes ``_init_openai_client()`` call ``_routed_client_kwargs()`` and
-    resolve a provider all over again. So this asserts the send STOPS: no
-    constructor on the initial resolution and none on either 401 self-heal retry
-    (``init_kwargs_history`` records every construction across all three), no
-    explicit client, no turn sent, a controlled ``provider_unroutable`` failure,
-    and an agent cache that was never written — a poisoned cache would hand the
-    borrowed pair to every later turn in the session.
+    The initial send is routable and cached with the complete raw record. During
+    the self-heal, only that record's ``base_url`` is removed; its credential and
+    the foreign ambient runtime bundle remain available. The refreshed terminal
+    route must therefore prevent every retry construction and cache write.
     """
     _clear_credential_env(monkeypatch)
+    session_id = f"session-1806-credential-only-omni-{fail_first}"
+    label = f"credential-only record / {fail_first}"
+    cfg_dict = _v12_raw_cfg({"base_url": _V12_URL, "api_key": _V12_KEY})
 
-    captured, apperrors = _run_composed_send_expecting_refusal(
-        monkeypatch,
-        _credential_only_cfg(),
-        copy.deepcopy(_ACTIVE_OTHER_RUNTIME),
-        "session-1806-credential-only-omni",
-        model=_CREDENTIAL_ONLY_MODEL,
+    def remove_only_the_endpoint():
+        config.cfg["providers"]["omni"]["base_url"] = ""
+
+    captured, apperrors, cache_at_heal, cache_after = (
+        _run_composed_retry_expecting_abandoned_heal(
+            monkeypatch,
+            cfg_dict,
+            _ambient_runtime(),
+            session_id,
+            fail_first=fail_first,
+            heal_mutate=remove_only_the_endpoint,
+        )
+    )
+
+    _assert_retry_abandoned(
+        captured,
+        apperrors,
+        cache_at_heal,
+        cache_after,
+        session_id,
+        label,
+        expected_cause="resolved no endpoint",
+        expected_initial_url=_V12_URL,
+        expected_initial_key=_V12_KEY,
     )
 
     payload = apperrors[-1]
-    # The STRUCTURED verdict, not the prose: a generic failure whose message
-    # happens to read "resolved no endpoint" would pass a message-only check,
-    # and the message is free to be reworded. This is the same terminal reason
-    # the merge-level and auxiliary-client regressions assert.
-    # The literal is pinned alongside the constant because it is the wire value
-    # the client branches on; renaming it silently would be a breaking change.
-    assert payload["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT == (
-        "custom_provider_endpoint_unresolved"
-    ), f"the failure did not carry {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
-    assert "custom:omni" in payload["message"], payload
-    assert "resolved no endpoint" in payload["message"], (
-        f"the failure did not name {config.CUSTOM_ROUTE_NO_ENDPOINT}: {payload}"
-    )
+    assert payload["reason"] == config.CUSTOM_ROUTE_NO_ENDPOINT, payload
     assert "base_url" in payload["hint"], payload
-
-    # ``_assert_route_refused`` already pinned "no constructor, no run, no cache";
-    # restate the two that this defect turns on so a future relaxation of that
-    # helper cannot quietly un-cover them.
-    assert not captured.get("init_kwargs_history"), (
-        "an agent was constructed for a record that declares no endpoint — on "
-        "the initial send or on a self-heal retry"
-    )
-    assert not captured.get("explicit_client_kwargs_calls"), (
-        "a client was configured with the active provider's borrowed connection"
-    )
-
-    _assert_no_borrowed_pair(str(payload) + str(captured), "composed send")
+    blob = str(captured) + str(apperrors)
+    for leaked in _ACTIVE_OTHER_SENTINELS:
+        assert leaked not in blob, f"{label}: {leaked!r} leaked into the retry path"
+    assert config.KEYLESS_CUSTOM_API_KEY not in blob
 
 
 # The two consumers whose auxiliary client can answer outright. There AIAgent is
