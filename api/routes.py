@@ -644,6 +644,71 @@ def _scope_rows_to_active_profile(rows, active_profile, *, is_isolated=None):
     return scoped
 
 
+# Verdicts returned by _session_profile_gate_denial.
+_PROFILE_GATE_NOT_FOUND = "not_found"
+_PROFILE_GATE_MISMATCH = "mismatch"
+
+
+def _session_profile_gate_denial(session, cli_meta, handler, *, effective_profile=None):
+    """Return why the active profile may not read ``session``, or ``None``.
+
+    Single source of truth for the detail-load and share profile gates:
+
+      * ``(_PROFILE_GATE_NOT_FOUND, None)`` -- the isolated-mode rejection and
+        the unknown/legacy None-profile case, which keep the 404 so the
+        frontend's self-heal (clear stale URL + localStorage) still fires;
+      * ``(_PROFILE_GATE_MISMATCH, profile)`` -- a valid session owned by a
+        KNOWN other profile, which gets the #5419 409 so the client can offer
+        to switch to it.
+
+    Both call sites authorize on a metadata-only load and then hydrate the
+    session with a second ``get_session(..., metadata_only=False)``. The
+    sidecar can be re-tagged to another profile between those two reads (an
+    empty placeholder is re-tagged during chat start, see
+    ``_handle_chat_start``), so the messages the second load returns may belong
+    to a profile the first load never authorized. Sharing that rule here lets
+    both sites re-run the identical check against the hydrated session before
+    touching its messages.
+    """
+    stored_profile = getattr(session, "profile", None) or None
+    if effective_profile is None:
+        effective_profile = stored_profile
+    check_meta = cli_meta or (session.compact() if hasattr(session, "compact") else {})
+    # Known owner wins: the exemption is for rows that belong to no Hermes
+    # profile, so it may only apply when the stored sidecar names none. A
+    # profile-less Claude metadata row must never launder a sidecar that is
+    # owned by another profile past the 409 below.
+    is_agnostic = (
+        not stored_profile
+        and _is_profile_agnostic_foreign_session(check_meta)
+    )
+    if is_agnostic:
+        if _is_isolated_profile_mode():
+            return (_PROFILE_GATE_NOT_FOUND, None)
+        return None
+    if _session_visible_to_active_profile(effective_profile, handler):
+        return None
+    if effective_profile:
+        return (_PROFILE_GATE_MISMATCH, effective_profile)
+    # _profiles_match coerces None->'default', so a truly missing/legacy
+    # session under a non-default active profile would otherwise emit a
+    # useless 409 with profile=null.
+    return (_PROFILE_GATE_NOT_FOUND, None)
+
+
+def _emit_session_profile_gate_denial(handler, sid, denial):
+    """Write the HTTP response for a ``_session_profile_gate_denial`` verdict."""
+    kind, profile = denial
+    if kind == _PROFILE_GATE_MISMATCH:
+        return j(handler, {
+            "error": "Session belongs to a different profile",
+            "code": "session_profile_mismatch",
+            "session_id": sid,
+            "profile": profile,
+        }, status=409)
+    return bad(handler, "Session not found", 404)
+
+
 def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     if not path:
         return False
@@ -5750,6 +5815,25 @@ def _build_share_metadata_sidecar(
     return session
 
 
+def _share_profile_gate_denies(stored_session, cli_meta, handler) -> bool:
+    """Return True when the active profile may not share ``stored_session``.
+
+    Wraps ``_session_profile_gate_denial`` with share's effective-profile rule:
+    a stored sidecar without an owner still inherits the CLI metadata row's
+    profile, if that row names one. Share collapses every denial verdict into
+    ``KeyError`` (a 404) rather than distinguishing 409 from 404.
+    """
+    stored_profile = getattr(stored_session, "profile", None) or None
+    effective_profile = (
+        stored_profile
+        or (cli_meta or {}).get("profile")
+        or None
+    )
+    return _session_profile_gate_denial(
+        stored_session, cli_meta, handler, effective_profile=effective_profile
+    ) is not None
+
+
 def _resolve_share_session_pair(sid: str, handler):
     """Resolve a shareable session plus the sidecar that stores share metadata.
 
@@ -5780,26 +5864,20 @@ def _resolve_share_session_pair(sid: str, handler):
             if _session_requires_cli_metadata_lookup(stored_session)
             else {}
         )
-        _stored_profile = getattr(stored_session, "profile", None) or None
-        effective_profile = (
-            _stored_profile
-            or (cli_meta or {}).get("profile")
-            or None
-        )
-        _check_meta = cli_meta or (stored_session.compact() if hasattr(stored_session, "compact") else {})
         # The profile-less exemption exists for rows that belong to NO Hermes
         # profile. A stored sidecar that names an owner is not such a row, even
         # when the Claude metadata row it is matched against carries no profile
-        # — honor the stored owner and fall through to the scoping gate below.
-        _is_agnostic = (
-            not _stored_profile
-            and _is_profile_agnostic_foreign_session(_check_meta)
-        )
-        if _is_isolated_profile_mode() and _is_agnostic:
-            raise KeyError(sid)
-        if not _is_agnostic and not _session_visible_to_active_profile(effective_profile, handler):
+        # — the shared gate honors the stored owner and scopes it normally.
+        if _share_profile_gate_denies(stored_session, cli_meta, handler):
             raise KeyError(sid)
         stored_session = get_session(sid, metadata_only=False)
+        # Authorize the load whose messages become the public share payload.
+        # The sidecar can be re-tagged to another profile between the
+        # metadata-only gate above and this hydration (an empty placeholder is
+        # re-tagged during chat start), which would otherwise snapshot another
+        # profile's transcript into a share link.
+        if _share_profile_gate_denies(stored_session, cli_meta, handler):
+            raise KeyError(sid)
         snapshot_session = copy.copy(stored_session)
         snapshot_session.messages = _share_snapshot_messages_for_session(
             stored_session,
@@ -13353,38 +13431,23 @@ def _handle_session_get(handler, parsed) -> bool:
         # read_only, which is itself one of the markers that puts a session on
         # the CLI lookup path — so a WebUI-native session can never match.
         cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
-        _check_meta = cli_meta or (s.compact() if hasattr(s, "compact") else {})
-        # Known owner wins: the exemption is for rows that belong to no Hermes
-        # profile, so it may only apply when the stored sidecar names none. A
-        # profile-less Claude metadata row must never launder a sidecar that is
-        # owned by another profile past the #5419 409 below.
-        _is_agnostic = (
-            not _session_profile
-            and _is_profile_agnostic_foreign_session(_check_meta)
-        )
-        if _is_agnostic and _is_isolated_profile_mode():
+        _denial = _session_profile_gate_denial(s, cli_meta, handler)
+        if _denial is not None:
             if _diag: _diag.finish()
-            return bad(handler, "Session not found", 404)
-        if not _is_agnostic and not _session_visible_to_active_profile(_session_profile, handler):
-            if _session_profile:
-                # Valid session owned by a KNOWN other profile: 409 so the
-                # client can offer to switch to it (#5419).
-                if _diag: _diag.finish()
-                return j(handler, {
-                    "error": "Session belongs to a different profile",
-                    "code": "session_profile_mismatch",
-                    "session_id": sid,
-                    "profile": _session_profile,
-                }, status=409)
-            # Unknown/legacy None-profile sidecar: keep the original 404 so
-            # the frontend's self-heal (clear stale URL + localStorage) still
-            # fires. _profiles_match coerces None->'default', so a truly
-            # missing/legacy session under a non-default active profile would
-            # otherwise emit a useless 409 with profile=null.
-            if _diag: _diag.finish()
-            return bad(handler, "Session not found", 404)
+            return _emit_session_profile_gate_denial(handler, sid, _denial)
         if load_messages:
             s = get_session(sid, metadata_only=False)
+            # Authorize the load we actually use. The sidecar can be re-tagged
+            # between the metadata-only gate above and this hydration (an empty
+            # placeholder is re-tagged to a profile during chat start), so the
+            # messages on this object may belong to a profile that was never
+            # authorized. Re-run the identical rule against the hydrated
+            # session before anything reads its transcript.
+            _session_profile = getattr(s, 'profile', None) or None
+            _denial = _session_profile_gate_denial(s, cli_meta, handler)
+            if _denial is not None:
+                if _diag: _diag.finish()
+                return _emit_session_profile_gate_denial(handler, sid, _denial)
         original_stream_id = getattr(s, "active_stream_id", None)
         _clear_stale_stream_state(s)
         is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
@@ -19878,12 +19941,34 @@ def _handle_gateway_sse_stream(handler, parsed):
         # sidebar fetch correctly withholds.
         active_profile = _get_active_profile_name()
         is_isolated = _is_isolated_profile_mode()
+        # The watcher projects one profile's state.db and its rows carry no
+        # `profile` key at all. _profiles_match coerces a missing profile to
+        # 'default', so under a named profile the scoping filter would drop
+        # every gateway row and the live list would go permanently empty right
+        # after the initial snapshot (#6889). Attribute an unkeyed row to the
+        # profile whose database the watcher read. An explicit `profile: None`
+        # is left alone — that marks a profile-agnostic external-agent row
+        # (Claude Code / Codex) whose exemption must survive the filter.
+        _watcher_profile_name = getattr(watcher, 'profile_name', None)
+        watcher_profile = (
+            _watcher_profile_name.strip()
+            if isinstance(_watcher_profile_name, str)
+            else ''
+        ) or active_profile
 
-        _sse(handler, 'sessions_changed', {
-            'sessions': _scope_rows_to_active_profile(
-                initial, active_profile, is_isolated=is_isolated
-            ),
-        })
+        def _scope(rows):
+            return _scope_rows_to_active_profile(
+                [
+                    dict(row, profile=watcher_profile)
+                    if isinstance(row, dict) and 'profile' not in row
+                    else row
+                    for row in rows
+                ],
+                active_profile,
+                is_isolated=is_isolated,
+            )
+
+        _sse(handler, 'sessions_changed', {'sessions': _scope(initial)})
 
         while True:
             try:
@@ -19901,10 +19986,7 @@ def _handle_gateway_sse_stream(handler, parsed):
             if isinstance(event_data.get('sessions'), list):
                 event_data = dict(
                     event_data,
-                    sessions=_scope_rows_to_active_profile(
-                        event_data['sessions'], active_profile,
-                        is_isolated=is_isolated,
-                    ),
+                    sessions=_scope(event_data['sessions']),
                 )
             _sse(handler, event_data.get('type', 'sessions_changed'), event_data)
     except _CLIENT_DISCONNECT_ERRORS:

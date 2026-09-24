@@ -881,3 +881,267 @@ def test_stored_foreign_owner_beats_active_profile_cli_metadata_on_share(monkeyp
             routes._resolve_share_session_pair(CLAUDE_SID, MagicMock())
 
     assert mock_snapshot.call_count == 0
+
+
+# ── Live gateway rows must survive the SSE profile filter (fix spec #1) ──────
+#
+# The SSE handler scopes every pushed event with
+# `_scope_rows_to_active_profile`, but the rows the gateway watcher projects
+# out of state.db carry no `profile` key at all. `_profiles_match` coerces a
+# missing profile to 'default', so under a named profile the filter dropped
+# every gateway row: the browser got the session in the initial snapshot and
+# an empty list on the next live update, skipped the active transcript refresh,
+# and gateway sessions stopped updating live.
+
+
+def _watcher_projection_row(session_id="tg-1"):
+    """A row shaped exactly like gateway_watcher._get_agent_sessions_from_db emits."""
+    return {
+        "session_id": session_id,
+        "title": "Telegram chat",
+        "model": None,
+        "message_count": 3,
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "source": "telegram",
+        "raw_source": "telegram",
+        "session_source": "gateway",
+        "source_label": "Telegram",
+    }
+
+
+def _run_gateway_sse_stream(
+    *, initial_rows, live_rows, active_profile, watcher_profile, is_isolated=False
+):
+    """Drive _handle_gateway_sse_stream for one snapshot + one live event."""
+    sent_events = []
+
+    def mock_sse(handler, event_type, data):
+        sent_events.append((event_type, data))
+        if len(sent_events) >= 2:
+            raise ConnectionResetError("test stop after loop event")
+
+    shared_event = {"type": "sessions_changed", "sessions": live_rows}
+    mock_queue = MagicMock()
+    mock_queue.get.return_value = shared_event
+    mock_watcher = MagicMock()
+    mock_watcher.is_alive.return_value = True
+    mock_watcher.subscribe.return_value = mock_queue
+    mock_watcher.profile_name = watcher_profile
+
+    with (
+        patch("api.routes.load_settings", return_value={"show_cli_sessions": True}),
+        patch("api.gateway_watcher.get_watcher", return_value=mock_watcher),
+        patch("api.routes._is_isolated_profile_mode", return_value=is_isolated),
+        patch("api.routes._get_active_profile_name", return_value=active_profile),
+        patch("api.models.get_cli_sessions", return_value=initial_rows),
+        patch("api.routes._sse", side_effect=mock_sse),
+        patch("api.routes.end_sse_headers"),
+        patch("api.routes._sse_set_write_deadline"),
+    ):
+        routes._handle_gateway_sse_stream(
+            MagicMock(), urlparse("/api/sessions/gateway/stream")
+        )
+
+    assert len(sent_events) == 2
+    return sent_events, shared_event
+
+
+def test_gateway_sse_live_event_keeps_unstamped_watcher_rows_under_named_profile():
+    row = _watcher_projection_row()
+    assert "profile" not in row, "watcher rows genuinely carry no profile key"
+
+    sent_events, shared_event = _run_gateway_sse_stream(
+        initial_rows=[row],
+        live_rows=[row],
+        active_profile="feng-family",
+        watcher_profile="feng-family",
+    )
+
+    snapshot, live = sent_events
+    assert {r["session_id"] for r in snapshot[1]["sessions"]} == {"tg-1"}
+    assert {r["session_id"] for r in live[1]["sessions"]} == {"tg-1"}, (
+        "an unstamped watcher row must be attributed to the watcher's own "
+        "profile, not dropped as a 'default'-profile row"
+    )
+    # The shared event dict (and its rows) is handed to every subscriber —
+    # scoping must not mutate it in place.
+    assert shared_event["sessions"] == [row]
+    assert "profile" not in row
+
+
+def test_gateway_sse_live_event_survives_watcher_without_profile_name():
+    """A watcher constructed without a profile name falls back to the active one."""
+    row = _watcher_projection_row("tg-2")
+
+    sent_events, _shared = _run_gateway_sse_stream(
+        initial_rows=[row],
+        live_rows=[row],
+        active_profile="feng-family",
+        watcher_profile="",
+    )
+
+    assert {r["session_id"] for r in sent_events[1][1]["sessions"]} == {"tg-2"}
+
+
+def test_gateway_sse_attribution_never_overwrites_explicit_profiles():
+    """Rows that already name a profile (including None) keep their own scope."""
+    claude_row = _claude_code_row()  # explicit profile: None -> stays agnostic
+    other_row = {"session_id": "other-1", "profile": "other-profile"}
+    watcher_row = _watcher_projection_row()
+    rows = [claude_row, other_row, watcher_row]
+
+    sent_events, _shared = _run_gateway_sse_stream(
+        initial_rows=rows,
+        live_rows=rows,
+        active_profile="feng-family",
+        watcher_profile="feng-family",
+    )
+
+    for _event_type, data in sent_events:
+        assert {r["session_id"] for r in data["sessions"]} == {CLAUDE_SID, "tg-1"}
+    assert claude_row["profile"] is None
+
+
+def test_gateway_watcher_stamps_owning_profile_on_projected_rows(monkeypatch):
+    """The watcher itself stamps the profile whose state.db it read."""
+    from api import gateway_watcher as gw
+
+    watcher = gw.GatewayWatcher(profile_name="feng-family")
+    watcher.subscribe()
+    monkeypatch.setattr(
+        gw, "_get_agent_sessions_from_db", lambda _path: [_watcher_projection_row()]
+    )
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", lambda _path: "fp-1")
+    monkeypatch.setattr(type(watcher._state_db_path), "exists", lambda _self: True)
+
+    assert watcher._poll_once(now=1.0) is True
+    assert [r["profile"] for r in watcher._last_sessions] == ["feng-family"]
+
+    # An explicit profile (including the agnostic None) is never overwritten.
+    stamped = watcher._attribute_owning_profile(
+        [dict(_watcher_projection_row(), profile=None), {"session_id": "x", "profile": "other"}]
+    )
+    assert [r["profile"] for r in stamped] == [None, "other"]
+
+
+# ── Detail and share must authorize the load they actually use (fix spec #3) ─
+#
+# Both handlers authorized on a metadata-only load and then hydrated the
+# session with a second get_session(metadata_only=False) whose owner was never
+# re-checked. An empty placeholder can be re-tagged to a profile during chat
+# start, so the second load could return another profile's transcript.
+
+
+RETAGGED_SECRET = "message that belongs to the other profile"
+
+
+def _retagging_get_session(first_profile, second_profile, secret=RETAGGED_SECRET):
+    """get_session double whose sidecar is re-tagged between the two loads."""
+
+    def _make(profile, messages):
+        return Session(
+            session_id="placeholder-sid",
+            title="Placeholder",
+            workspace="/tmp",
+            model="test-model",
+            messages=messages,
+            created_at=1.0,
+            updated_at=2.0,
+            profile=profile,
+        )
+
+    def _side_effect(sid, metadata_only=False, **_kwargs):
+        if metadata_only:
+            return _make(first_profile, [])
+        return _make(second_profile, [{"role": "user", "content": secret}])
+
+    return MagicMock(side_effect=_side_effect)
+
+
+def test_detail_load_rechecks_profile_after_the_full_load(monkeypatch):
+    cap = _capture(monkeypatch)
+    mock_get_session = _retagging_get_session("ops", "other")
+
+    parsed = urlparse(
+        "/api/session?session_id=placeholder-sid&messages=1&resolve_model=0"
+    )
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value={}),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+    ):
+        assert routes.handle_get(MagicMock(), parsed) is True
+
+    assert cap["status"] == 409
+    assert cap["data"] == {
+        "error": "Session belongs to a different profile",
+        "code": "session_profile_mismatch",
+        "session_id": "placeholder-sid",
+        "profile": "other",
+    }
+    # Both loads ran; the messages from the second one never reached the client.
+    assert mock_get_session.call_count == 2
+    assert RETAGGED_SECRET not in repr(cap["data"])
+
+
+def test_detail_load_recheck_allows_an_unchanged_owner(monkeypatch):
+    """Negative control: the re-check only denies when ownership actually moved."""
+    cap = _capture(monkeypatch)
+    mock_get_session = _retagging_get_session("ops", "ops")
+
+    parsed = urlparse(
+        "/api/session?session_id=placeholder-sid&messages=1&resolve_model=0"
+    )
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value={}),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+    ):
+        assert routes.handle_get(MagicMock(), parsed) is True
+
+    assert cap.get("error") is None
+    assert cap["status"] == 200
+    assert RETAGGED_SECRET in repr(cap["data"])
+
+
+def test_share_rechecks_profile_after_the_full_load(monkeypatch):
+    mock_get_session = _retagging_get_session("ops", "other")
+    mock_snapshot = MagicMock()
+
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value={}),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes._share_snapshot_messages_for_session", mock_snapshot),
+    ):
+        with pytest.raises(KeyError):
+            routes._resolve_share_session_pair("placeholder-sid", MagicMock())
+
+    assert mock_get_session.call_count == 2
+    # Denied before the share snapshot (and its message load) is built.
+    assert mock_snapshot.call_count == 0
+
+
+def test_share_recheck_allows_an_unchanged_owner(monkeypatch):
+    """Negative control: an owner that did not move still shares."""
+    mock_get_session = _retagging_get_session("ops", "ops")
+    mock_snapshot = MagicMock(return_value=[{"role": "user", "content": RETAGGED_SECRET}])
+
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value={}),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes._share_snapshot_messages_for_session", mock_snapshot),
+    ):
+        snapshot_session, stored_session, _cli_meta = routes._resolve_share_session_pair(
+            "placeholder-sid", MagicMock()
+        )
+
+    assert mock_snapshot.call_count == 1
+    assert stored_session.profile == "ops"
+    assert snapshot_session.messages == [{"role": "user", "content": RETAGGED_SECRET}]
