@@ -577,6 +577,37 @@ def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
     return bool(sources & profile_agnostic_sources)
 
 
+def _is_profile_agnostic_session_id(sid) -> bool:
+    """Identify an out-of-profile external-agent transcript from its id alone.
+
+    ``_is_profile_agnostic_foreign_session`` answers the same question from a
+    *metadata row*, which makes it unusable on its own as an isolation gate:
+    the CLI metadata cache can be cold or stale for a transcript whose JSONL
+    file is already on disk, and a missing row reads as "not agnostic". The
+    message readers have no such blind spot — ``get_cli_session_messages``
+    routes on this very id prefix and scans ``~/.claude/projects`` directly —
+    so a cache-stale isolated deployment could still read a brand-new Claude
+    Code transcript through import / detail synthesis / share.
+
+    The prefix is stamped by ``_claude_code_session_id()`` at scan time, so it
+    is available before any cache lookup. Isolation gates use this predicate;
+    the metadata predicate above keeps owning the *exemption* semantics in
+    normal mode, which must stay evidence-based.
+    """
+    text = str(sid or "").strip()
+    if not text:
+        return False
+    # Mirrors the source set in _is_profile_agnostic_foreign_session: these
+    # stores live outside the Hermes profile tree and mint their own ids.
+    prefixes = {f"{CLAUDE_CODE_SOURCE}_"}
+    try:
+        from api.codex_sessions import CODEX_SOURCE
+        prefixes.add(f"{CODEX_SOURCE}_")
+    except ImportError:
+        pass
+    return any(text.startswith(prefix) for prefix in prefixes)
+
+
 def _scope_rows_to_active_profile(rows, active_profile, *, is_isolated=None):
     """Filter session rows down to what ``active_profile`` may see.
 
@@ -601,6 +632,11 @@ def _scope_rows_to_active_profile(rows, active_profile, *, is_isolated=None):
         matches_profile = _profiles_match(row.get("profile"), active_profile)
         is_agnostic = _is_profile_agnostic_foreign_session(row)
         if is_isolated:
+            # Same id-based rule the detail-load/import/share gates apply, so
+            # an isolated sidebar never lists a row whose detail load 404s
+            # (a stale row can carry a profile and miss the metadata shape).
+            if _is_profile_agnostic_session_id(row.get("session_id")):
+                continue
             if matches_profile and not is_agnostic:
                 scoped.append(row)
         elif matches_profile or is_agnostic:
@@ -5724,6 +5760,11 @@ def _resolve_share_session_pair(sid: str, handler):
     sessions that have not yet created local metadata.
     """
     if _is_isolated_profile_mode():
+        # Decide from the id before touching the sidecar store, the CLI
+        # metadata cache or the JSONL transcript: a stale/cold cache row must
+        # not turn into a readable share payload under isolation.
+        if _is_profile_agnostic_session_id(sid):
+            raise KeyError(sid)
         _raw_meta = _lookup_cli_session_metadata(sid)
         if _is_profile_agnostic_foreign_session(_raw_meta):
             raise KeyError(sid)
@@ -5739,13 +5780,21 @@ def _resolve_share_session_pair(sid: str, handler):
             if _session_requires_cli_metadata_lookup(stored_session)
             else {}
         )
+        _stored_profile = getattr(stored_session, "profile", None) or None
         effective_profile = (
-            (cli_meta or {}).get("profile")
-            or getattr(stored_session, "profile", None)
+            _stored_profile
+            or (cli_meta or {}).get("profile")
             or None
         )
         _check_meta = cli_meta or (stored_session.compact() if hasattr(stored_session, "compact") else {})
-        _is_agnostic = _is_profile_agnostic_foreign_session(_check_meta)
+        # The profile-less exemption exists for rows that belong to NO Hermes
+        # profile. A stored sidecar that names an owner is not such a row, even
+        # when the Claude metadata row it is matched against carries no profile
+        # — honor the stored owner and fall through to the scoping gate below.
+        _is_agnostic = (
+            not _stored_profile
+            and _is_profile_agnostic_foreign_session(_check_meta)
+        )
         if _is_isolated_profile_mode() and _is_agnostic:
             raise KeyError(sid)
         if not _is_agnostic and not _session_visible_to_active_profile(effective_profile, handler):
@@ -13248,6 +13297,14 @@ def _handle_session_get(handler, parsed) -> bool:
     if not sid:
         if _diag: _diag.finish()
         return j(handler, {"error": "session_id is required"}, status=400)
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        # Isolation gate on the id alone, ahead of the sidecar load, the CLI
+        # metadata lookup and every message read below. The metadata-shaped
+        # gates further down treat a missing cache row as "not agnostic", so a
+        # transcript whose JSONL exists but has not been scanned yet would
+        # otherwise synthesize and render under an isolated profile.
+        if _diag: _diag.finish()
+        return bad(handler, "Session not found", 404)
     # ?messages=0 skips the message payload for fast session switching.
     # The frontend uses this when switching conversations in the sidebar
     # (only needs metadata). The full message array is loaded lazily
@@ -13297,7 +13354,14 @@ def _handle_session_get(handler, parsed) -> bool:
         # the CLI lookup path — so a WebUI-native session can never match.
         cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
         _check_meta = cli_meta or (s.compact() if hasattr(s, "compact") else {})
-        _is_agnostic = _is_profile_agnostic_foreign_session(_check_meta)
+        # Known owner wins: the exemption is for rows that belong to no Hermes
+        # profile, so it may only apply when the stored sidecar names none. A
+        # profile-less Claude metadata row must never launder a sidecar that is
+        # owned by another profile past the #5419 409 below.
+        _is_agnostic = (
+            not _session_profile
+            and _is_profile_agnostic_foreign_session(_check_meta)
+        )
         if _is_agnostic and _is_isolated_profile_mode():
             if _diag: _diag.finish()
             return bad(handler, "Session not found", 404)
@@ -29125,6 +29189,12 @@ def _handle_session_import_cli(handler, body):
         return bad(handler, "profile is required for all_profiles import", 400)
 
     if _is_isolated_profile_mode():
+        # Id-first isolation gate: runs before Session.load(), before the CLI
+        # metadata cache is consulted and before any transcript is read, so a
+        # cache-stale Claude Code session cannot be imported (and materialized
+        # as a writable sidecar) under an isolated profile.
+        if _is_profile_agnostic_session_id(sid):
+            return bad(handler, "Session not found in CLI store", 404)
         _initial_cli_meta = _lookup_cli_session_metadata(sid) or _resolve_cli_import_metadata(
             sid,
             requested_profile=requested_profile,

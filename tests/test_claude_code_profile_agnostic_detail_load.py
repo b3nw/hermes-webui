@@ -574,3 +574,310 @@ def test_import_cli_existing_foreign_profile_returns_409_mismatch(monkeypatch):
     assert cap.get("data", {}).get("profile") == "work-profile"
     assert cap.get("data", {}).get("session_id") == "other_sid"
     assert mock_get_msgs.call_count == 0
+
+
+# ── Cache-stale isolation (fix spec #1) ──────────────────────────────────────
+#
+# The isolation gates used to decide "profile-agnostic" from the CLI metadata
+# row, and a MISSING row reads as "not agnostic". The message readers do not
+# share that blind spot: get_cli_session_messages() routes on the
+# ``claude_code_`` id prefix and scans ~/.claude/projects directly. So with a
+# transcript already on disk but not yet in the metadata cache, an isolated
+# deployment could import it (as a writable sidecar), open it, and share it.
+# These pin the id-first gate: 404 with no sidecar load, no metadata-driven
+# synthesis and no transcript read.
+
+
+def _stale_cache_disk_messages():
+    """What the JSONL scanner would return for a transcript not yet cached."""
+    return [
+        {"role": "user", "content": "isolated deployment must never see this"},
+        {"role": "assistant", "content": "leaked reply"},
+    ]
+
+
+def test_isolated_import_rejects_claude_code_when_metadata_cache_is_stale(monkeypatch):
+    cap = _capture(monkeypatch)
+    body = {"session_id": CLAUDE_SID, "profile": "ops"}
+
+    # Cold/stale cache: no row for a transcript whose JSONL already exists.
+    mock_lookup = MagicMock(return_value=None)
+    mock_resolve = MagicMock(return_value={})
+    mock_load = MagicMock(return_value=None)
+    mock_get_msgs = MagicMock(return_value=_stale_cache_disk_messages())
+    mock_import = MagicMock()
+
+    with (
+        patch("api.routes.Session.load", mock_load),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", mock_lookup),
+        patch("api.routes._resolve_cli_import_metadata", mock_resolve),
+        patch("api.routes.get_cli_session_messages", mock_get_msgs),
+        patch("api.routes.import_cli_session", mock_import),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
+    ):
+        assert routes._handle_session_import_cli(handler := MagicMock(), body) is True
+        assert handler is not None
+
+    assert cap["status"] == 404
+    assert cap.get("error") == "Session not found in CLI store"
+    # No sidecar read/mutation and no transcript read on the rejected path.
+    assert mock_load.call_count == 0
+    assert mock_import.call_count == 0
+    assert mock_get_msgs.call_count == 0
+    assert mock_lookup.call_count == 0
+    assert mock_resolve.call_count == 0
+
+
+def test_isolated_detail_load_rejects_claude_code_when_metadata_cache_is_stale(monkeypatch):
+    cap = _capture(monkeypatch)
+
+    mock_get_session = MagicMock(side_effect=KeyError(CLAUDE_SID))
+    mock_lookup = MagicMock(return_value={})
+    mock_synth = MagicMock(return_value=(_synth_for(_claude_code_row()), "not_claimable"))
+    mock_get_msgs = MagicMock(return_value=_stale_cache_disk_messages())
+
+    parsed = urlparse(
+        "/api/session?session_id=%s&messages=1&resolve_model=0" % CLAUDE_SID
+    )
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", mock_lookup),
+        patch("api.routes._claim_or_synthesize_cli_session", mock_synth),
+        patch("api.routes.get_cli_session_messages", mock_get_msgs),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
+    ):
+        assert routes.handle_get(MagicMock(), parsed) is True
+
+    assert cap["status"] == 404
+    assert cap.get("error") == "Session not found"
+    # The gate runs before the sidecar load, the metadata lookup and any
+    # synthesis, so nothing on disk is touched.
+    assert mock_get_session.call_count == 0
+    assert mock_lookup.call_count == 0
+    assert mock_synth.call_count == 0
+    assert mock_get_msgs.call_count == 0
+
+
+def test_isolated_share_rejects_claude_code_when_metadata_cache_is_stale(monkeypatch):
+    mock_get_session = MagicMock(side_effect=KeyError(CLAUDE_SID))
+    mock_lookup = MagicMock(return_value={})
+    mock_synth = MagicMock(return_value=(_synth_for(_claude_code_row()), "not_claimable"))
+
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", mock_lookup),
+        patch("api.routes._claim_or_synthesize_cli_session", mock_synth),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
+    ):
+        with pytest.raises(KeyError):
+            routes._resolve_share_session_pair(CLAUDE_SID, MagicMock())
+
+    assert mock_get_session.call_count == 0
+    assert mock_lookup.call_count == 0
+    assert mock_synth.call_count == 0
+
+
+def test_isolated_sidebar_drops_claude_code_row_that_carries_a_profile():
+    """A stale row with a profile misses the metadata shape — the id still wins."""
+    stale_row = dict(_claude_code_row(), profile="ops", read_only=False)
+    assert routes._is_profile_agnostic_foreign_session(stale_row) is False
+    scoped = routes._scope_rows_to_active_profile(
+        [stale_row, {"session_id": "active-1", "profile": "ops"}],
+        "ops",
+        is_isolated=True,
+    )
+    assert {r["session_id"] for r in scoped} == {"active-1"}
+
+
+def test_profile_agnostic_session_id_predicate(monkeypatch):
+    assert routes._is_profile_agnostic_session_id(CLAUDE_SID) is True
+    assert routes._is_profile_agnostic_session_id("  " + CLAUDE_SID + "  ") is True
+    assert routes._is_profile_agnostic_session_id("claude_code_") is True
+    assert routes._is_profile_agnostic_session_id("20260101_000000_abc123") is False
+    assert routes._is_profile_agnostic_session_id("") is False
+    assert routes._is_profile_agnostic_session_id(None) is False
+
+    # When codex_sessions module is available, codex_ prefix is also recognized
+    import sys
+    import types
+    fake_codex = types.ModuleType("api.codex_sessions")
+    fake_codex.CODEX_SOURCE = "codex"
+    monkeypatch.setitem(sys.modules, "api.codex_sessions", fake_codex)
+    assert routes._is_profile_agnostic_session_id("codex_session_123") is True
+
+
+def test_isolated_rejection_with_real_jsonl_file_and_stale_cache(monkeypatch, tmp_path):
+    """End-to-end regression: real JSONL exists on disk but CLI metadata cache is stale."""
+    import json
+    import api.models as models
+
+    projects_dir = tmp_path / "claude" / "projects"
+    session_file = projects_dir / "proj" / "session.jsonl"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"summary": "Secret Real Session"},
+        {"timestamp": "2026-04-18T12:00:01Z", "message": {"role": "user", "content": [{"type": "text", "text": "secret unread text"}]}},
+    ]
+    session_file.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    sid = models._claude_code_session_id(session_file)
+    assert sid.startswith("claude_code_")
+
+    # Real scanner verifies the transcript exists on disk and is readable
+    disk_msgs = models.get_claude_code_session_messages(sid, projects_dir=projects_dir)
+    assert len(disk_msgs) == 1
+    assert disk_msgs[0]["content"] == "secret unread text"
+
+    cap = _capture(monkeypatch)
+    with (
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=None),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
+    ):
+        # 1. Import returns 404 and does not mutate or read messages
+        assert routes._handle_session_import_cli(MagicMock(), {"session_id": sid, "profile": "ops"}) is True
+        assert cap["status"] == 404
+        assert cap.get("error") == "Session not found in CLI store"
+
+        # 2. Detail load returns 404
+        parsed = urlparse(f"/api/session?session_id={sid}&messages=1&resolve_model=0")
+        assert routes.handle_get(MagicMock(), parsed) is True
+        assert cap["status"] == 404
+        assert cap.get("error") == "Session not found"
+
+        # 3. Share resolution raises KeyError
+        with pytest.raises(KeyError):
+            routes._resolve_share_session_pair(sid, MagicMock())
+
+
+# ── Stored foreign owner outranks a profile-less metadata row (fix spec #2) ──
+#
+# The profile-less exemption ran BEFORE the stored-profile check, so a
+# persisted sidecar owned by `other` matched against a Claude metadata row with
+# no profile was treated as belonging to no profile at all: detail load
+# returned 200 with the transcript instead of the #5419 409, and sharing was
+# allowed.
+
+
+FOREIGN_OWNED_SECRET = "message owned by the other profile"
+
+
+def _foreign_owned_claude_sidecar():
+    return Session(
+        session_id=CLAUDE_SID,
+        title="Imported Claude Code transcript",
+        workspace="/home/user/project",
+        model="claude-code",
+        messages=[{"role": "user", "content": FOREIGN_OWNED_SECRET}],
+        created_at=1.0,
+        updated_at=2.0,
+        profile="other",
+        is_cli_session=True,
+        source_tag="claude_code",
+        raw_source="claude_code",
+        session_source="external_agent",
+        source_label="Claude Code",
+        read_only=True,
+    )
+
+
+@pytest.mark.parametrize("messages", ["0", "1"])
+def test_stored_foreign_owner_beats_profile_less_claude_metadata_on_detail_load(
+    monkeypatch, messages
+):
+    cap = _capture(monkeypatch)
+    stored = _foreign_owned_claude_sidecar()
+    # The Claude metadata row carries no profile — the old exemption fired here.
+    agnostic_meta = _claude_code_row()
+
+    mock_get_session = MagicMock(return_value=stored)
+    parsed = urlparse(
+        "/api/session?session_id=%s&messages=%s&resolve_model=0" % (CLAUDE_SID, messages)
+    )
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=agnostic_meta),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+    ):
+        assert routes.handle_get(MagicMock(), parsed) is True
+
+    assert cap["status"] == 409
+    assert cap["data"] == {
+        "error": "Session belongs to a different profile",
+        "code": "session_profile_mismatch",
+        "session_id": CLAUDE_SID,
+        "profile": "other",
+    }
+    # Never hydrated: the gate rejects on metadata alone.
+    assert mock_get_session.call_count >= 1
+    assert all(
+        call.kwargs.get("metadata_only") is True
+        for call in mock_get_session.call_args_list
+    )
+    assert FOREIGN_OWNED_SECRET not in repr(cap["data"])
+
+
+def test_stored_foreign_owner_beats_profile_less_claude_metadata_on_share(monkeypatch):
+    stored = _foreign_owned_claude_sidecar()
+    mock_get_session = MagicMock(return_value=stored)
+    mock_snapshot = MagicMock()
+
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=_claude_code_row()),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes._share_snapshot_messages_for_session", mock_snapshot),
+    ):
+        with pytest.raises(KeyError):
+            routes._resolve_share_session_pair(CLAUDE_SID, MagicMock())
+
+    # Denied before the share snapshot (and its message load) is built.
+    assert mock_snapshot.call_count == 0
+
+
+def test_stored_active_owner_with_profile_less_claude_metadata_still_loads(monkeypatch):
+    """Negative control: the owner check only denies a FOREIGN owner."""
+    cap = _capture(monkeypatch)
+    stored = _foreign_owned_claude_sidecar()
+    stored.profile = "ops"
+
+    parsed = urlparse(
+        "/api/session?session_id=%s&messages=0&resolve_model=0" % CLAUDE_SID
+    )
+    with (
+        patch("api.routes.get_session", return_value=stored),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=_claude_code_row()),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+    ):
+        assert routes.handle_get(MagicMock(), parsed) is True
+
+    assert cap.get("error") is None
+    assert cap["status"] == 200
+
+
+def test_stored_foreign_owner_beats_active_profile_cli_metadata_on_share(monkeypatch):
+    """Stored foreign sidecar profile='other' outranks conflicting CLI metadata profile='ops'."""
+    stored = _foreign_owned_claude_sidecar()
+    stored.profile = "other"
+    conflicting_meta = dict(_claude_code_row(), profile="ops")
+    mock_get_session = MagicMock(return_value=stored)
+    mock_snapshot = MagicMock()
+
+    with (
+        patch("api.routes.get_session", mock_get_session),
+        patch("api.routes._get_active_profile_name", return_value="ops"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=conflicting_meta),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes._share_snapshot_messages_for_session", mock_snapshot),
+    ):
+        with pytest.raises(KeyError):
+            routes._resolve_share_session_pair(CLAUDE_SID, MagicMock())
+
+    assert mock_snapshot.call_count == 0
