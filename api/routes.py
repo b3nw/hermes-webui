@@ -537,6 +537,20 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     return _profiles_match(session_profile, active_profile)
 
 
+def _profile_agnostic_source_tags() -> frozenset[str]:
+    """Source tags whose transcripts live outside the Hermes profile tree.
+
+    Claude Code transcripts are scanned from ``~/.claude/projects``, which
+    belongs to no Hermes profile. Kept as one named helper so the row predicate
+    and the id predicate below can never disagree about which sources are
+    agnostic; add a tag here (and mint the matching id prefix at scan time)
+    when another out-of-profile store lands. ``CLAUDE_CODE_SOURCE`` is imported
+    further down this module, so the set is built per call rather than bound to
+    a module constant here.
+    """
+    return frozenset({CLAUDE_CODE_SOURCE})
+
+
 def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
     """Return whether a foreign-session row lives outside the Hermes profile tree.
 
@@ -567,14 +581,7 @@ def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
         str(cli_meta.get("raw_source") or "").strip().lower(),
     }
     # Profile-less external-agent rows that live outside the Hermes profile tree.
-    # Claude Code: scanned from ~/.claude/projects; Codex: scanned from ~/.codex/
-    profile_agnostic_sources = {CLAUDE_CODE_SOURCE}
-    try:
-        from api.codex_sessions import CODEX_SOURCE
-        profile_agnostic_sources.add(CODEX_SOURCE)
-    except ImportError:
-        pass
-    return bool(sources & profile_agnostic_sources)
+    return bool(sources & _profile_agnostic_source_tags())
 
 
 def _is_profile_agnostic_session_id(sid) -> bool:
@@ -597,15 +604,9 @@ def _is_profile_agnostic_session_id(sid) -> bool:
     text = str(sid or "").strip()
     if not text:
         return False
-    # Mirrors the source set in _is_profile_agnostic_foreign_session: these
-    # stores live outside the Hermes profile tree and mint their own ids.
-    prefixes = {f"{CLAUDE_CODE_SOURCE}_"}
-    try:
-        from api.codex_sessions import CODEX_SOURCE
-        prefixes.add(f"{CODEX_SOURCE}_")
-    except ImportError:
-        pass
-    return any(text.startswith(prefix) for prefix in prefixes)
+    # Same source set as _is_profile_agnostic_foreign_session: these stores
+    # live outside the Hermes profile tree and mint their own id prefixes.
+    return any(text.startswith(f"{tag}_") for tag in _profile_agnostic_source_tags())
 
 
 def _scope_rows_to_active_profile(rows, active_profile, *, is_isolated=None):
@@ -616,9 +617,9 @@ def _scope_rows_to_active_profile(rows, active_profile, *, is_isolated=None):
     and the live push can never disagree:
 
       * normal mode — a row is visible when it matches the active profile OR
-        it is a profile-agnostic external-agent row (Claude Code / Codex),
-        which belongs to no Hermes profile and must stay reachable under any
-        named profile;
+        it is a profile-agnostic external-agent row (Claude Code), which
+        belongs to no Hermes profile and must stay reachable under any named
+        profile;
       * isolated profile mode — the agnostic passthrough is revoked, because
         those transcripts live outside the pinned profile tree and isolation
         promises the deployment sees nothing but its own profile.
@@ -722,10 +723,23 @@ def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     # Import routes create/claim sessions before normal ownership exists, and
     # chat/start has inline placeholder-retag rules that must run before the
     # generic request-session guard.
+    #
+    # Share create/revoke resolve through ``_resolve_share_session_pair()``,
+    # which owns a STRICTER gate than this one (isolated-mode id rule, the
+    # stored-owner/effective-profile check, and a recheck after hydration) while
+    # keeping a profile-less external-agent transcript reachable from any named
+    # profile. The plain profile match below has no such exemption, and it is
+    # only reached once a sidecar exists: the FIRST share of an unstored Claude
+    # Code transcript passes (``get_session`` raises ``KeyError``) and persists a
+    # ``profile: None`` sidecar, after which every revoke/refresh from the very
+    # profile that created the link 404s — a public share the user cannot take
+    # down. Defer to the resolver instead (#6870).
     return path in {
         "/api/session/import",
         "/api/session/import_cli",
         "/api/chat/start",
+        "/api/share/create",
+        "/api/share/revoke",
     }
 
 
@@ -738,11 +752,25 @@ def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = T
     not found`` only for the unknown/legacy None-profile case so the
     frontend's self-heal (clear stale URL + localStorage) keeps firing
     for actually-missing sids. ``#7710``.
+
+    Isolated profile mode is the exception to that contract: a profile-agnostic
+    external-agent transcript is hidden outright there, so the 409 would leak
+    both its existence and its owning profile name. This guard runs BEFORE the
+    per-endpoint gates (``_load_branch_source_or_refuse``,
+    ``_handle_session_export``), which already answer 404 from the id, so it has
+    to apply the same id rule first or it decides the response for them.
     """
     if not isinstance(sid, str) or not sid:
         return True
     if not is_safe_session_id(sid):
         return True
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        # Decided from the id, before the sidecar store is read: a stale sidecar
+        # that carries some other profile must not answer 409 where the list and
+        # the detail load both answer 404.
+        if emit_error:
+            bad(handler, "Session not found", 404)
+        return False
     try:
         session = get_session(sid, metadata_only=True)
     except KeyError:
@@ -5604,6 +5632,14 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
         KeyError: session not found in any store
         PermissionError: session is read-only (messaging/Claude Code)
     """
+    # Isolated profile mode hides out-of-profile external-agent transcripts
+    # everywhere else (list, detail, import, share), so the read-only refusal
+    # this helper would otherwise raise for one (403 "Read-only imported
+    # sessions cannot be continued" via /api/chat/start) would still confirm the
+    # transcript exists. Decide from the id, before the sidecar store or the CLI
+    # metadata cache is touched, and report it missing like every other gate.
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        raise KeyError(sid)
     try:
         s = get_session(sid)
         s = _ensure_full_session_before_mutation(sid, s)
@@ -5716,19 +5752,34 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     return s
 
 
-def _share_snapshot_messages_for_session(session, *, cli_meta: dict | None = None) -> list:
+def _share_snapshot_messages_for_session(
+    session,
+    *,
+    cli_meta: dict | None = None,
+    effective_profile=None,
+) -> list:
     """Return the visible transcript that a public share should snapshot.
 
     External sessions (Telegram/Discord/Slack/CLI/etc.) may have no WebUI sidecar
     or may persist only local metadata in the sidecar while the transcript lives
     in state.db. Public sharing should snapshot the same visible conversation the
     session page renders, not the bare local sidecar payload.
+
+    ``effective_profile`` is the profile the share gate authorized against
+    (``_share_effective_profile``): a sidecar with no owner inherits the CLI
+    metadata row's profile. Read state.db under that same value — authorizing on
+    the metadata row's profile and then reading with the sidecar's ``None`` would
+    snapshot from the wrong profile database.
     """
     sid = str(getattr(session, "session_id", "") or "").strip()
     current_messages = list(getattr(session, "messages", None) or [])
     if not sid:
         return current_messages
-    profile = getattr(session, "profile", None)
+    profile = (
+        effective_profile
+        if effective_profile is not None
+        else getattr(session, "profile", None)
+    )
     is_messaging = (
         _is_messaging_session_record(session)
         or _is_messaging_session_record(cli_meta)
@@ -5815,22 +5866,31 @@ def _build_share_metadata_sidecar(
     return session
 
 
-def _share_profile_gate_denies(stored_session, cli_meta, handler) -> bool:
-    """Return True when the active profile may not share ``stored_session``.
+def _share_effective_profile(stored_session, cli_meta):
+    """Return the profile share authorizes (and must read state.db) under.
 
-    Wraps ``_session_profile_gate_denial`` with share's effective-profile rule:
-    a stored sidecar without an owner still inherits the CLI metadata row's
-    profile, if that row names one. Share collapses every denial verdict into
-    ``KeyError`` (a 404) rather than distinguishing 409 from 404.
+    A stored sidecar without an owner still inherits the CLI metadata row's
+    profile, if that row names one.
     """
-    stored_profile = getattr(stored_session, "profile", None) or None
-    effective_profile = (
-        stored_profile
+    return (
+        (getattr(stored_session, "profile", None) or None)
         or (cli_meta or {}).get("profile")
         or None
     )
+
+
+def _share_profile_gate_denies(stored_session, cli_meta, handler) -> bool:
+    """Return True when the active profile may not share ``stored_session``.
+
+    Wraps ``_session_profile_gate_denial`` with share's effective-profile rule
+    (``_share_effective_profile``). Share collapses every denial verdict into
+    ``KeyError`` (a 404) rather than distinguishing 409 from 404.
+    """
     return _session_profile_gate_denial(
-        stored_session, cli_meta, handler, effective_profile=effective_profile
+        stored_session,
+        cli_meta,
+        handler,
+        effective_profile=_share_effective_profile(stored_session, cli_meta),
     ) is not None
 
 
@@ -5882,6 +5942,7 @@ def _resolve_share_session_pair(sid: str, handler):
         snapshot_session.messages = _share_snapshot_messages_for_session(
             stored_session,
             cli_meta=cli_meta,
+            effective_profile=_share_effective_profile(stored_session, cli_meta),
         )
         return snapshot_session, stored_session, cli_meta or {}
 
@@ -8942,6 +9003,13 @@ def _normalize_import_profile_value(value):
 
 
 def _load_branch_source_or_refuse(handler, sid: str):
+    # Same existence-disclosure rule as the materialize fallback: under an
+    # isolated profile a hidden external-agent transcript must 404 here instead
+    # of 403ing with "Read-only sessions cannot be branched from WebUI", which
+    # would tell the caller the transcript is on disk.
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        bad(handler, "Session not found", 404)
+        return None
     if _session_is_subagent_view_only(sid):
         bad(handler, "Subagent sessions are view-only and cannot be branched from WebUI", 400)
         return None
@@ -18437,6 +18505,11 @@ def _handle_session_export(handler, parsed):
     sid = parse_qs(parsed.query).get("session_id", [""])[0]
     if not sid:
         return bad(handler, "session_id is required")
+    # Isolated profile mode: decide from the id before the sidecar store is
+    # touched, so a stored claude_code_* sidecar cannot be exported while the
+    # list and detail loads 404 it.
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        return bad(handler, "Session not found", 404)
     try:
         s = get_session(sid)
     except KeyError:
@@ -18539,10 +18612,10 @@ def _handle_sessions_search(handler, parsed):
     all_profiles = _all_profiles_enabled(parsed)
     sessions = all_sessions()
     if not all_profiles:
-        sessions = [
-            s for s in sessions
-            if _profiles_match(s.get("profile"), active_profile)
-        ]
+        # Same rule as the sidebar list and the gateway SSE push: a bare
+        # _profiles_match let an isolated deployment title-search a stored
+        # claude_code_* sidecar that list and detail both 404.
+        sessions = _scope_rows_to_active_profile(sessions, active_profile)
     # Reject a malformed depth instead of letting int() raise ValueError and
     # surface as a confusing 500. Clamp to >= 0 so a negative value can't reach
     # the messages[:depth] slice below — messages[:-n] would silently exclude
@@ -19937,7 +20010,7 @@ def _handle_gateway_sse_stream(handler, parsed):
         # The watcher is profile-blind: it scans every store and broadcasts the
         # full row set. Scope it per connection with the same rule /api/sessions
         # uses, or an isolated-profile deployment would receive foreign and
-        # profile-agnostic (Claude Code / Codex) rows over the stream that the
+        # profile-agnostic (Claude Code) rows over the stream that the
         # sidebar fetch correctly withholds.
         active_profile = _get_active_profile_name()
         is_isolated = _is_isolated_profile_mode()
@@ -19948,7 +20021,7 @@ def _handle_gateway_sse_stream(handler, parsed):
         # after the initial snapshot (#6889). Attribute an unkeyed row to the
         # profile whose database the watcher read. An explicit `profile: None`
         # is left alone — that marks a profile-agnostic external-agent row
-        # (Claude Code / Codex) whose exemption must survive the filter.
+        # (Claude Code) whose exemption must survive the filter.
         _watcher_profile_name = getattr(watcher, 'profile_name', None)
         watcher_profile = (
             _watcher_profile_name.strip()

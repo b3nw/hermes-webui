@@ -692,21 +692,15 @@ def test_isolated_sidebar_drops_claude_code_row_that_carries_a_profile():
     assert {r["session_id"] for r in scoped} == {"active-1"}
 
 
-def test_profile_agnostic_session_id_predicate(monkeypatch):
+def test_profile_agnostic_session_id_predicate():
     assert routes._is_profile_agnostic_session_id(CLAUDE_SID) is True
     assert routes._is_profile_agnostic_session_id("  " + CLAUDE_SID + "  ") is True
     assert routes._is_profile_agnostic_session_id("claude_code_") is True
     assert routes._is_profile_agnostic_session_id("20260101_000000_abc123") is False
     assert routes._is_profile_agnostic_session_id("") is False
     assert routes._is_profile_agnostic_session_id(None) is False
-
-    # When codex_sessions module is available, codex_ prefix is also recognized
-    import sys
-    import types
-    fake_codex = types.ModuleType("api.codex_sessions")
-    fake_codex.CODEX_SOURCE = "codex"
-    monkeypatch.setitem(sys.modules, "api.codex_sessions", fake_codex)
-    assert routes._is_profile_agnostic_session_id("codex_session_123") is True
+    # A non-agnostic store must not be laundered in by a lookalike prefix.
+    assert routes._is_profile_agnostic_session_id("codex_session_123") is False
 
 
 def test_isolated_rejection_with_real_jsonl_file_and_stale_cache(monkeypatch, tmp_path):
@@ -1145,3 +1139,593 @@ def test_share_recheck_allows_an_unchanged_owner(monkeypatch):
     assert mock_snapshot.call_count == 1
     assert stored_session.profile == "ops"
     assert snapshot_session.messages == [{"role": "user", "content": RETAGGED_SECRET}]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Round 5 maintainer review (PR #6889)
+#
+# 1. Share create/revoke ran the GENERIC request guard
+#    (_guard_request_session_visibility -> _session_id_visible_to_request_profile),
+#    a plain profile match with no agnostic exemption, BEFORE the share
+#    resolver. The first share of an unstored Claude Code transcript passed
+#    (get_session raised KeyError) and persisted a `profile: None` sidecar;
+#    every later revoke/refresh from that same profile 404'd, stranding a
+#    public link the user could not take down.
+# 2. Isolated mode answered 403 (read-only) instead of 404 for a hidden
+#    transcript on the materialize + branch paths, revealing its existence.
+# 3. Search and export skipped the isolated id-prefix rule.
+# 4. The share snapshot read state.db under the sidecar's `None` profile while
+#    authorizing on the CLI metadata row's profile.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class _PostHandler:
+    """Minimal stand-in for the BaseHTTPRequestHandler in handle_post()."""
+
+    command = "POST"
+
+    def __init__(self):
+        self.headers = {}
+        self.client_address = ("127.0.0.1", 0)
+
+
+def _stored_claude_code_sidecar(*, profile=None, messages=None):
+    """A persisted WebUI sidecar for a Claude Code transcript.
+
+    Real ``Session`` (not a MagicMock): the share handlers call ``compact()``
+    and ``copy.copy()`` on it. ``save`` is neutered so the test never writes to
+    the sidecar store.
+    """
+    session = Session(
+        session_id=CLAUDE_SID,
+        title="Claude Code transcript",
+        workspace="/home/user/project",
+        model="claude-code",
+        messages=(
+            messages
+            if messages is not None
+            else [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]
+        ),
+        profile=profile,
+        is_cli_session=True,
+        source_tag="claude_code",
+        raw_source="claude_code",
+        session_source="external_agent",
+        source_label="Claude Code",
+        read_only=True,
+    )
+    session.save = lambda **_kwargs: None
+    return session
+
+
+def _patch_share_post(
+    monkeypatch,
+    *,
+    session,
+    cli_meta,
+    active_profile,
+    isolated=False,
+):
+    """Wire handle_post() for a share round trip and return the capture dict."""
+    cap = _capture(monkeypatch)
+    revoked = []
+
+    def _get_session(_sid, metadata_only=False):
+        if session is None:
+            raise KeyError(_sid)
+        return session
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(
+        routes, "_lookup_cli_session_metadata", lambda *_a, **_kw: dict(cli_meta or {})
+    )
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: active_profile)
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: isolated)
+    monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        routes,
+        "create_or_refresh_share",
+        lambda snapshot: {
+            "share_token": "tok-123",
+            "share_created_at": 100.0,
+            "share_updated_at": 100.0,
+            "share_title": getattr(snapshot, "title", ""),
+            "share_message_count": len(getattr(snapshot, "messages", None) or []),
+        },
+    )
+    monkeypatch.setattr(routes, "revoke_share", lambda target: revoked.append(target))
+    cap["revoked"] = revoked
+    return cap
+
+
+def _post(monkeypatch, path, body):
+    monkeypatch.setattr(routes, "read_body", lambda _handler: dict(body))
+    return routes.handle_post(_PostHandler(), urlparse(path))
+
+
+def test_share_create_then_revoke_through_handle_post_under_named_profile(monkeypatch):
+    """The share a named profile creates must stay revocable from that profile.
+
+    Drives the real POST entry point so the generic request-visibility guard
+    runs. Before the fix the guard 404'd both calls (stored sidecar profile is
+    None, active profile is `feng-family`) before `_resolve_share_session_pair`
+    ever ran — and the create only worked the very first time, while no sidecar
+    existed yet, which is exactly how an unrevokable public link was minted.
+    """
+    row = _claude_code_row()
+    session = _stored_claude_code_sidecar()
+    cap = _patch_share_post(
+        monkeypatch, session=session, cli_meta=row, active_profile="feng-family"
+    )
+
+    assert _post(monkeypatch, "/api/share/create", {"session_id": CLAUDE_SID}) is True
+    assert cap.get("error") is None
+    assert cap["status"] == 200
+    assert cap["data"]["share"]["token"] == "tok-123"
+    assert session.share_token == "tok-123"
+
+    assert _post(monkeypatch, "/api/share/revoke", {"session_id": CLAUDE_SID}) is True
+    assert cap.get("error") is None
+    assert cap["status"] == 200
+    assert cap["revoked"] == [session]
+    assert session.share_token is None
+    assert session.share_created_at is None
+    assert cap["data"]["session"]["share_token"] is None
+
+
+def test_share_post_guard_defers_to_the_share_resolver():
+    """The generic request guard is exempt for both share routes."""
+    assert routes._request_session_visibility_exempt("POST", "/api/share/create") is True
+    assert routes._request_session_visibility_exempt("POST", "/api/share/revoke") is True
+    # The exemption is POST-only and path-exact.
+    assert routes._request_session_visibility_exempt("GET", "/api/share/create") is False
+    assert routes._request_session_visibility_exempt("POST", "/api/share") is False
+    assert routes._request_session_visibility_exempt("POST", "/api/session/delete") is False
+
+
+def test_share_create_through_handle_post_still_404s_under_isolation(monkeypatch):
+    """The guard exemption must not open an isolated-mode hole."""
+    row = _claude_code_row()
+    session = _stored_claude_code_sidecar()
+    cap = _patch_share_post(
+        monkeypatch,
+        session=session,
+        cli_meta=row,
+        active_profile="default",
+        isolated=True,
+    )
+
+    assert _post(monkeypatch, "/api/share/create", {"session_id": CLAUDE_SID}) is True
+    assert cap["status"] == 404
+    assert cap["error"] == "Session not found"
+    assert session.share_token is None
+
+
+def test_share_create_through_handle_post_still_404s_for_a_foreign_owner(monkeypatch):
+    """A sidecar owned by another profile stays unshareable after the exemption."""
+    row = _claude_code_row()
+    session = _stored_claude_code_sidecar(profile="other")
+    cap = _patch_share_post(
+        monkeypatch, session=session, cli_meta=row, active_profile="feng-family"
+    )
+
+    assert _post(monkeypatch, "/api/share/create", {"session_id": CLAUDE_SID}) is True
+    assert cap["status"] == 404
+    assert cap["error"] == "Session not found"
+    assert session.share_token is None
+
+
+def test_share_revoke_through_handle_post_still_404s_for_a_foreign_owner(monkeypatch):
+    row = _claude_code_row()
+    session = _stored_claude_code_sidecar(profile="other")
+    session.share_token = "tok-foreign"
+    cap = _patch_share_post(
+        monkeypatch, session=session, cli_meta=row, active_profile="feng-family"
+    )
+
+    assert _post(monkeypatch, "/api/share/revoke", {"session_id": CLAUDE_SID}) is True
+    assert cap["status"] == 404
+    assert cap["error"] == "Session not found"
+    assert cap["revoked"] == []
+    assert session.share_token == "tok-foreign"
+
+
+# ── Item 2: isolated mode must not confirm a hidden transcript exists ───────
+
+
+def test_isolated_materialize_reports_hidden_transcript_missing_not_readonly(monkeypatch):
+    """/api/chat/start 403'd ("read-only imported"), which proves existence."""
+    reads = []
+
+    def _get_session(_sid, metadata_only=False):
+        reads.append(("get_session", _sid))
+        raise KeyError(_sid)
+
+    def _cli_meta(_sid, **_kw):
+        reads.append(("cli_meta", _sid))
+        return _claude_code_row()
+
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", _cli_meta)
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+    with pytest.raises(KeyError):
+        routes._get_or_materialize_session(CLAUDE_SID)
+    # Decided from the id: neither the sidecar store nor the metadata cache
+    # was consulted for a transcript this deployment must not see.
+    assert reads == []
+
+    # Negative control: the same input outside isolation still reports the
+    # read-only refusal (403), so the 404 above is the isolation rule and not a
+    # blanket regression.
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    with pytest.raises(PermissionError):
+        routes._get_or_materialize_session(CLAUDE_SID)
+    assert ("cli_meta", CLAUDE_SID) in reads
+
+
+def test_isolated_branch_reports_hidden_transcript_missing_not_readonly(monkeypatch):
+    """POST /api/session/branch answered 403 for a hidden Claude Code transcript."""
+    cap = _capture(monkeypatch)
+    synth = _synth_for(_claude_code_row())
+
+    def _get_session(_sid, metadata_only=False):
+        raise KeyError(_sid)
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(
+        routes, "_claim_or_synthesize_cli_session", lambda _sid, **_kw: (synth, "not_claimable")
+    )
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "default")
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+    assert _post(monkeypatch, "/api/session/branch", {"session_id": CLAUDE_SID}) is True
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+
+    # Negative control: outside isolation the read-only refusal still applies.
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    assert _post(monkeypatch, "/api/session/branch", {"session_id": CLAUDE_SID}) is True
+    assert cap["status"] == 403
+    assert cap["error"] == "Read-only sessions cannot be branched from WebUI"
+
+
+# ── Item 3: search and export owe the isolated id-prefix rule ───────────────
+
+
+def _search(monkeypatch, *, rows, active_profile, isolated, query="secret"):
+    cap = _capture(monkeypatch)
+    monkeypatch.setattr(routes, "all_sessions", lambda *_a, **_kw: [dict(r) for r in rows])
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: isolated)
+    monkeypatch.setattr(routes, "load_settings", lambda *_a, **_kw: {})
+    import api.profiles as profiles
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: active_profile)
+    routes._handle_sessions_search(
+        _PostHandler(), urlparse(f"/api/sessions/search?q={query}&content=0")
+    )
+    return cap
+
+
+def test_isolated_search_drops_profile_agnostic_rows(monkeypatch):
+    """A stored claude_code_* sidecar was title-searchable under isolation."""
+    row = dict(_claude_code_row(), title="secret claude transcript", profile="default")
+    cap = _search(monkeypatch, rows=[row], active_profile="default", isolated=True)
+    assert cap["data"]["sessions"] == []
+
+
+def test_search_keeps_profile_agnostic_rows_under_a_named_profile(monkeypatch):
+    """Negative control: the sidebar rule also widens search outside isolation."""
+    row = dict(_claude_code_row(), title="secret claude transcript")
+    cap = _search(monkeypatch, rows=[row], active_profile="feng-family", isolated=False)
+    assert [s["session_id"] for s in cap["data"]["sessions"]] == [CLAUDE_SID]
+
+
+def test_search_still_scopes_profile_tagged_rows(monkeypatch):
+    """Negative control: an ordinary row owned by another profile stays hidden."""
+    row = {
+        "session_id": "20260101_000000_abc123",
+        "title": "secret other-profile session",
+        "profile": "other",
+    }
+    cap = _search(monkeypatch, rows=[row], active_profile="feng-family", isolated=False)
+    assert cap["data"]["sessions"] == []
+
+
+def test_isolated_export_404s_profile_agnostic_session(monkeypatch):
+    """A stored claude_code_* sidecar was exportable while detail 404'd it."""
+    cap = _capture(monkeypatch)
+    reads = []
+
+    def _get_session(_sid, metadata_only=False):
+        reads.append(_sid)
+        return _stored_claude_code_sidecar(profile="default")
+
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    assert (
+        routes._handle_session_export(
+            _PostHandler(), urlparse(f"/api/session/export?session_id={CLAUDE_SID}")
+        )
+        is True
+    )
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    # Rejected from the id, before the sidecar store is read.
+    assert reads == []
+
+
+def test_export_still_serves_an_ordinary_session_under_isolation(monkeypatch):
+    """Negative control: the id gate only covers agnostic transcripts."""
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+    assert routes._is_profile_agnostic_session_id("20260101_000000_abc123") is False
+
+
+# ── Item 4: the share snapshot must read the profile it authorized under ────
+
+
+def test_share_snapshot_reads_the_authorized_profile_database(monkeypatch):
+    """Authorizing on cli_meta.profile but reading with session.profile (None)
+    snapshotted from the wrong profile database."""
+    row = dict(_claude_code_row(), profile="feng-family")
+    stored = _stored_claude_code_sidecar(profile=None, messages=[])
+    seen = {}
+
+    def _cli_messages(sid, profile=None, **_kw):
+        seen["sid"] = sid
+        seen["profile"] = profile
+        return [{"role": "user", "content": "from feng-family state.db"}]
+
+    with (
+        patch("api.routes.get_session", return_value=stored),
+        patch("api.routes._get_active_profile_name", return_value="feng-family"),
+        patch("api.routes._lookup_cli_session_metadata", return_value=row),
+        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes.get_cli_session_messages", _cli_messages),
+    ):
+        snapshot, stored_session, cli_meta = routes._resolve_share_session_pair(
+            CLAUDE_SID, MagicMock()
+        )
+
+    assert seen == {"sid": CLAUDE_SID, "profile": "feng-family"}
+    assert snapshot.messages == [{"role": "user", "content": "from feng-family state.db"}]
+    assert stored_session is stored
+    assert cli_meta["profile"] == "feng-family"
+
+
+def test_share_effective_profile_prefers_the_stored_owner():
+    stored = _stored_claude_code_sidecar(profile="ops")
+    assert routes._share_effective_profile(stored, {"profile": "feng-family"}) == "ops"
+    assert routes._share_effective_profile(_stored_claude_code_sidecar(), {"profile": "ops"}) == "ops"
+    assert routes._share_effective_profile(_stored_claude_code_sidecar(), {}) is None
+    assert routes._share_effective_profile(None, None) is None
+
+
+def test_share_snapshot_falls_back_to_the_session_profile(monkeypatch):
+    """Direct callers without an effective profile keep the historical read."""
+    stored = _stored_claude_code_sidecar(profile="ops", messages=[])
+    seen = {}
+
+    def _cli_messages(sid, profile=None, **_kw):
+        seen["profile"] = profile
+        return [{"role": "user", "content": "ops transcript"}]
+
+    monkeypatch.setattr(routes, "get_cli_session_messages", _cli_messages)
+    assert routes._share_snapshot_messages_for_session(stored, cli_meta={}) == [
+        {"role": "user", "content": "ops transcript"}
+    ]
+    assert seen["profile"] == "ops"
+
+
+# ── Shared source-tag registry (one set behind both agnostic predicates) ────
+
+
+def test_profile_agnostic_source_tags_is_claude_code_only():
+    """The speculative Codex arm is gone: api/codex_sessions.py does not exist.
+
+    Both agnostic predicates read this one set, so the row shape and the id
+    prefix can never disagree about which stores sit outside the profile tree.
+    """
+    import sys
+
+    assert "api.codex_sessions" not in sys.modules
+    assert routes._profile_agnostic_source_tags() == frozenset({"claude_code"})
+    assert routes._is_profile_agnostic_session_id("codex_session_123") is False
+    assert (
+        routes._is_profile_agnostic_foreign_session(
+            {
+                "profile": None,
+                "read_only": True,
+                "session_source": "external_agent",
+                "source_tag": "codex",
+                "raw_source": "codex",
+            }
+        )
+        is False
+    )
+    # ...and the tag it does carry still matches the row predicate.
+    assert routes._is_profile_agnostic_foreign_session(_claude_code_row()) is True
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Round 5 review 2: guard ORDER under isolation
+#
+# _guard_request_session_visibility() runs on every /api/ request before the
+# per-endpoint gates. Those gates already answer a non-disclosing 404 from the
+# id under isolation (_load_branch_source_or_refuse, _handle_session_export),
+# but the generic guard reached them first and, for a stored claude_code_*
+# sidecar carrying some OTHER profile, answered 409 session_profile_mismatch —
+# publishing both that the hidden transcript exists and which profile owns it.
+# The guard owes the same id rule, applied before the sidecar store is read.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _guard(monkeypatch, parsed, *, body=None, method="GET", session, isolated, active="ops"):
+    """Run the generic request guard and return (allowed, capture, reads)."""
+    cap = _capture(monkeypatch)
+    reads = []
+
+    def _get_session(_sid, metadata_only=False):
+        reads.append(_sid)
+        if session is None:
+            raise KeyError(_sid)
+        return session
+
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: active)
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: isolated)
+    allowed = routes._guard_request_session_visibility(
+        MagicMock(), parsed, body=body, method=method
+    )
+    return allowed, cap, reads
+
+
+def test_branch_generic_guard_404s_isolated_agnostic_id_instead_of_409(monkeypatch):
+    """POST body session_id: 409 mismatch disclosed the hidden transcript."""
+    allowed, cap, reads = _guard(
+        monkeypatch,
+        urlparse("/api/session/branch"),
+        body={"session_id": CLAUDE_SID},
+        method="POST",
+        session=_stored_claude_code_sidecar(profile="other"),
+        isolated=True,
+    )
+    assert allowed is False
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    assert "code" not in (cap.get("data") or {})
+    # Decided from the id: the sidecar store was never read, so a stale row
+    # cannot leak the owning profile name either.
+    assert reads == []
+
+
+def test_export_generic_guard_404s_isolated_agnostic_id_instead_of_409(monkeypatch):
+    """Query-string session_id on the GET path takes the same rule."""
+    allowed, cap, reads = _guard(
+        monkeypatch,
+        urlparse(f"/api/session/export?session_id={CLAUDE_SID}"),
+        method="GET",
+        session=_stored_claude_code_sidecar(profile="other"),
+        isolated=True,
+    )
+    assert allowed is False
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    assert reads == []
+
+
+def test_isolated_guard_404s_an_agnostic_id_with_no_sidecar_at_all(monkeypatch):
+    """A cold sidecar store must not fall through to the endpoint either."""
+    allowed, cap, _reads = _guard(
+        monkeypatch,
+        urlparse("/api/session/delete"),
+        body={"session_id": CLAUDE_SID},
+        method="POST",
+        session=None,
+        isolated=True,
+    )
+    assert allowed is False
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+
+
+def test_guard_keeps_the_409_contract_outside_isolation(monkeypatch):
+    """Negative control: the id rule is isolation-only.
+
+    Outside isolation a sidecar owned by a known other profile still gets the
+    #5419 409 so the client can offer to switch to that profile.
+    """
+    allowed, cap, reads = _guard(
+        monkeypatch,
+        urlparse("/api/session/branch"),
+        body={"session_id": CLAUDE_SID},
+        method="POST",
+        session=_stored_claude_code_sidecar(profile="other"),
+        isolated=False,
+    )
+    assert allowed is False
+    assert cap["status"] == 409
+    assert cap["data"]["code"] == "session_profile_mismatch"
+    assert cap["data"]["profile"] == "other"
+    assert reads == [CLAUDE_SID]
+
+
+def test_guard_keeps_the_409_contract_for_ordinary_ids_under_isolation(monkeypatch):
+    """Negative control: the id rule does not widen to profile-tree sessions."""
+    ordinary = Session(session_id="20260101_000000_abc123", profile="other")
+    ordinary.save = lambda **_kwargs: None
+    allowed, cap, reads = _guard(
+        monkeypatch,
+        urlparse("/api/session/branch"),
+        body={"session_id": "20260101_000000_abc123"},
+        method="POST",
+        session=ordinary,
+        isolated=True,
+    )
+    assert allowed is False
+    assert cap["status"] == 409
+    assert cap["data"]["code"] == "session_profile_mismatch"
+    assert reads == ["20260101_000000_abc123"]
+
+
+def test_guard_still_admits_a_matching_session_under_isolation(monkeypatch):
+    """Negative control: an in-profile ordinary session is untouched."""
+    ordinary = Session(session_id="20260101_000000_abc123", profile="ops")
+    ordinary.save = lambda **_kwargs: None
+    allowed, cap, _reads = _guard(
+        monkeypatch,
+        urlparse("/api/session/branch"),
+        body={"session_id": "20260101_000000_abc123"},
+        method="POST",
+        session=ordinary,
+        isolated=True,
+    )
+    assert allowed is True
+    assert cap == {}
+
+
+def test_isolated_branch_404s_end_to_end_for_a_foreign_owned_sidecar(monkeypatch):
+    """Full POST stack: guard first, endpoint gate second, one 404 either way."""
+    cap = _capture(monkeypatch)
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda _sid, metadata_only=False: _stored_claude_code_sidecar(profile="other"),
+    )
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    assert _post(monkeypatch, "/api/session/branch", {"session_id": CLAUDE_SID}) is True
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    assert cap.get("data") is None
+
+
+def test_isolated_export_404s_end_to_end_for_a_foreign_owned_sidecar(monkeypatch):
+    """Full GET stack for export: no 409, no transcript."""
+    cap = _capture(monkeypatch)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda _sid, metadata_only=False: _stored_claude_code_sidecar(profile="other"),
+    )
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    allowed = routes._guard_request_session_visibility(
+        MagicMock(),
+        urlparse(f"/api/session/export?session_id={CLAUDE_SID}"),
+        method="GET",
+    )
+    assert allowed is False
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    # And the endpoint itself repeats the verdict if it is ever reached
+    # directly (e.g. a future caller that bypasses the generic guard).
+    assert (
+        routes._handle_session_export(
+            _PostHandler(), urlparse(f"/api/session/export?session_id={CLAUDE_SID}")
+        )
+        is True
+    )
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
