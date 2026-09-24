@@ -8798,6 +8798,12 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
       ``'invalid_sid'``
         ``sid`` failed :func:`is_safe_session_id`.  Callers MUST return 404.
 
+      ``'isolated_hidden'``
+        Isolated profile mode hides out-of-profile external-agent
+        transcripts, so this helper refuses to read one or build a
+        Session from it at all.  ``session`` is ``None``; callers MUST
+        return 404 (they already do, via their ``session is None`` arm).
+
     ``cli_meta`` is an optional pass-through.  Callers that already
     computed ``_lookup_cli_session_metadata(sid)`` (e.g. the GET path
     building a sidebar dict) can pass it in to avoid the redundant
@@ -8809,6 +8815,15 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
     on a missing-sidecar KeyError, so a TUI/Desktop/CLI session can be
     loaded read-only AND continued writeable from the WebUI.
     """
+    # Shared chokepoint for the isolation rule. Every caller already gates the
+    # hidden-transcript case from the id before getting here, but this helper is
+    # the only place that reads the external JSONL and mints a claimable
+    # Session, so the refusal belongs here too: a future
+    # raise-KeyError-then-claim caller must not be able to materialize (and let
+    # its caller persist) an out-of-profile external-agent transcript.
+    if _is_isolated_profile_mode() and _is_profile_agnostic_session_id(sid):
+        return None, "isolated_hidden"
+
     def build_workspace(sid, cli_meta):
         """Coalesce workspace with sane fallbacks so _start_run doesn't
         trip on a missing field. state.db's cwd is the canonical workspace for
@@ -25058,6 +25073,25 @@ def _handle_chat_start(handler, body, diag=None):
                 {"status": "suppressed", "reason": "silent_control_message"},
                 status=200,
             )
+        # Isolation gate on the id alone, ahead of every session lookup, the
+        # CLI metadata cache and the KeyError claim fallback below. It sits
+        # *after* the [SILENT] suppression above because that sentinel is an
+        # unconditional control-plane no-op: it never reaches a lookup or a
+        # mutation, so there is no hidden transcript for isolation to protect
+        # and answering 404 would regress the documented 200 contract.
+        # _get_or_materialize_session() hides an out-of-profile external-agent
+        # transcript by raising KeyError, and the fallback treats KeyError as
+        # "no WebUI sidecar exists" and calls _claim_or_synthesize_cli_session()
+        # — which reads the Claude Code JSONL and hands back a Session the
+        # handler then .save()s. With a stored read_only=True sidecar present
+        # that would overwrite it (read_only cleared, original messages lost)
+        # while still answering 404, so the hiding rule has to be decided here
+        # rather than inside the helper the fallback catches.
+        if (
+            _is_isolated_profile_mode()
+            and _is_profile_agnostic_session_id(body.get("session_id"))
+        ):
+            return bad(handler, "Session not found", 404)
         if body.get("regenerate") is True:
             from api.runtime_adapter import runtime_adapter_runner_enabled
 

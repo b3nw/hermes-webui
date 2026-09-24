@@ -15,6 +15,7 @@ profile-tagged foreign rows stay fully scoped (the #5419 409 contract).
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
@@ -1729,3 +1730,372 @@ def test_isolated_export_404s_end_to_end_for_a_foreign_owned_sidecar(monkeypatch
         is True
     )
     assert (cap["error"], cap["status"]) == ("Session not found", 404)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Round 6 maintainer review (PR #6889)
+#
+# The item-2 fix made `_get_or_materialize_session()` raise KeyError for an
+# isolated profile-agnostic id. POST /api/chat/start catches exactly that
+# KeyError and reads it as "no WebUI sidecar exists", so it fell through to
+# `_claim_or_synthesize_cli_session()` — which reads the Claude Code JSONL and
+# returns a claimable Session the handler then `.save()`s. With a stored
+# read_only=True sidecar on disk and a cold/stale CLI metadata cache the
+# request still answered 404, but the sidecar was rewritten: read_only cleared
+# and the original message replaced by the external transcript. The isolation
+# rule has to be decided before that fallback can run.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+STORED_SIDECAR_MESSAGE = "sidecar message that must survive the 404"
+HIDDEN_TRANSCRIPT_TEXT = "isolated deployment must never read this"
+
+
+def _real_claude_code_transcript(tmp_path, monkeypatch):
+    """Write a real Claude Code JSONL and return its scanner-derived sid."""
+    import json
+    import api.models as models
+
+    projects_dir = tmp_path / "claude" / "projects"
+    session_file = projects_dir / "proj" / "session.jsonl"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"summary": "Hidden Claude Code transcript"},
+        {
+            "timestamp": "2026-04-18T12:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": HIDDEN_TRANSCRIPT_TEXT}],
+            },
+        },
+    ]
+    session_file.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    sid = models._claude_code_session_id(session_file)
+    assert sid.startswith("claude_code_")
+    # The transcript really is readable from disk, so a 404 below is the
+    # isolation rule and not a missing file.
+    disk_msgs = models.get_claude_code_session_messages(sid, projects_dir=projects_dir)
+    assert [m["content"] for m in disk_msgs] == [HIDDEN_TRANSCRIPT_TEXT]
+    return sid
+
+
+def _stored_read_only_sidecar_on_disk(tmp_path, monkeypatch, sid):
+    """Persist a real read_only=True sidecar and return (path, bytes)."""
+    import api.models as models
+
+    session_dir = tmp_path / "webui-sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    models.SESSIONS.pop(sid, None)
+
+    sidecar = Session(
+        session_id=sid,
+        title="Claude Code transcript",
+        workspace="/home/user/project",
+        model="claude-code",
+        messages=[{"role": "user", "content": STORED_SIDECAR_MESSAGE}],
+        profile=None,
+        is_cli_session=True,
+        source_tag="claude_code",
+        raw_source="claude_code",
+        session_source="external_agent",
+        source_label="Claude Code",
+        read_only=True,
+    )
+    sidecar.save()
+    path = session_dir / f"{sid}.json"
+    assert path.exists()
+    return path, path.read_bytes()
+
+
+def test_isolated_chat_start_404s_without_claiming_the_read_only_sidecar(
+    monkeypatch, tmp_path
+):
+    """POST /api/chat/start must not rewrite a hidden transcript's sidecar.
+
+    Isolated named profile + a real ``claude_code_*`` JSONL on disk + a cold
+    (stale) CLI metadata cache + a stored ``read_only=True`` sidecar. Before the
+    fix the response was a correct 404 while the fallback claimed the session:
+    the sidecar came back ``read_only=False`` with the external transcript in
+    place of its own message.
+    """
+    import api.models as models
+
+    sid = _real_claude_code_transcript(tmp_path, monkeypatch)
+    sidecar_path, sidecar_bytes = _stored_read_only_sidecar_on_disk(
+        tmp_path, monkeypatch, sid
+    )
+
+    cap = _capture(monkeypatch)
+    calls = {"transcript_reads": 0, "claims": 0, "runs": 0, "sidecar_loads": 0}
+
+    def _get_session(_sid, metadata_only=False):
+        calls["sidecar_loads"] += 1
+        loaded = models.Session.load(_sid)
+        if loaded is None:
+            raise KeyError(_sid)
+        return loaded
+
+    def _get_cli_session_messages(_sid, *_a, **_kw):
+        calls["transcript_reads"] += 1
+        return models.get_claude_code_session_messages(_sid)
+
+    _real_claim = routes._claim_or_synthesize_cli_session
+
+    def _counting_claim(_sid, **kwargs):
+        calls["claims"] += 1
+        return _real_claim(_sid, **kwargs)
+
+    def _unexpected_run(*_a, **_kw):
+        calls["runs"] += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "get_session", _get_session)
+    monkeypatch.setattr(routes, "get_cli_session_messages", _get_cli_session_messages)
+    monkeypatch.setattr(routes, "_claim_or_synthesize_cli_session", _counting_claim)
+    monkeypatch.setattr(routes, "_start_chat_stream_for_session", _unexpected_run)
+    # Cold/stale metadata cache: the JSONL is on disk but was never scanned, so
+    # the metadata-shaped gates read it as "not a profile-agnostic row".
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda *_a, **_kw: {})
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    assert (
+        _post(
+            monkeypatch,
+            "/api/chat/start",
+            {"session_id": sid, "message": "continue this hidden transcript"},
+        )
+        is True
+    )
+
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    assert cap.get("data") is None
+    # The stored sidecar is untouched, byte for byte.
+    assert sidecar_path.read_bytes() == sidecar_bytes
+    reloaded = models.Session.load(sid)
+    assert reloaded.read_only is True
+    assert reloaded.messages == [{"role": "user", "content": STORED_SIDECAR_MESSAGE}]
+    # Decided from the id: no transcript read, no claim, no run.
+    assert calls == {
+        "transcript_reads": 0,
+        "claims": 0,
+        "runs": 0,
+        "sidecar_loads": 0,
+    }
+
+
+def test_isolated_claim_helper_refuses_a_hidden_transcript(monkeypatch, tmp_path):
+    """Chokepoint guard: the claim helper itself never materializes a hidden id.
+
+    Every current caller gates the id before reaching the helper; this pins the
+    refusal at the one place that reads the external JSONL, so a future
+    raise-KeyError-then-claim caller cannot reopen the same hole.
+    """
+    import api.models as models
+
+    sid = _real_claude_code_transcript(tmp_path, monkeypatch)
+    reads = []
+
+    monkeypatch.setattr(
+        routes,
+        "get_cli_session_messages",
+        lambda _sid, *_a, **_kw: reads.append(_sid)
+        or models.get_claude_code_session_messages(_sid),
+    )
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda *_a, **_kw: {})
+
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+    assert routes._claim_or_synthesize_cli_session(sid) == (None, "isolated_hidden")
+    assert reads == []
+
+    # Negative control: outside isolation the same input still materializes,
+    # so the refusal above is the isolation rule and not a blanket regression.
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: False)
+    synth, reason = routes._claim_or_synthesize_cli_session(sid)
+    assert reason == "materialized"
+    assert synth is not None
+    assert reads == [sid]
+
+
+def test_chat_start_still_claims_a_non_agnostic_session_under_isolation(
+    monkeypatch, tmp_path
+):
+    """Negative control: the KeyError claim path is intact for ordinary ids.
+
+    Same isolated named profile, but an in-profile id: the new gate keys on the
+    profile-agnostic id prefix only, so the TUI/Desktop claim contract (#4911)
+    still reaches ``_claim_or_synthesize_cli_session()`` and persists its
+    sidecar.
+    """
+    import api.models as models
+
+    session_dir = tmp_path / "webui-sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+
+    cap = _capture(monkeypatch)
+    claimed = Session(
+        session_id="20260101_000000_abc123",
+        title="TUI session",
+        workspace=os.path.expanduser("~"),
+        model="unknown",
+        messages=[{"role": "user", "content": "from the TUI"}],
+        profile="ops",
+        is_cli_session=True,
+        source_tag="tui",
+        raw_source="tui",
+    )
+    started = []
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda _sid, metadata_only=False: (_ for _ in ()).throw(KeyError(_sid)),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_claim_or_synthesize_cli_session",
+        lambda _sid, **_kw: (claimed, "materialized"),
+    )
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+    monkeypatch.setattr(
+        routes,
+        "_start_chat_stream_for_session",
+        lambda *_a, **_kw: started.append(True) or {"ok": True, "stream_id": "s1"},
+    )
+
+    assert (
+        _post(
+            monkeypatch,
+            "/api/chat/start",
+            {"session_id": claimed.session_id, "message": "hello"},
+        )
+        is True
+    )
+    assert cap.get("error") is None
+    assert (session_dir / f"{claimed.session_id}.json").exists()
+    assert started == [True]
+
+
+def test_isolated_chat_start_still_suppresses_a_silent_control_message(
+    monkeypatch, tmp_path
+):
+    """`[SILENT]` stays an unconditional 200 no-op, even for a hidden id.
+
+    The sentinel is control-plane traffic, not conversation: `tests/
+    test_silent_control_suppression.py` pins it as suppressed *before* any
+    session lookup or pending-state mutation. Ordering the isolation gate ahead
+    of that check turned an isolated `claude_code_*` POST into a 404, which a
+    wake relay reads as "session is gone" instead of "delivery suppressed".
+    Since suppression returns before any lookup, there is no hidden transcript
+    left for the isolation rule to protect here.
+    """
+    import api.models as models
+
+    sid = _real_claude_code_transcript(tmp_path, monkeypatch)
+    sidecar_path, sidecar_bytes = _stored_read_only_sidecar_on_disk(
+        tmp_path, monkeypatch, sid
+    )
+
+    cap = _capture(monkeypatch)
+    calls = {"transcript_reads": 0, "claims": 0, "runs": 0, "sidecar_loads": 0}
+
+    def _unexpected_lookup(_sid, metadata_only=False):
+        calls["sidecar_loads"] += 1
+        raise AssertionError("[SILENT] must be suppressed before session lookup")
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "get_session", _unexpected_lookup)
+    monkeypatch.setattr(
+        routes,
+        "get_cli_session_messages",
+        lambda *_a, **_kw: calls.__setitem__(
+            "transcript_reads", calls["transcript_reads"] + 1
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_claim_or_synthesize_cli_session",
+        lambda *_a, **_kw: calls.__setitem__("claims", calls["claims"] + 1),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_start_chat_stream_for_session",
+        lambda *_a, **_kw: calls.__setitem__("runs", calls["runs"] + 1),
+    )
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda *_a, **_kw: {})
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    assert (
+        _post(monkeypatch, "/api/chat/start", {"session_id": sid, "message": "  [SILENT]\n"})
+        is True
+    )
+
+    assert cap.get("error") is None, (
+        "the [SILENT] sentinel must stay a 200 no-op under isolation, not 404"
+    )
+    assert cap["status"] == 200
+    assert cap["data"] == {
+        "status": "suppressed",
+        "reason": "silent_control_message",
+    }
+    # Suppressed means nothing was read, claimed, run or written.
+    assert calls == {
+        "transcript_reads": 0,
+        "claims": 0,
+        "runs": 0,
+        "sidecar_loads": 0,
+    }
+    assert sidecar_path.read_bytes() == sidecar_bytes
+    reloaded = models.Session.load(sid)
+    assert reloaded.read_only is True
+    assert reloaded.messages == [{"role": "user", "content": STORED_SIDECAR_MESSAGE}]
+
+
+def test_isolated_chat_start_404s_a_non_sentinel_message_that_merely_contains_silent(
+    monkeypatch, tmp_path
+):
+    """Negative control: only the exact sentinel escapes the isolation gate.
+
+    `_is_silent_control_message` matches exact, case-sensitive, whitespace-
+    stripped `[SILENT]`. Ordinary text that merely mentions it is conversation
+    content, so the hidden-transcript rule still applies and answers 404.
+    """
+    sid = _real_claude_code_transcript(tmp_path, monkeypatch)
+    _stored_read_only_sidecar_on_disk(tmp_path, monkeypatch, sid)
+
+    cap = _capture(monkeypatch)
+
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda _sid, metadata_only=False: (_ for _ in ()).throw(
+            AssertionError("isolated hidden id must 404 before session lookup")
+        ),
+    )
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda *_a, **_kw: {})
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "ops")
+    monkeypatch.setattr(routes, "_is_isolated_profile_mode", lambda: True)
+
+    assert (
+        _post(
+            monkeypatch,
+            "/api/chat/start",
+            {"session_id": sid, "message": "why did you emit [SILENT] earlier?"},
+        )
+        is True
+    )
+    assert (cap["error"], cap["status"]) == ("Session not found", 404)
+    assert cap.get("data") is None
