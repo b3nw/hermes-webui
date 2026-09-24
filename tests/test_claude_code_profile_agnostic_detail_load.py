@@ -18,6 +18,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
+import pytest
+
 import api.routes as routes
 from api.models import Session
 
@@ -292,6 +294,44 @@ def test_isolated_profile_mode_blocks_stored_claude_code_detail_load(monkeypatch
     assert cap.get("error") == "Session not found"
 
 
+@pytest.mark.parametrize("messages", ["0", "1"])
+def test_isolated_profile_mode_stored_foreign_profile_returns_409(
+    monkeypatch, messages
+):
+    sid = "stored_other_profile"
+    stored = Session(
+        session_id=sid,
+        title="Other profile session",
+        workspace="/tmp",
+        model="test-model",
+        messages=[],
+        created_at=1.0,
+        updated_at=2.0,
+        profile="other-profile",
+    )
+    cap = _capture(monkeypatch)
+
+    with (
+        patch("api.routes.get_session", return_value=stored),
+        patch("api.routes._get_active_profile_name", return_value="feng-family"),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
+    ):
+        assert routes.handle_get(
+            MagicMock(),
+            urlparse(
+                f"/api/session?session_id={sid}&messages={messages}&resolve_model=0"
+            ),
+        ) is True
+
+    assert cap["status"] == 409
+    assert cap["data"] == {
+        "error": "Session belongs to a different profile",
+        "code": "session_profile_mismatch",
+        "session_id": sid,
+        "profile": "other-profile",
+    }
+
+
 def test_isolated_profile_mode_filters_gateway_sse_snapshot():
     claude_row = _claude_code_row()
     active_row = {"session_id": "active-1", "profile": "feng-family"}
@@ -524,7 +564,7 @@ def test_import_cli_existing_foreign_profile_returns_409_mismatch(monkeypatch):
         patch("api.routes.Session.load", return_value=existing),
         patch("api.routes._get_active_profile_name", return_value="default"),
         patch("api.routes._lookup_cli_session_metadata", return_value=None),
-        patch("api.routes._is_isolated_profile_mode", return_value=False),
+        patch("api.routes._is_isolated_profile_mode", return_value=True),
         patch("api.routes.get_cli_session_messages", mock_get_msgs),
     ):
         assert routes._handle_session_import_cli(handler, body) is True

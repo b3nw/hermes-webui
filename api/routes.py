@@ -13305,9 +13305,6 @@ def _handle_session_get(handler, parsed) -> bool:
             if _session_profile:
                 # Valid session owned by a KNOWN other profile: 409 so the
                 # client can offer to switch to it (#5419).
-                if _is_isolated_profile_mode():
-                    if _diag: _diag.finish()
-                    return bad(handler, "Session not found", 404)
                 if _diag: _diag.finish()
                 return j(handler, {
                     "error": "Session belongs to a different profile",
