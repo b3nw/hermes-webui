@@ -38,6 +38,22 @@ DELEGATION_BODY = "\n".join(
     ]
 )
 
+# Single envelope: the goal (prose, unbounded length) headlines the summary.
+SINGLE_LONG_GOAL_BODY = "\n".join(
+    [
+        "[ASYNC DELEGATION COMPLETE \u2014 deleg_abc123]",
+        "A background subagent you dispatched earlier has finished.",
+        "",
+        "Dispatched: 2026-08-29 17:42:24 (2m ago)",
+        "Original goal: Audit every nginx vhost on the edge proxies for stale upstreams, "
+        "missing HSTS headers and duplicated server_name entries, then summarize",
+        "Role: leaf   Model: m",
+        "Status: completed   API calls: 4   Duration: 12.5s",
+        "--- RESULT ---",
+        "All clear.",
+    ]
+)
+
 
 def _extract_func(name: str) -> str:
     start = UI_JS.find(f"function {name}")
@@ -69,8 +85,11 @@ def _fixture_script() -> str:
             # Grammar constants the parser/card helpers close over.
             _extract_const("_ASYNC_DELEGATION_WAKEUP_HEADER_RE"),
             _extract_const("_ASYNC_DELEGATION_CHIP_CLASS"),
-            _extract_func("_asyncDelegationBatchStatus"),
+            _extract_const("_ASYNC_DELEGATION_BATCH_UNIT_RE"),
+            _extract_func("_asyncDelegationBatchUnitCount"),
+            _extract_func("_asyncDelegationBatchOutcome"),
             _extract_func("_asyncDelegationSingleStatus"),
+            _extract_func("_asyncDelegationSingleGoal"),
             _extract_func("_parseProcessWakeupBody"),
             _extract_func("_processWakeupInfo"),
             _extract_func("_processWakeupCardHtml"),
@@ -173,6 +192,17 @@ def test_delegation_card_fits_narrow_viewport_and_stays_collapsed():
     """The async-delegation variant swaps the command slot for a delegation id
     and an aggregate chip; it must obey the same narrow-viewport contract."""
     m = _measure(390, renderer="__renderDelegationCard", arg=DELEGATION_BODY)
+    assert m["summaryScrollWidth"] <= m["summaryClientWidth"] + 1, m
+    assert m["summaryClientWidth"] <= m["cardClientWidth"] + 1, m
+    assert m["docScrollWidth"] <= m["docClientWidth"] + 1, m
+    assert m["summaryHeight"] >= 44, m
+    assert m["cardOpen"] is False, m
+
+
+def test_single_delegation_long_goal_headline_fits_narrow_viewport():
+    """The goal headline is unbounded prose; it must truncate in the slot the
+    delegation id used, not push the chip off a 390px card."""
+    m = _measure(390, renderer="__renderDelegationCard", arg=SINGLE_LONG_GOAL_BODY)
     assert m["summaryScrollWidth"] <= m["summaryClientWidth"] + 1, m
     assert m["summaryClientWidth"] <= m["cardClientWidth"] + 1, m
     assert m["docScrollWidth"] <= m["docClientWidth"] + 1, m

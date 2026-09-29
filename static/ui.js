@@ -16491,35 +16491,70 @@ function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualW
   return true;
 }
 
+// The unit's task count sits on the formatter-owned intro line directly under
+// the batch header, ahead of any subagent-controlled text. Two shapes ship:
+// the original "A background fan-out of N subagent(s) …" and the grouped
+// "A background fan-out unit you dispatched earlier — [group 'g' (]N
+// subagent(s)[)] — has finished; …". The group name is caller-supplied, so the
+// greedy `[^\n]*` backtracks to the LAST `' (N subagent(s)) — has finished;`
+// on the line, which is the formatter's own. Zero (a crash with no goals)
+// reads as unknown.
+const _ASYNC_DELEGATION_BATCH_UNIT_RE=/^\[ASYNC DELEGATION BATCH COMPLETE — [^\n\]]+\]\nA background fan-out (?:of (\d+) subagent\(s\) you dispatched earlier|unit you dispatched earlier — (?:group '[^\n]*' \((\d+) subagent\(s\)\)|(\d+) subagent\(s\)) — has finished;)/;
+function _asyncDelegationBatchUnitCount(body){
+  const m=String(body||'').match(_ASYNC_DELEGATION_BATCH_UNIT_RE);
+  const n=m?Number(m[1]||m[2]||m[3]):0;
+  return n>0?n:null;
+}
 // Aggregate one batch envelope's outcome from the formatter's per-task marker
 // lines ONLY. The formatter emits exactly one `--- <icon> TASK i/n …` line per
-// task, numbered 1..n against a constant n; requiring that exact sequence
-// means a marker forged inside subagent-controlled goal/summary prose breaks
-// it and the outcome falls back to neutral rather than being misreported.
-// `(status=…)` fragments are never scanned: they also appear verbatim inside
-// goal text.
-function _asyncDelegationBatchStatus(body){
+// task in this unit, in ascending index order against a constant n (the whole
+// call's size, so a group unit's indices may skip). The outcome is accepted
+// only when that holds AND the marker count equals the unit's task count (from
+// the intro line, else n): a marker forged inside subagent-controlled
+// goal/summary prose breaks it and the outcome falls back to neutral rather
+// than being misreported. `(status=…)` fragments are never scanned: they also
+// appear verbatim inside goal text.
+// `total` is the headline task count and is independent of the outcome: the
+// intro-line count when present, else the markers' n when every marker agrees
+// on it, else null. `ok` is null whenever the sequence is unprovable so the
+// chip never shows a split it cannot back.
+function _asyncDelegationBatchOutcome(body){
   const s=String(body||'');
+  const unitCount=_asyncDelegationBatchUnitCount(s);
   const re=/^--- ([✓✗⚠]) TASK (\d+)\/(\d+)[:\s]/gm;
-  let m,seen=0,ok=0,err=0,total=null,sequenceIntact=true;
+  let m,seen=0,ok=0,err=0,n=null,last=0,nConstant=true,sequenceIntact=true;
   while((m=re.exec(s))!==null){
     seen++;
     const index=Number(m[2]),count=Number(m[3]);
-    if(total===null) total=count;
-    if(count!==total||index!==seen) sequenceIntact=false;
+    if(n===null) n=count;
+    if(count!==n) nConstant=false;
+    if(index<=last||index<1||index>count) sequenceIntact=false;
+    last=index;
     // A ⚠ (truncated) task counts toward neither, so a batch containing one
     // can never report all-ok or all-error and settles on 'partial'.
     if(m[1]==='✓') ok++; else if(m[1]==='✗') err++;
   }
+  const total=unitCount!=null?unitCount:((nConstant&&n>0)?n:null);
   if(seen===0){
     // Whole-batch crash: the formatter writes `--- ERROR ---` directly after
     // its `Role: …` line when the fan-out failed before any task reported.
-    return /\nRole: [^\n]*\n--- ERROR ---\n/.test(s)?'error':'complete';
+    const status=/\nRole: [^\n]*\n--- ERROR ---\n/.test(s)?'error':'complete';
+    return {status,total,ok:null};
   }
-  if(!sequenceIntact||seen!==total) return 'complete';
-  if(err===total) return 'error';
-  if(ok===total) return 'completed';
-  return 'partial';
+  if(!nConstant||!sequenceIntact||total===null||seen!==total) return {status:'complete',total,ok:null};
+  const status=err===total?'error':(ok===total?'completed':'partial');
+  return {status,total,ok};
+}
+// The single envelope's goal sits at a fixed, formatter-owned position: the
+// header, one intro line, a blank line, the optional `Dispatched:` line, then
+// `Original goal:`. Anchoring there (not scanning for the label) keeps an
+// `Original goal:` line inside later context/result text from becoming the
+// headline. Only the first goal line headlines; the full goal stays in the
+// expanded body.
+function _asyncDelegationSingleGoal(body){
+  const m=String(body||'').match(/^\[ASYNC DELEGATION COMPLETE — [^\n\]]+\]\n[^\n]*\n\n(?:Dispatched: [^\n]*\n)?Original goal: ([^\n]*)/);
+  const goal=m?m[1].trim():'';
+  return goal||null;
 }
 // The single-envelope status line is framed by the formatter between its
 // `Role: …` line and the `--- RESULT ---` separator. Matching the whole frame
@@ -16560,15 +16595,21 @@ function _parseProcessWakeupBody(text){
   // belong to one formatter-owned block — so the body rides through verbatim
   // and the expanded detail stays byte-for-byte the raw notice.
   m=s.match(_ASYNC_DELEGATION_WAKEUP_HEADER_RE);
-  if(m) return {
-    type:'async_delegation',
-    taskId:m[2],
-    status:m[1]==='BATCH'?_asyncDelegationBatchStatus(s):_asyncDelegationSingleStatus(s),
-    command:null,
-    exitCode:null,
-    pattern:null,
-    output:s,
-  };
+  if(m){
+    const batch=m[1]==='BATCH'?_asyncDelegationBatchOutcome(s):null;
+    return {
+      type:'async_delegation',
+      taskId:m[2],
+      status:batch?batch.status:_asyncDelegationSingleStatus(s),
+      goal:batch?null:_asyncDelegationSingleGoal(s),
+      taskCount:batch?batch.total:null,
+      okCount:batch?batch.ok:null,
+      command:null,
+      exitCode:null,
+      pattern:null,
+      output:s,
+    };
+  }
   return null;
 }
 // Server-stamped _wakeup_meta (authoritative when present) merged over the
@@ -16591,6 +16632,9 @@ function _processWakeupInfo(m, text){
     // Aggregate delegation outcome: parse-only, because the server never
     // stamps a meta for the async_delegation grammar.
     status:parsed&&parsed.status?parsed.status:null,
+    goal:parsed&&parsed.goal?parsed.goal:null,
+    taskCount:parsed&&parsed.taskCount!=null?parsed.taskCount:null,
+    okCount:parsed&&parsed.okCount!=null?parsed.okCount:null,
     output:parsed?parsed.output:null,
   };
 }
@@ -16613,7 +16657,12 @@ function _processWakeupCardHtml(info, rawText, extras){
     // The neutral bucket keys off `…_unknown`, not `…_complete`: a fail-closed
     // chip must never read like the `…_completed` success chip.
     const labelKey='async_delegation_status_'+(status==='complete'?'unknown':status);
-    chip=`<span class="process-wakeup-chip ${cls}">${icon}<span>${esc(t(labelKey))}</span></span>`;
+    // A partial batch names its split ("1 of 2 ok") when the parser proved the
+    // counts; otherwise the bare "partial" label.
+    const label=(status==='partial'&&info.taskCount!=null&&info.okCount!=null)
+      ? t('async_delegation_status_partial_count',info.okCount,info.taskCount)
+      : t(labelKey);
+    chip=`<span class="process-wakeup-chip ${cls}">${icon}<span>${esc(label)}</span></span>`;
   }else if(isWatch){
     chip=`<span class="process-wakeup-chip watch" title="${esc(t('process_wakeup_matched'))}">${li('eye',11)}<code title="${esc(String(info.pattern||''))}">${esc(String(info.pattern||''))}</code></span>`;
   }else{
@@ -16632,11 +16681,16 @@ function _processWakeupCardHtml(info, rawText, extras){
   // wrapping value in the expanded detail so touch/keyboard users can read it
   // without relying on a hover tooltip (#6350 review finding 4).
   const patternRow=(isWatch&&info.pattern)?`<div class="process-wakeup-pattern-row"><span class="process-wakeup-detail-key">${esc(t('process_wakeup_matched'))}</span><code>${esc(String(info.pattern))}</code></div>`:'';
-  // A delegation has no command; the delegation id takes the same collapsed
-  // slot so the summary still says WHICH fan-out reported, and repeats in the
-  // detail where it can wrap.
+  // A delegation has no command; its headline takes the same collapsed slot:
+  // the goal for a single envelope, "N tasks" for a batch. The opaque id lives
+  // in the expanded detail, and headlines the summary only when neither is
+  // knowable (goal unparsed, task count unknown), so the row still says WHICH
+  // fan-out reported.
   const delegationId=(isDelegation&&info.taskId)?String(info.taskId):'';
-  const delegationHtml=delegationId?`<code class="process-wakeup-cmd" title="${esc(delegationId)}">${esc(delegationId)}</code>`:'';
+  const headline=!isDelegation?'':(info.goal?String(info.goal):(info.taskCount!=null?t('async_delegation_task_count',info.taskCount):''));
+  const delegationHtml=headline
+    ? `<span class="process-wakeup-cmd process-wakeup-headline" title="${esc(headline)}">${esc(headline)}</span>`
+    : (delegationId?`<code class="process-wakeup-cmd" title="${esc(delegationId)}">${esc(delegationId)}</code>`:'');
   const delegationRow=delegationId?`<div class="process-wakeup-cmd-row"><span class="process-wakeup-detail-key">${esc(t('async_delegation_id'))}</span><code>${esc(delegationId)}</code></div>`:'';
   const labelHtml=isDelegation
     ? `${li('bot',13)}<span>${esc(t('async_delegation_label'))}</span>`

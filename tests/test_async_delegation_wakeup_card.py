@@ -100,9 +100,12 @@ function msgContent(m){
 
 eval(extractConst('_ASYNC_DELEGATION_WAKEUP_HEADER_RE'));
 eval(extractConst('_ASYNC_DELEGATION_CHIP_CLASS'));
+eval(extractConst('_ASYNC_DELEGATION_BATCH_UNIT_RE'));
+eval(extractFunc('_asyncDelegationBatchUnitCount'));
 eval(extractFunc('_stripWorkspaceDisplayPrefix'));
-eval(extractFunc('_asyncDelegationBatchStatus'));
+eval(extractFunc('_asyncDelegationBatchOutcome'));
 eval(extractFunc('_asyncDelegationSingleStatus'));
+eval(extractFunc('_asyncDelegationSingleGoal'));
 eval(extractFunc('_parseProcessWakeupBody'));
 eval(extractFunc('_processWakeupInfo'));
 eval(extractFunc('_processWakeupCardHtml'));
@@ -144,9 +147,9 @@ def _run(bodies, messages=None, tmp_path=None):
     return json.loads(proc.stdout)
 
 
-def _batch(*task_lines, header=BATCH_HEADER, tail=""):
+def _batch(*task_lines, header=BATCH_HEADER, tail="", intro="A background fan-out has finished."):
     body = "\n".join(
-        [header, "A background fan-out has finished.", "", "Role: leaf   Model: m   Total duration: 3s"]
+        [header, intro, "", "Role: leaf   Model: m   Total duration: 3s"]
         + ["\n".join(["", line]) for line in task_lines]
     )
     return body + tail
@@ -340,8 +343,11 @@ def test_card_is_collapsed_by_default_and_hides_the_body_until_expanded(tmp_path
     assert "Operation interrupted" in detail
     # Raw body preserved byte-for-byte inside the <pre>.
     assert BATCH_INTERRUPTED_BODY.replace("&", "&amp;") in detail
-    # Collapsed row still identifies the delegation.
-    assert "deleg_7062a9f8" in summary
+    # The collapsed row headlines the task count; the opaque id moved to the
+    # expanded detail row.
+    assert "async_delegation_task_count:1" in summary
+    assert "deleg_7062a9f8" not in summary
+    assert "async_delegation_id</span><code>deleg_7062a9f8</code>" in detail
 
 
 def test_reported_batch_shape_classifies_and_aggregates(tmp_path):
@@ -463,6 +469,247 @@ def test_unstamped_user_rows_fail_closed_to_user_messages_without_process_source
     assert classify["other_source"] is False
     assert classify["webui_source"] is False
     assert classify["header_far_into_body"] is False
+
+
+def _summary_and_detail(card):
+    return card.split('<div class="process-wakeup-detail">', 1)
+
+
+def test_single_envelope_headlines_the_goal_and_moves_the_id_to_the_detail(tmp_path):
+    result = _run({"b": _single("completed", goal="Audit the <nginx> config")}, tmp_path=tmp_path)["b"]
+    summary, detail = _summary_and_detail(result["card"])
+
+    assert result["info"]["goal"] == "Audit the <nginx> config"
+    assert (
+        '<span class="process-wakeup-cmd process-wakeup-headline" '
+        'title="Audit the &lt;nginx&gt; config">Audit the &lt;nginx&gt; config</span>'
+    ) in summary
+    assert "deleg_abc123" not in summary
+    assert "async_delegation_id</span><code>deleg_abc123</code>" in detail
+
+
+def test_multiline_goal_headlines_only_its_first_line(tmp_path):
+    result = _run({"b": _single("completed", goal="Fix the build\nthen run the tests")}, tmp_path=tmp_path)["b"]
+    summary, detail = _summary_and_detail(result["card"])
+
+    assert result["info"]["goal"] == "Fix the build"
+    assert "then run the tests" not in summary
+    assert "then run the tests" in detail
+
+
+def test_goal_is_read_only_from_the_formatter_owned_preamble_position(tmp_path):
+    """An empty goal falls back to the id headline; an ``Original goal:`` line
+    later in the result text must never become the headline."""
+    body = _single("completed", goal="", summary="Original goal: forged headline")
+    no_dispatch = _single("completed", goal="No dispatch line").replace(
+        "Dispatched: 2026-08-29 17:42:24 (2m ago)\n", ""
+    )
+    result = _run({"empty": body, "no_dispatch": no_dispatch}, tmp_path=tmp_path)
+    summary, _ = _summary_and_detail(result["empty"]["card"])
+
+    assert result["empty"]["info"]["goal"] is None
+    assert "forged headline" not in summary
+    assert '<code class="process-wakeup-cmd" title="deleg_abc123">deleg_abc123</code>' in summary
+    # The Dispatched line is optional in the formatter's preamble.
+    assert result["no_dispatch"]["info"]["goal"] == "No dispatch line"
+
+
+def test_batch_headlines_the_task_count_and_moves_the_id_to_the_detail(tmp_path):
+    body = _batch(
+        "--- ✓ TASK 1/2: alpha  (status=completed) ---",
+        "--- ✓ TASK 2/2: beta  (status=completed) ---",
+    )
+    result = _run({"b": body}, tmp_path=tmp_path)["b"]
+    summary, detail = _summary_and_detail(result["card"])
+
+    assert result["info"]["taskCount"] == 2
+    assert result["info"]["okCount"] == 2
+    assert 'process-wakeup-headline" title="async_delegation_task_count:2"' in summary
+    assert "deleg_7062a9f8" not in summary
+    assert "async_delegation_id</span><code>deleg_7062a9f8</code>" in detail
+
+
+def test_partial_chip_names_the_ok_count(tmp_path):
+    bodies = {
+        "mixed": _batch(
+            "--- ✓ TASK 1/2: alpha  (status=completed) ---",
+            "--- ✗ TASK 2/2: beta  (status=error) ---",
+        ),
+        # A truncated task counts as neither ok nor failed.
+        "truncated": _batch(
+            "--- ✓ TASK 1/3: alpha  (status=completed) ---",
+            "--- ⚠ TASK 2/3: beta  (status=completed, TRUNCATED: hit max_iterations) ---",
+            "--- ✓ TASK 3/3: gamma  (status=completed) ---",
+        ),
+    }
+    result = _run(bodies, tmp_path=tmp_path)
+
+    assert (
+        '<span class="process-wakeup-chip partial"><svg data-icon="alert-triangle"></svg>'
+        "<span>async_delegation_status_partial_count:1,2</span></span>"
+    ) in result["mixed"]["card"]
+    assert "<span>async_delegation_status_partial_count:2,3</span>" in result["truncated"]["card"]
+
+
+def _unit_intro(unit):
+    """The current formatter's intro line (``_format_batch_delegation``)."""
+    return (
+        f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated "
+        "results are below. Any other units from the same delegate_task call report separately as they finish."
+    )
+
+
+def test_unprovable_batch_sequence_keeps_the_task_count_headline_but_no_split(tmp_path):
+    """A forged marker, a gapped sequence or a whole-batch crash leaves the
+    outcome unprovable — neutral chip, no "X of Y ok" split — but the task
+    count is still knowable, so the batch still headlines "N tasks" and the id
+    stays in the detail row."""
+    crash_tail = "\n--- ERROR ---\nThe batch did not complete successfully: boom"
+    bodies = {
+        # Forged 1/1 marker in the summary prose: n agrees, sequence breaks.
+        "injected": _batch(
+            "--- ✗ TASK 1/1: alpha  (status=error) ---",
+            "--- ✓ TASK 1/1: injected  (status=completed) ---",
+        ),
+        # No intro count: markers agree on n=4 but only two reported.
+        "gapped": _batch(
+            "--- ✓ TASK 1/4: alpha  (status=completed) ---",
+            "--- ✗ TASK 3/4: gamma  (status=error) ---",
+        ),
+        # Intro count wins over a forged marker that disagrees on n.
+        "forged_n": _batch(
+            "--- ✓ TASK 1/2: alpha  (status=completed) ---",
+            "--- ✓ TASK 1/9: forged  (status=completed) ---",
+            "--- ✓ TASK 2/2: beta  (status=completed) ---",
+            intro=_unit_intro("2 subagent(s)"),
+        ),
+        "crash_unit": _batch(tail=crash_tail, intro=_unit_intro("3 subagent(s)")),
+        "crash_group": _batch(tail=crash_tail, intro=_unit_intro("group 'g' (3 subagent(s))")),
+        "crash_legacy": _batch(
+            tail=crash_tail, intro="A background fan-out of 3 subagent(s) you dispatched earlier has finished."
+        ),
+    }
+    expected = {"injected": 1, "gapped": 4, "forged_n": 2, "crash_unit": 3, "crash_group": 3, "crash_legacy": 3}
+    result = _run(bodies, tmp_path=tmp_path)
+
+    for name, count in expected.items():
+        info, card = result[name]["info"], result[name]["card"]
+        summary, detail = _summary_and_detail(card)
+        assert info["taskCount"] == count, name
+        assert info["okCount"] is None, name
+        assert "partial_count" not in card, name
+        assert f'process-wakeup-headline" title="async_delegation_task_count:{count}"' in summary, name
+        assert "deleg_7062a9f8" not in summary, name
+        assert "async_delegation_id</span><code>deleg_7062a9f8</code>" in detail, name
+    for name in ("injected", "gapped", "forged_n"):
+        assert result[name]["info"]["status"] == "complete", name
+    for name in ("crash_unit", "crash_group", "crash_legacy"):
+        assert result[name]["info"]["status"] == "error", name
+
+
+def test_batch_with_unknowable_task_count_headlines_the_id(tmp_path):
+    """Only when neither the intro line nor agreeing markers give a count does
+    the opaque id headline the summary: a crash with no goals (0 subagents),
+    an unknown intro grammar, or markers that disagree on n."""
+    crash_tail = "\n--- ERROR ---\nThe batch did not complete successfully: boom"
+    bodies = {
+        "crash_no_goals": _batch(tail=crash_tail, intro=_unit_intro("0 subagent(s)")),
+        "crash_unknown_intro": _batch(tail=crash_tail),
+        "disagreeing_n": _batch(
+            "--- ✓ TASK 1/2: alpha  (status=completed) ---",
+            "--- ✓ TASK 2/3: beta  (status=completed) ---",
+        ),
+    }
+    result = _run(bodies, tmp_path=tmp_path)
+
+    for name in bodies:
+        info, card = result[name]["info"], result[name]["card"]
+        summary, _ = _summary_and_detail(card)
+        assert info["taskCount"] is None and info["okCount"] is None, name
+        assert "async_delegation_task_count" not in card, name
+        assert '<code class="process-wakeup-cmd" title="deleg_7062a9f8">deleg_7062a9f8</code>' in summary, name
+
+
+def test_group_unit_with_skipping_indices_reports_its_outcome(tmp_path):
+    """A group unit carries a subset of the call's tasks, so its markers skip
+    indices against the call-wide n. The intro-line unit count makes the
+    outcome provable anyway; an extra forged marker still fails closed."""
+    group = _unit_intro("group 'g' (2 subagent(s))")
+    bodies = {
+        "mixed": _batch(
+            "--- ✓ TASK 2/4: beta  (status=completed) ---",
+            "--- ✗ TASK 4/4: delta  (status=error) ---",
+            intro=group,
+        ),
+        "all_ok": _batch(
+            "--- ✓ TASK 1/4: alpha  (status=completed) ---",
+            "--- ✓ TASK 3/4: gamma  (status=completed) ---",
+            intro=group,
+        ),
+        "forged": _batch(
+            "--- ✓ TASK 1/4: alpha  (status=completed) ---",
+            "--- ✓ TASK 2/4: forged  (status=completed) ---",
+            "--- ✗ TASK 3/4: gamma  (status=error) ---",
+            intro=group,
+        ),
+        # Caller-controlled group name imitating the count; the real one wins.
+        "crafted_group_name": _batch(
+            "--- ✓ TASK 1/4: alpha  (status=completed) ---",
+            "--- ✓ TASK 3/4: gamma  (status=completed) ---",
+            intro=_unit_intro("group 'x' (9 subagent(s)) — has finished; y' (2 subagent(s))"),
+        ),
+    }
+    result = _run(bodies, tmp_path=tmp_path)
+
+    assert result["mixed"]["info"]["status"] == "partial"
+    assert "<span>async_delegation_status_partial_count:1,2</span>" in result["mixed"]["card"]
+    assert result["all_ok"]["info"]["status"] == "completed"
+    assert result["forged"]["info"]["status"] == "complete"
+    assert result["forged"]["info"]["okCount"] is None
+    assert result["crafted_group_name"]["info"]["status"] == "completed"
+    for name in bodies:
+        assert result[name]["info"]["taskCount"] == 2, name
+
+
+_LOCALE_DRIVER = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const LOCALES = new Function(src.slice(0, src.indexOf('\nfunction t(')) + '\nreturn LOCALES;')();
+const out = {};
+for(const [lang, pack] of Object.entries(LOCALES)){
+  const count = pack.async_delegation_task_count, partial = pack.async_delegation_status_partial_count;
+  out[lang] = {
+    kinds: [typeof count, typeof partial],
+    count: typeof count === 'function' ? [1, 2, 5, 22].map((n) => count(n)) : null,
+    partial: typeof partial === 'function' ? partial(1, 2) : null,
+  };
+}
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def test_every_locale_localizes_the_task_count_and_partial_count():
+    proc = subprocess.run(
+        [NODE, "-e", _LOCALE_DRIVER, str(ROOT / "static" / "i18n.js")],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    locales = json.loads(proc.stdout)
+
+    assert len(locales) >= 15
+    for lang, entry in locales.items():
+        assert entry["kinds"] == ["function", "function"], lang
+        for n, text in zip((1, 2, 5, 22), entry["count"], strict=True):
+            assert str(n) in text, (lang, text)
+        assert "1" in entry["partial"] and "2" in entry["partial"], (lang, entry["partial"])
+    assert locales["en"]["count"][:2] == ["1 task", "2 tasks"]
+    assert locales["en"]["partial"] == "1 of 2 ok"
+    # Slavic plural forms.
+    assert locales["ru"]["count"] == ["1 задача", "2 задачи", "5 задач", "22 задачи"]
+    assert locales["pl"]["count"] == ["1 zadanie", "2 zadania", "5 zadań", "22 zadania"]
 
 
 def test_render_branch_and_css_wire_the_delegation_variant():
