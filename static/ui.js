@@ -17183,7 +17183,11 @@ function renderMessages(options){
         noticeClass+=' process-wakeup-notice-card';
         const exitStr=wakeupInfo.exitCode==null?'':String(wakeupInfo.exitCode);
         if(wakeupInfo.type==='completion'&&/^-?\d+$/.test(exitStr)&&exitStr!=='0') noticeClass+=' process-wakeup-fail';
-        if(wakeupInfo.type==='async_delegation'&&wakeupInfo.status==='error') noticeClass+=' process-wakeup-fail';
+        if(wakeupInfo.type==='async_delegation'){
+          noticeClass+=' process-wakeup-delegation';
+          if(wakeupInfo.status==='error') noticeClass+=' process-wakeup-fail';
+          else if(wakeupInfo.status==='partial') noticeClass+=' process-wakeup-partial';
+        }
         noticeInnerHtml=_processWakeupCardHtml(wakeupInfo, processText, {timeHtml, filesHtml, footHtml:`<div class="msg-foot"><span class="msg-actions">${copyBtn}</span></div>`});
       }else{
         const processTextHtml=processText?`<pre class="process-wakeup-text">${esc(processText)}</pre>`:'';
