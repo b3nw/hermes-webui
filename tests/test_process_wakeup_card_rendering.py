@@ -74,6 +74,7 @@ eval(extractConst('_ASYNC_DELEGATION_CHIP_CLASS'));
 eval(extractConst('_ASYNC_DELEGATION_BATCH_UNIT_RE'));
 eval(extractFunc('_asyncDelegationBatchUnitCount'));
 eval(extractFunc('_asyncDelegationBatchOutcome'));
+eval(extractFunc('_asyncDelegationBatchCrashed'));
 eval(extractFunc('_asyncDelegationSingleStatus'));
 eval(extractFunc('_asyncDelegationSingleGoal'));
 eval(extractFunc('_parseProcessWakeupBody'));

@@ -88,6 +88,7 @@ def _fixture_script() -> str:
             _extract_const("_ASYNC_DELEGATION_BATCH_UNIT_RE"),
             _extract_func("_asyncDelegationBatchUnitCount"),
             _extract_func("_asyncDelegationBatchOutcome"),
+            _extract_func("_asyncDelegationBatchCrashed"),
             _extract_func("_asyncDelegationSingleStatus"),
             _extract_func("_asyncDelegationSingleGoal"),
             _extract_func("_parseProcessWakeupBody"),

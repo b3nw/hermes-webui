@@ -17285,14 +17285,24 @@ function _asyncDelegationBatchOutcome(body){
   }
   const total=unitCount!=null?unitCount:((nConstant&&n>0)?n:null);
   if(seen===0){
-    // Whole-batch crash: the formatter writes `--- ERROR ---` directly after
-    // its `Role: …` line when the fan-out failed before any task reported.
-    const status=/\nRole: [^\n]*\n--- ERROR ---\n/.test(s)?'error':'complete';
-    return {status,total,ok:null};
+    return {status:_asyncDelegationBatchCrashed(s)?'error':'complete',total,ok:null};
   }
   if(!nConstant||!sequenceIntact||total===null||seen!==total) return {status:'complete',total,ok:null};
   const status=err===total?'error':(ok===total?'completed':'partial');
   return {status,total,ok};
+}
+// Whole-batch crash: the formatter ends the body with its `--- ERROR ---`
+// block when the fan-out failed before any task reported. It sits directly
+// under the `Role: …` line, or — when an owner-died recovery set
+// `last_known_status` — after the recovery diagnostics, which open with
+// `Last persisted unit status:` and carry verbatim transcript tails framed by
+// `--- last lines of task i transcript ---` … `--- end ---`. Those tails are
+// subagent-controlled, so only the LAST error block counts, and one followed
+// by a tail's `--- end ---` was forged inside a tail and reads neutral.
+function _asyncDelegationBatchCrashed(s){
+  const at=s.lastIndexOf('\n--- ERROR ---\nThe batch did not complete successfully: ');
+  if(at<0||s.slice(at).includes('\n--- end ---')) return false;
+  return /\nRole: [^\n]*\n(?:Last persisted unit status: [^\n]*\n[\s\S]*)?$/.test(s.slice(0,at+1));
 }
 // The single envelope's goal sits at a fixed, formatter-owned position: the
 // header, one intro line, a blank line, the optional `Dispatched:` line, then
@@ -17306,23 +17316,21 @@ function _asyncDelegationSingleGoal(body){
   return goal||null;
 }
 // The single-envelope status line is framed by the formatter as
-// `Status: <s>   API calls: …` directly followed by the `--- RESULT ---`
-// separator. It is NOT anchored on the preceding `Role: …` line: the formatter
-// may insert a notice block (blank line + `⚠ SUBAGENT MODEL REJECTED …`)
-// between the two. Matching the whole frame (not a bare `Status:` line) keeps
-// a crafted status line inside the goal or context text from deciding the
-// chip — but the goal/context block PRECEDES the real frame, so a subagent
-// that forges a complete frame there would win a first-match scan. Fail closed
-// instead, the same rule the batch path applies to its task-marker sequence:
-// scan every frame and accept the status only when there is EXACTLY ONE. Zero
-// frames (unknown grammar) or two-or-more (at least one is forged, and which
-// is unprovable) settle on neutral 'complete'. The trailing separator is a
-// lookahead so two adjacent frames both match.
+// `Role: …   Model: …`, `Status: <s>   API calls: …`, then the
+// `--- RESULT ---` separator. The only thing the formatter puts between Role:
+// and Status: is the optional model-rejection notice (blank line +
+// `⚠ SUBAGENT MODEL REJECTED …` and its fixed follow-up lines). The goal and
+// context are emitted verbatim BEFORE Role:, so a `Status:` + `--- RESULT ---`
+// pair forged there is not anchored on Role: and is ignored. A forgery that
+// also fakes the Role: line still fails closed: the status is accepted only
+// when EXACTLY ONE anchored frame exists; zero (unknown grammar) or two-or-more
+// (which one is real is unprovable) settle on neutral 'complete'. The trailing
+// separator is a lookahead so adjacent frames both match.
 // A truncated run (iteration cap) is reported `completed` with a
 // `[TRUNCATED: …]` suffix on the same line; like a ⚠ batch task it is neither
 // ok nor error, so it settles on 'partial'.
 function _asyncDelegationSingleStatus(body){
-  const re=/\nStatus: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
+  const re=/\nRole: [^\n]*   Model: [^\n]*\n(?:\n⚠ SUBAGENT MODEL REJECTED: [^\n]*\nEvery task in this batch failed for this reason before doing any work\.\nCheck Settings → [^\n]*\n(?:No fallback chain is configured, so no failover was attempted\.\n)?)?Status: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
   let m,seen=0,found='',rest='';
   while((m=re.exec(String(body||'')))!==null){ seen++; found=m[1]; rest=m[2]; }
   if(seen!==1) return 'complete';
