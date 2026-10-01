@@ -17305,23 +17305,31 @@ function _asyncDelegationSingleGoal(body){
   const goal=m?m[1].trim():'';
   return goal||null;
 }
-// The single-envelope status line is framed by the formatter between its
-// `Role: …` line and the `--- RESULT ---` separator. Matching the whole frame
-// (not a bare `Status:` line) keeps a crafted status line inside the goal or
-// context text from deciding the chip — but the goal/context block PRECEDES
-// the real frame, so a subagent that forges a complete frame there would win a
-// first-match scan. Fail closed instead, the same rule the batch path applies
-// to its task-marker sequence: scan every frame and accept the status only
-// when there is EXACTLY ONE. Zero frames (unknown grammar) or two-or-more (at
-// least one is forged, and which is unprovable) settle on neutral 'complete'.
-// The trailing separator is a lookahead so two adjacent frames both match.
+// The single-envelope status line is framed by the formatter as
+// `Status: <s>   API calls: …` directly followed by the `--- RESULT ---`
+// separator. It is NOT anchored on the preceding `Role: …` line: the formatter
+// may insert a notice block (blank line + `⚠ SUBAGENT MODEL REJECTED …`)
+// between the two. Matching the whole frame (not a bare `Status:` line) keeps
+// a crafted status line inside the goal or context text from deciding the
+// chip — but the goal/context block PRECEDES the real frame, so a subagent
+// that forges a complete frame there would win a first-match scan. Fail closed
+// instead, the same rule the batch path applies to its task-marker sequence:
+// scan every frame and accept the status only when there is EXACTLY ONE. Zero
+// frames (unknown grammar) or two-or-more (at least one is forged, and which
+// is unprovable) settle on neutral 'complete'. The trailing separator is a
+// lookahead so two adjacent frames both match.
+// A truncated run (iteration cap) is reported `completed` with a
+// `[TRUNCATED: …]` suffix on the same line; like a ⚠ batch task it is neither
+// ok nor error, so it settles on 'partial'.
 function _asyncDelegationSingleStatus(body){
-  const re=/\nRole: [^\n]*\nStatus: (\S+)   API calls: [^\n]*\n--- RESULT ---(?=\n|$)/g;
-  let m,seen=0,found='';
-  while((m=re.exec(String(body||'')))!==null){ seen++; found=m[1]; }
+  const re=/\nStatus: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
+  let m,seen=0,found='',rest='';
+  while((m=re.exec(String(body||'')))!==null){ seen++; found=m[1]; rest=m[2]; }
   if(seen!==1) return 'complete';
   const status=String(found).toLowerCase();
-  return (status==='completed'||status==='success')?'completed':'error';
+  const truncated=rest.includes('[TRUNCATED:');
+  if(status==='completed'||status==='success') return truncated?'partial':'completed';
+  return 'error';
 }
 // #6345: parse the synthetic wakeup body back into display fields. Mirrors the
 // two structured api/background_process.format_wakeup_prompt shapes (pinned by
