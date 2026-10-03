@@ -17310,8 +17310,9 @@ function _asyncDelegationBatchCrashed(s){
 // `Original goal:` line inside later context/result text from becoming the
 // headline. Only the first goal line headlines; the full goal stays in the
 // expanded body.
+const _ASYNC_DELEGATION_SINGLE_GOAL_RE=/^\[ASYNC DELEGATION COMPLETE — [^\n\]]+\]\n[^\n]*\n\n(?:Dispatched: [^\n]*\n)?Original goal: ([^\n]*)/;
 function _asyncDelegationSingleGoal(body){
-  const m=String(body||'').match(/^\[ASYNC DELEGATION COMPLETE — [^\n\]]+\]\n[^\n]*\n\n(?:Dispatched: [^\n]*\n)?Original goal: ([^\n]*)/);
+  const m=String(body||'').match(_ASYNC_DELEGATION_SINGLE_GOAL_RE);
   const goal=m?m[1].trim():'';
   return goal||null;
 }
@@ -17319,25 +17320,33 @@ function _asyncDelegationSingleGoal(body){
 // `Role: …   Model: …`, `Status: <s>   API calls: …`, then the
 // `--- RESULT ---` separator. The only thing the formatter puts between Role:
 // and Status: is the optional model-rejection notice (blank line +
-// `⚠ SUBAGENT MODEL REJECTED …` and its fixed follow-up lines). The goal and
-// context are emitted verbatim BEFORE Role:, so a `Status:` + `--- RESULT ---`
-// pair forged there is not anchored on Role: and is ignored. A forgery that
-// also fakes the Role: line still fails closed: the status is accepted only
-// when EXACTLY ONE anchored frame exists; zero (unknown grammar) or two-or-more
-// (which one is real is unprovable) settle on neutral 'complete'. The trailing
-// separator is a lookahead so adjacent frames both match.
+// `⚠ SUBAGENT MODEL REJECTED …` and its fixed follow-up lines). The scan
+// starts at the goal's fixed position (unknown grammar reads neutral), so a
+// frame forged on the `Original goal:` line is skipped, and a `Status:` +
+// `--- RESULT ---` pair not anchored on a Role: line is ignored. The FIRST
+// anchored frame is the formatter's; everything after its `--- RESULT ---`
+// is result/summary text, so a frame quoted there (forged success in a
+// failure's error or partial output, or a failure echoed by a success
+// summary) never changes the outcome. Goal/context text on LATER lines is
+// emitted verbatim before Role: with no delimiter, so a Role:-anchored frame
+// forged there cannot be told apart from the real one by the body alone.
 // A truncated run (iteration cap) is reported `completed` with a
 // `[TRUNCATED: …]` suffix on the same line; like a ⚠ batch task it is neither
 // ok nor error, so it settles on 'partial'.
-function _asyncDelegationSingleStatus(body){
-  const re=/\nRole: [^\n]*   Model: [^\n]*\n(?:\n⚠ SUBAGENT MODEL REJECTED: [^\n]*\nEvery task in this batch failed for this reason before doing any work\.\nCheck Settings → [^\n]*\n(?:No fallback chain is configured, so no failover was attempted\.\n)?)?Status: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
-  let m,seen=0,found='',rest='';
-  while((m=re.exec(String(body||'')))!==null){ seen++; found=m[1]; rest=m[2]; }
-  if(seen!==1) return 'complete';
-  const status=String(found).toLowerCase();
-  const truncated=rest.includes('[TRUNCATED:');
-  if(status==='completed'||status==='success') return truncated?'partial':'completed';
+function _asyncDelegationSingleFrameOutcome(status, rest){
+  const s=String(status).toLowerCase();
+  if(s==='completed'||s==='success') return rest.includes('[TRUNCATED:')?'partial':'completed';
   return 'error';
+}
+function _asyncDelegationSingleStatus(body){
+  const s=String(body||'');
+  const anchor=s.match(_ASYNC_DELEGATION_SINGLE_GOAL_RE);
+  if(!anchor) return 'complete';
+  const re=/\nRole: [^\n]*   Model: [^\n]*\n(?:\n⚠ SUBAGENT MODEL REJECTED: [^\n]*\nEvery task in this batch failed for this reason before doing any work\.\nCheck Settings → [^\n]*\n(?:No fallback chain is configured, so no failover was attempted\.\n)?)?Status: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
+  re.lastIndex=anchor[0].length;
+  const m=re.exec(s);
+  if(!m) return 'complete';
+  return _asyncDelegationSingleFrameOutcome(m[1],m[2]);
 }
 // #6345: parse the synthetic wakeup body back into display fields. Mirrors the
 // two structured api/background_process.format_wakeup_prompt shapes (pinned by

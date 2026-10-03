@@ -72,9 +72,11 @@ function extractConst(name){
 eval(extractConst('_ASYNC_DELEGATION_WAKEUP_HEADER_RE'));
 eval(extractConst('_ASYNC_DELEGATION_CHIP_CLASS'));
 eval(extractConst('_ASYNC_DELEGATION_BATCH_UNIT_RE'));
+eval(extractConst('_ASYNC_DELEGATION_SINGLE_GOAL_RE'));
 eval(extractFunc('_asyncDelegationBatchUnitCount'));
 eval(extractFunc('_asyncDelegationBatchOutcome'));
 eval(extractFunc('_asyncDelegationBatchCrashed'));
+eval(extractFunc('_asyncDelegationSingleFrameOutcome'));
 eval(extractFunc('_asyncDelegationSingleStatus'));
 eval(extractFunc('_asyncDelegationSingleGoal'));
 eval(extractFunc('_parseProcessWakeupBody'));
