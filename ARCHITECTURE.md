@@ -66,7 +66,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, readiness detection
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
       startup.py           Startup helpers: auto_install_agent_deps()
-      state_sync.py        /insights sync — message_count to the agent's state.db
+      state_sync.py        state.db bridge — opt-in /insights usage/title sync; always mirrors the session workspace into sessions.cwd
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
@@ -540,6 +540,26 @@ name and the global registry slot, which belong to the process profile.
 Status and inventory stay passive: they never start or probe an MCP server. Ledger key
 helpers resolve to Hermes Agent's `tools.mcp_tool_scope` when present so the key shape
 has one owner; the local fallbacks only cover Agents that predate that module.
+
+#### MCP configuration writes
+
+MCP create/update, toggle and delete are separate from Agent runtime ownership.
+Each edit resolves the existing `_get_config_path()` once under `_cfg_lock`,
+reads a private raw YAML mapping, and commits to that same path with the existing
+atomic writer. `HERMES_CONFIG_PATH` keeps its documented precedence; this does
+not redirect operator-configured files or change profile resolution.
+
+Raw `${ENV_VAR}` references, unrelated configuration and masked credentials keep
+their original stored values. YAML-aliased containers and the selected server
+entry are detached before mutation so an edit cannot change a sibling or template. Runtime-expanded cache dictionaries are never the
+write source. An unreadable, malformed or non-mapping existing document aborts
+without overwriting it; a missing/empty document can be initialized. Failed disk
+writes do not publish uncommitted mutations into the runtime cache. Reloading
+that cache and sending HTTP responses happen after the lock is released.
+
+This transaction serializes cooperating writes/reloads in one WebUI process.
+It does not lock out other processes or provide Agent status/schema/dispatch
+isolation; those remain the runtime boundary described above.
 
 ---
 
@@ -1486,7 +1506,11 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
     /api/chat/stream           ?stream_id=X -> SSE stream. Long-lived. Emits token/tool/
                                approval/done/error events.
     /api/chat/stream/status    ?stream_id=X -> {"active": true/false, "stream_id": X}
-    /api/approval/pending      ?session_id=X -> {"pending": entry_or_null}
+    /api/approval/pending      ?session_id=X -> {"pending": entry_or_null}. The approval/clarify
+                               fallback pollers stop on a 409 session_profile_mismatch.
+    /api/git-info              ?session_id=X -> {"git": status_or_null}. State.db-only sessions
+                               (CLI, subagents) use their stored workspace if it resolves via
+                               resolve_trusted_workspace; missing/untrusted -> {"git": null}.
     /api/approval/inject_test  ?session_id=X&pattern_key=K&command=C -> test-only endpoint.
                                Injects a pending approval entry into the server process.
     /api/file/raw              ?session_id=X&path=P -> raw file bytes with correct MIME type.
