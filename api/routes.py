@@ -24067,12 +24067,17 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
                     latest["_fork_child_turn"] = s.session_id
                 return
     user_msg = {"role": "user", "content": msg}
-    from api.process_event_utils import build_active_turn_token, stamp_message_source
+    from api.process_event_utils import (
+        build_active_turn_token,
+        pending_turn_wakeup_meta,
+        stamp_message_source,
+    )
 
     stamp_message_source(
         user_msg,
         source,
         active_turn_token=build_active_turn_token(getattr(s, "active_stream_id", None), started_at),
+        wakeup_meta=pending_turn_wakeup_meta(s),
     )
     if str(source or "").strip().lower() == "fork":
         user_msg["_fork_child_turn"] = s.session_id
@@ -24326,6 +24331,7 @@ def _prepare_chat_start_session_for_stream(
     retained_user=None,
     retained_context_user=_RETAINED_CONTEXT_USER_UNSET,
     defer_save: bool = False,
+    wakeup_meta=None,
 ):
     """Persist chat-start state according to webui.session_save_mode.
 
@@ -24335,6 +24341,11 @@ def _prepare_chat_start_session_for_stream(
     a process restart immediately after /api/chat/start preserves the prompt as
     a normal session message. Empty sessions are never saved here because this
     helper only runs after a non-empty message is validated.
+
+    ``wakeup_meta`` is the server-derived process-wakeup outcome (#7361). It is
+    recorded on the pending turn, bound to its ``pending_started_at``, and so
+    persists with the pending fields in both modes; every materialization of
+    this turn stamps it as the row's ``_wakeup_meta``.
     """
     effective_source = (
         "fork"
@@ -24351,6 +24362,13 @@ def _prepare_chat_start_session_for_stream(
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = effective_source
+    from api.process_event_utils import pending_wakeup_meta_record
+
+    s.pending_wakeup_meta = (
+        pending_wakeup_meta_record(wakeup_meta, s.pending_started_at)
+        if effective_source == "process_wakeup"
+        else None
+    )
     s._webui_pending_user_timestamp_identity = None
     if retained_user is not None:
         from api.process_event_utils import build_active_turn_token
@@ -25097,6 +25115,7 @@ def _start_chat_stream_for_session(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    wakeup_meta=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn.
 
@@ -25266,6 +25285,7 @@ def _start_chat_stream_for_session(
                         model_provider=persisted_model_provider,
                         stream_id=stream_id,
                         source=source,
+                        wakeup_meta=wakeup_meta,
                     )
                     diag.stage("turn_journal_submitted") if diag else None
                     try:
@@ -25560,6 +25580,7 @@ def _start_run(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    wakeup_meta=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -25573,6 +25594,8 @@ def _start_run(
     ``source`` is the StartRunRequest.source (``"webui"`` for browser POSTs,
     ``"process_wakeup"`` for the drain-thread wakeup). ``route`` is the
     metadata.route label that lands on the run record for observability.
+    ``wakeup_meta`` is the server-derived process-wakeup outcome (#7361) the
+    legacy start path records on the accepted turn.
 
     Returns a dict with ``_status`` plus the legacy chat-start response
     fields (``stream_id``, ``session_id``, etc.). Adapter selection that
@@ -25647,6 +25670,7 @@ def _start_run(
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
+                wakeup_meta=wakeup_meta,
             )
 
         def _legacy_adapter_factory():
@@ -25698,6 +25722,7 @@ def _start_run(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        wakeup_meta=wakeup_meta,
     )
 
 
@@ -25760,6 +25785,7 @@ def start_session_turn(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    wakeup_meta=None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -25785,6 +25811,10 @@ def start_session_turn(
         on the per-session agent lock + active-stream guard, so a concurrent
         human ``/api/chat/start`` cannot double-start (one wins, the other gets
         the existing 409 "session already has an active stream").
+      - ``wakeup_meta`` (async-delegation outcome derived from the completion
+        event, #7361) is recorded on the accepted turn's pending state and
+        persisted with it before this returns 200, so the outcome survives
+        until the turn settles or is recovered after a restart.
 
     Returns the same dict ``_start_chat_stream_for_session`` returns, including
     ``_status`` (200 on start, 409 when a turn is already active). On 409 the
@@ -25960,6 +25990,7 @@ def start_session_turn(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        wakeup_meta=wakeup_meta,
     )
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────

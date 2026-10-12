@@ -18341,20 +18341,21 @@ function _asyncDelegationSingleGoal(body){
   const goal=m?m[1].trim():'';
   return goal||null;
 }
-// The single-envelope status line is framed by the formatter as
-// `Role: …   Model: …`, `Status: <s>   API calls: …`, then the
-// `--- RESULT ---` separator. The only thing the formatter puts between Role:
-// and Status: is the optional model-rejection notice (blank line +
-// `⚠ SUBAGENT MODEL REJECTED …` and its fixed follow-up lines). The scan
-// starts at the goal's fixed position (unknown grammar reads neutral), so a
-// frame forged on the `Original goal:` line is skipped, and a `Status:` +
-// `--- RESULT ---` pair not anchored on a Role: line is ignored. The FIRST
-// anchored frame is the formatter's; everything after its `--- RESULT ---`
-// is result/summary text, so a frame quoted there (forged success in a
-// failure's error or partial output, or a failure echoed by a success
-// summary) never changes the outcome. Goal/context text on LATER lines is
-// emitted verbatim before Role: with no delimiter, so a Role:-anchored frame
-// forged there cannot be told apart from the real one by the body alone.
+// Legacy body read of the single envelope's outcome, used only when the row
+// carries no server-stamped outcome (_wakeup_meta, #7361). The formatter
+// frames its status as `Role: …   Model: …`, `Status: <s>   API calls: …`,
+// then `--- RESULT ---`; the only thing it puts between Role: and Status: is
+// the optional model-rejection notice (blank line + `⚠ SUBAGENT MODEL
+// REJECTED …` and its fixed follow-up lines). The scan starts after the
+// fixed-position `Original goal:` label (unknown grammar reads neutral), and a
+// `Status:` + `--- RESULT ---` pair not anchored on a Role: line is ignored.
+// The formatter's real frame is always one of the anchored frames, but the
+// multiline goal and context before it and the result text after it are
+// emitted verbatim with no delimiter, so a frame forged in any of them cannot
+// be told apart from the real one — neither the first nor the last match
+// proves ownership. The outcome is therefore accepted only when EVERY
+// anchored frame agrees; any disagreement is unprovable and reads neutral,
+// never success.
 // A truncated run (iteration cap) is reported `completed` with a
 // `[TRUNCATED: …]` suffix on the same line; like a ⚠ batch task it is neither
 // ok nor error, so it settles on 'partial'.
@@ -18369,9 +18370,13 @@ function _asyncDelegationSingleStatus(body){
   if(!anchor) return 'complete';
   const re=/\nRole: [^\n]*   Model: [^\n]*\n(?:\n⚠ SUBAGENT MODEL REJECTED: [^\n]*\nEvery task in this batch failed for this reason before doing any work\.\nCheck Settings → [^\n]*\n(?:No fallback chain is configured, so no failover was attempted\.\n)?)?Status: (\S+)   API calls: ([^\n]*)\n--- RESULT ---(?=\n|$)/g;
   re.lastIndex=anchor[0].length;
-  const m=re.exec(s);
-  if(!m) return 'complete';
-  return _asyncDelegationSingleFrameOutcome(m[1],m[2]);
+  let m,outcome=null;
+  while((m=re.exec(s))!==null){
+    const frame=_asyncDelegationSingleFrameOutcome(m[1],m[2]);
+    if(outcome!==null&&frame!==outcome) return 'complete';
+    outcome=frame;
+  }
+  return outcome||'complete';
 }
 // #6345: parse the synthetic wakeup body back into display fields. Mirrors the
 // two structured api/background_process.format_wakeup_prompt shapes (pinned by
@@ -18422,18 +18427,23 @@ function _processWakeupInfo(m, text){
     if(meta&&meta[metaKey]!=null) return meta[metaKey];
     return parsed?parsed[parsedKey]:null;
   };
+  const delegationMeta=(meta&&meta.type==='async_delegation'
+    &&typeof meta.status==='string'
+    &&Object.prototype.hasOwnProperty.call(_ASYNC_DELEGATION_CHIP_CLASS,meta.status))?meta:null;
+  const metaCount=v=>(Number.isInteger(v)&&v>=0)?v:null;
   return {
     type:String(pick('type','type')||''),
     taskId:String(pick('task_id','taskId')||''),
     command:String(pick('command','command')||''),
     exitCode:pick('exit_code','exitCode'),
     pattern:pick('pattern','pattern'),
-    // Aggregate delegation outcome: parse-only, because the server never
-    // stamps a meta for the async_delegation grammar.
-    status:parsed&&parsed.status?parsed.status:null,
+    // Aggregate delegation outcome: the server-stamped one (derived from the
+    // completion event, #7361) when present and renderable, wholesale so its
+    // counts never mix with parsed ones; otherwise the fail-closed body parse.
+    status:delegationMeta?delegationMeta.status:(parsed&&parsed.status?parsed.status:null),
     goal:parsed&&parsed.goal?parsed.goal:null,
-    taskCount:parsed&&parsed.taskCount!=null?parsed.taskCount:null,
-    okCount:parsed&&parsed.okCount!=null?parsed.okCount:null,
+    taskCount:delegationMeta?metaCount(delegationMeta.task_count):(parsed&&parsed.taskCount!=null?parsed.taskCount:null),
+    okCount:delegationMeta?metaCount(delegationMeta.ok_count):(parsed&&parsed.okCount!=null?parsed.okCount:null),
     output:parsed?parsed.output:null,
   };
 }

@@ -39,7 +39,7 @@ TOKEN = "7740f0b6e9ee4f3ea31dca09e8882d2a:1788025846.8926563"
 STARTED_AT = 1788025846.8926563
 
 
-def _identity(body, source, *, session_id="sess-1", checkpoint=None):
+def _identity(body, source, *, session_id="sess-1", checkpoint=None, wakeup_meta=None):
     """The turn identity a resolved Agent boundary produces mid-run."""
     return {
         "session_id": session_id,
@@ -47,6 +47,7 @@ def _identity(body, source, *, session_id="sess-1", checkpoint=None):
         "text": body,
         "timestamp": STARTED_AT,
         "source": source,
+        "wakeup_meta": wakeup_meta,
         "attachments": [],
         "checkpoint": checkpoint,
         "current_turn_user_idx": 2,
@@ -56,7 +57,7 @@ def _identity(body, source, *, session_id="sess-1", checkpoint=None):
     }
 
 
-def _settle(body, source, *, session_id="sess-1", checkpoint=None):
+def _settle(body, source, *, session_id="sess-1", checkpoint=None, wakeup_meta=None):
     """Run one full settle where the Agent echoed the current user row.
 
     ``api_content``/``id``/``_db_persisted`` mirror the Agent-side row shape the
@@ -96,7 +97,13 @@ def _settle(body, source, *, session_id="sess-1", checkpoint=None):
         result_messages,
         body,
         source,
-        _identity(body, source, session_id=session_id, checkpoint=checkpoint),
+        _identity(
+            body,
+            source,
+            session_id=session_id,
+            checkpoint=checkpoint,
+            wakeup_meta=wakeup_meta,
+        ),
     )
     return session
 
@@ -171,3 +178,30 @@ def test_eager_checkpoint_turn_is_unaffected():
 
     row = _current_turn_row(session)
     assert row["_source"] == "process_wakeup"
+
+
+def test_agent_echoed_async_delegation_turn_keeps_the_turn_owned_outcome():
+    """The server-owned delegation outcome (#7361) rides the same choke point:
+    the turn identity carries the accepted turn's outcome, so the Agent-echoed
+    row the deferred save persists is stamped with it."""
+    session = _settle(
+        BATCH_BODY,
+        "process_wakeup",
+        wakeup_meta={
+            "type": "async_delegation",
+            "task_id": "deleg_7062a9f8",
+            "status": "error",
+            "task_count": 1,
+            "ok_count": 0,
+        },
+    )
+
+    row = _current_turn_row(session)
+    assert row["_source"] == "process_wakeup"
+    assert row["_wakeup_meta"] == {
+        "type": "async_delegation",
+        "task_id": "deleg_7062a9f8",
+        "status": "error",
+        "task_count": 1,
+        "ok_count": 0,
+    }
