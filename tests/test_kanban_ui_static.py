@@ -3567,3 +3567,159 @@ def test_kanban_model_chip_touch_target_is_at_least_44px():
     assert STYLE.index("@media (pointer: coarse), (max-width: 640px)") > STYLE.index(
         ".kanban-model-picker-wrap .settings-model-chip{"
     ), "the touch override is declared before the desktop rule it must beat"
+
+
+# ── #6765 maintainer review: focus trap, picker chrome, identity restore ──
+
+
+def test_kanban_focus_trap_recollects_on_tab_and_skips_unrendered():
+    """Tab must not get stuck on the model chip after the picker was used: the
+    trap re-collects focusables on every Tab (an element added after open is
+    reachable) and skips elements without a layout box (getClientRects empty)."""
+    fn = extract_function(PANELS, "_trapModalFocus", prefix="function")
+    harness = f"""
+const assert = require("assert");
+function mk(id, rendered) {{
+  return {{ id, tabIndex: 0, disabled: false, hidden: false, rendered,
+           getClientRects() {{ return this.rendered ? [{{}}] : []; }},
+           focus() {{ document.activeElement = this; }} }};
+}}
+global.getComputedStyle = () => ({{ display: "block", visibility: "visible" }});
+global.document = {{ activeElement: null }};
+const els = [mk("title", true), mk("chip", true), mk("search", false)];
+let handler = null;
+const modal = {{
+  querySelectorAll: () => els.slice(),
+  addEventListener: (_t, h) => {{ handler = h; }},
+  removeEventListener: () => {{ handler = null; }},
+}};
+{fn}
+const cleanup = _trapModalFocus(modal);
+const tab = (shiftKey) => handler({{ key: "Tab", shiftKey, preventDefault() {{}} }});
+// Unrendered search input (closed picker) is skipped: chip -> wraps to title.
+els[1].focus();
+tab(false);
+assert.strictEqual(document.activeElement.id, "title", "Tab landed on an element with no layout box");
+// A control added AFTER the trap was installed is reachable from the chip.
+els.push(mk("submit", true));
+els[1].focus();
+tab(false);
+assert.strictEqual(document.activeElement.id, "submit", "focusables were not re-collected on Tab");
+tab(false);
+assert.strictEqual(document.activeElement.id, "title");
+cleanup();
+assert.strictEqual(handler, null);
+console.log(JSON.stringify({{ success: true }}));
+"""
+    assert _run_node(harness)["success"] is True
+
+
+def test_kanban_model_badge_is_clamped_with_ellipsis():
+    rule = re.search(r"\.kanban-badge\.model\{([^}]*)\}", COMPACT_STYLE)
+    assert rule, ".kanban-badge.model rule missing"
+    body = rule.group(1)
+    for decl in ("max-width:100%", "min-width:0", "overflow:hidden", "text-overflow:ellipsis"):
+        assert decl in body, f".kanban-badge.model missing {decl}"
+
+
+def test_kanban_model_chip_has_select_chrome():
+    rule = re.search(r"\.kanban-model-picker-wrap\.settings-model-chip\{([^}]*)\}", COMPACT_STYLE)
+    assert rule, "kanban model chip rule missing"
+    body = rule.group(1)
+    for decl in (
+        "padding:8px32px8px10px",
+        "background:var(--input-bg)",
+        "border-color:var(--border)",
+        "border-radius:8px",
+        "polyline",
+        "background-repeat:no-repeat",
+        "background-position:right8pxcenter",
+        "background-size:16px",
+    ):
+        assert decl in body, f"kanban model chip missing {decl}"
+
+    focus_rule = re.search(
+        r"\.kanban-model-picker-wrap\.settings-model-chip:hover,\.kanban-model-picker-wrap\.settings-model-chip\.active,\.kanban-model-picker-wrap\.settings-model-chip:focus-visible\{([^}]*)\}",
+        COMPACT_STYLE,
+    )
+    assert focus_rule, "kanban model chip focus/hover/active rule missing"
+    assert "border-color:var(--accent,#FFD700)" in focus_rule.group(1)
+
+
+def test_kanban_model_scope_note_is_not_sticky_in_modal_picker():
+    assert ".kanban-model-picker-wrap.model-scope-note{position:static;}" in COMPACT_STYLE
+
+
+def test_kanban_populate_restores_provider_qualified_option_by_identity():
+    """A task persisted as model + provider_override must select the catalog's
+    "@provider:model" option instead of synthesizing a duplicate raw-id option
+    (two "Selected" rows, chip showing the raw id)."""
+    fn_sync = extract_function(PANELS, "_kanbanSyncModelChip", prefix="function")
+    fn_populate = extract_function(PANELS, "_kanbanPopulateModelSelect", prefix="async function")
+    fn_refresh = extract_function(PANELS, "_kanbanRefreshOpenModelDropdown", prefix="function")
+    harness = f"""
+const assert = require("assert");
+{_KANBAN_DOM_ELEMENT_JS}
+const elements = {{
+  kanbanTaskModalModel: new Element("select"),
+  kanbanTaskModalModelChip: new Element("button"),
+}};
+global.document = {{
+  getElementById: (id) => elements[id] || null,
+  createElement: (tag) => new Element(tag),
+  baseURI: "http://localhost/",
+}};
+function t(k) {{ return k === "kanban_no_model_override" ? "Profile default" : k; }}
+const groups = [
+  {{ provider_id: "openai", models: [{{ id: "gpt-x", label: "GPT X (openai)" }}] }},
+  {{ provider_id: "openrouter", models: [{{ id: "@openrouter:gpt-x", label: "GPT X (openrouter)" }}] }},
+];
+global.fetch = async () => ({{ ok: true, json: async () => ({{ groups }}) }});
+let _kanbanModelPopulateSeq = 0;
+{fn_sync}
+{fn_populate}
+{fn_refresh}
+(async () => {{
+  const sel = elements.kanbanTaskModalModel;
+  const chip = elements.kanbanTaskModalModelChip;
+  await _kanbanPopulateModelSelect("gpt-x", "openrouter");
+  assert.strictEqual(sel.value, "@openrouter:gpt-x", "qualified catalog option not selected");
+  assert.strictEqual(sel.options.filter(o => o.value === "gpt-x").length, 1, "duplicate raw-id option synthesized");
+  assert.strictEqual(sel.options.length, 3, "an extra option was synthesized");
+  assert.strictEqual(chip.textContent, "GPT X (openrouter)", "chip shows the raw id instead of the catalog label");
+  assert.strictEqual(sel.selectedOptions[0].dataset.provider, "openrouter");
+  // Bare persisted model with no provider still matches the bare option.
+  await _kanbanPopulateModelSelect("gpt-x", "");
+  assert.strictEqual(sel.value, "gpt-x");
+  assert.strictEqual(sel.options.length, 3);
+  console.log(JSON.stringify({{ success: true }}));
+}})().catch(e => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
+"""
+    assert _run_node(harness)["success"] is True
+
+
+def test_kanban_open_model_dropdown_scrolls_picker_into_view():
+    fn_open = extract_function(PANELS, "_kanbanOpenModelDropdown", prefix="function")
+    harness = f"""
+const assert = require("assert");
+const classes = new Set();
+let scrolled = null;
+let openWhenScrolled = null;
+const dd = {{
+  classList: {{ add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) }},
+  scrollIntoView(opts) {{ scrolled = opts; openWhenScrolled = classes.has("open"); }},
+}};
+const chip = {{ classList: {{ add() {{}} }}, setAttribute() {{}} }};
+const elements = {{ kanbanTaskModalModelDropdown: dd, kanbanTaskModalModel: {{}}, kanbanTaskModalModelChip: chip }};
+global.document = {{ getElementById: id => elements[id] || null }};
+function t() {{ return ""; }}
+function renderModelDropdown() {{}}
+function _kanbanCloseModelDropdown() {{}}
+function _kanbanSelectModelFromDropdown() {{}}
+{fn_open}
+_kanbanOpenModelDropdown();
+assert.deepStrictEqual(scrolled, {{ block: "nearest" }}, "picker was not scrolled into view");
+assert.strictEqual(openWhenScrolled, true, "scrollIntoView ran before the open class was applied");
+console.log(JSON.stringify({{ success: true }}));
+"""
+    assert _run_node(harness)["success"] is True

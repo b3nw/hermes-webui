@@ -3352,6 +3352,8 @@ function _kanbanOpenModelDropdown(){
     autoFocusSearch: true,  // renderModelDropdown() already focuses the search input
   });
   dd.classList.add('open');
+  // The chip sits low in the modal; without this the popup opens below the fold.
+  if (typeof dd.scrollIntoView === 'function') dd.scrollIntoView({block: 'nearest'});
   if (chip) {
     chip.classList.add('active');
     chip.setAttribute('aria-expanded', 'true');
@@ -3438,8 +3440,17 @@ async function _kanbanPopulateModelSelect(currentValue, currentProvider){
   sel.value = currentValue || '';
   const currentModel = currentValue ? String(currentValue) : '';
   if (currentModel) {
-    const found = Array.from(sel.options).find(o => String(o.value) === currentModel);
+    // Match by identity, not raw value: the catalog lists a provider-qualified
+    // model as "@provider:model", while the task persists the bare model plus
+    // provider_override. A raw-value miss synthesized a duplicate option (two
+    // "Selected" rows, chip showing the raw id). Prefer the exact qualified
+    // option so the persisted provider wins over a same-named bare entry.
+    const qualified = currentProvider ? `@${currentProvider}:${currentModel}` : '';
+    const opts = Array.from(sel.options);
+    const found = (qualified && opts.find(o => o.value === qualified))
+      || opts.find(o => o.value === currentModel || (o.dataset.model || '') === currentModel);
     if (found) {
+      sel.value = found.value;
       // Catalog model — overwrite the catalog-derived provider with the PERSISTED
       // one so a save of an unrelated edit neither re-pins a provider (when the
       // task had none) nor rewrites it to a catalog default (when it differed).
@@ -3819,14 +3830,19 @@ function _trapModalFocus(modalEl){
     const candidates = Array.from(modalEl.querySelectorAll(selector));
     return candidates.filter((el) => {
       if (el.disabled || el.hidden) return false;
+      // No layout box: inside a hidden/collapsed ancestor (e.g. a closed model
+      // picker's search input), so it can't take focus.
+      if (el.getClientRects().length === 0) return false;
       const style = getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden') return false;
       return el.tabIndex >= 0;
     });
   };
-  let focusableEls = collect();
   const onKeyDown = (ev) => {
     if (ev.key !== 'Tab') return;
+    // Re-collect on every Tab: the model picker adds/removes focusables after
+    // open, and a snapshot taken at open leaves Tab stuck on the chip.
+    const focusableEls = collect();
     if (!focusableEls.length) {
       ev.preventDefault();
       return;
