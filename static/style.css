@@ -7062,7 +7062,7 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
 .kanban-card-id{font-family:var(--font-mono);opacity:.8}
 .kanban-badge{border:1px solid var(--border);border-radius:999px;padding:1px 6px;font-size:10px;color:var(--muted);white-space:nowrap}
 .kanban-badge.priority{color:var(--accent)}
-.kanban-badge.tenant{color:var(--text)}
+.kanban-badge.tenant{color:var(--text);max-width:100%;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .kanban-badge.model{color:var(--accent);max-width:100%;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .kanban-model-picker-wrap{position:relative;width:100%;}
 /* Same chrome as .kanban-modal-row select so the chip reads as a dropdown. */

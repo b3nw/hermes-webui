@@ -3723,3 +3723,195 @@ assert.strictEqual(openWhenScrolled, true, "scrollIntoView ran before the open c
 console.log(JSON.stringify({{ success: true }}));
 """
     assert _run_node(harness)["success"] is True
+
+
+def test_kanban_tenant_badge_is_clamped_with_ellipsis():
+    """A long tenant (up to 64 chars) must clamp with an ellipsis rather than
+    bleeding past the card boundaries (#6765)."""
+    rule = re.search(r"\.kanban-badge\.tenant\{([^}]*)\}", COMPACT_STYLE)
+    assert rule, ".kanban-badge.tenant rule missing"
+    body = rule.group(1)
+    for decl in ("max-width:100%", "min-width:0", "overflow:hidden", "text-overflow:ellipsis"):
+        assert decl in body, f".kanban-badge.tenant missing {decl}"
+    assert 'class="kanban-badge tenant" title="${esc(task.tenant)}"' in PANELS, (
+        "tenant badge must include full tenant in title attribute for tooltip on hover"
+    )
+
+
+def test_kanban_escape_on_focused_model_chip_closes_modal_when_picker_closed():
+    """Escape on the model chip must close the task modal when the picker dropdown
+    is closed, but close only the picker dropdown when it is open (#6765)."""
+    key_src = extract_function(PANELS, "_kanbanTaskModalKey", prefix="function")
+    harness = f"""
+const assert = require("assert");
+let dropdownOpen = false, modalHidden = false;
+const calls = {{close: 0, closeDropdown: 0, submit: 0}};
+const dropdownEl = {{classList: {{contains: (c) => c === "open" && dropdownOpen}}}};
+const modalEl = {{get hidden(){{ return modalHidden; }}}};
+global.document = {{
+  getElementById: (id) => (
+    id === "kanbanTaskModalModelDropdown" ? dropdownEl :
+    id === "kanbanTaskModal" ? modalEl : null
+  ),
+}};
+function closeKanbanTaskModal(){{ calls.close++; modalHidden = true; }}
+function _kanbanCloseModelDropdown(){{ calls.closeDropdown++; dropdownOpen = false; }}
+function submitKanbanTaskModal(){{ calls.submit++; }}
+{key_src}
+function ev(key, target){{
+  const e = {{key, target, shiftKey: false, prevented: 0, stopped: 0}};
+  e.preventDefault = () => {{ e.prevented++; }};
+  e.stopPropagation = () => {{ e.stopped++; }};
+  return e;
+}}
+
+// The chip button lives inside .kanban-model-picker-wrap, but NOT inside #kanbanTaskModalModelDropdown.
+const chipEl = {{
+  tagName: "BUTTON",
+  id: "kanbanTaskModalModelChip",
+  closest: (sel) => sel.includes(".kanban-model-picker-wrap") ? {{}} : null,
+}};
+
+// 1. When picker is CLOSED: Escape on focused chip closes the task modal.
+dropdownOpen = false;
+modalHidden = false;
+let e1 = ev("Escape", chipEl);
+_kanbanTaskModalKey(e1);
+assert.strictEqual(calls.close, 1, "Escape on focused chip must close the modal when dropdown is closed");
+assert.strictEqual(calls.closeDropdown, 0, "must not call _kanbanCloseModelDropdown when closed");
+assert.strictEqual(modalHidden, true);
+
+// 2. When picker is OPEN: Escape on focused chip closes the dropdown, leaving modal open.
+dropdownOpen = true;
+modalHidden = false;
+let e2 = ev("Escape", chipEl);
+_kanbanTaskModalKey(e2);
+assert.strictEqual(calls.closeDropdown, 1, "Escape on chip when dropdown is open must close dropdown");
+assert.strictEqual(calls.close, 1, "Escape on chip when dropdown is open must not close modal");
+assert.strictEqual(modalHidden, false);
+
+console.log(JSON.stringify({{ success: true }}));
+"""
+    assert _run_node(harness)["success"] is True
+
+
+def test_kanban_explicit_model_pick_stamps_chosen_provider():
+    """When a task has no provider pin (provider_override: null), edit mode sets
+    dataset.provider = '' on populate so unrelated edits do not re-pin a provider.
+    However, explicitly clicking a catalog option in the picker must stamp that option's
+    provider onto the draft so saving persists provider_override (#6765)."""
+    fn_sync = extract_function(PANELS, "_kanbanSyncModelChip", prefix="function")
+    fn_close_dd = extract_function(PANELS, "_kanbanCloseModelDropdown", prefix="function")
+    fn_select = extract_function(PANELS, "_kanbanSelectModelFromDropdown", prefix="function")
+    fn_populate = extract_function(PANELS, "_kanbanPopulateModelSelect", prefix="async function")
+    fn_refresh = extract_function(PANELS, "_kanbanRefreshOpenModelDropdown", prefix="function")
+    submit_src = extract_function(PANELS, "submitKanbanTaskModal", prefix="async function")
+
+    fn_value_provider = extract_function(UI, "_providerFromModelValue", prefix="function")
+    fn_option_provider = extract_function(UI, "_getOptionProviderId", prefix="function")
+    fn_model_state = extract_function(UI, "_modelStateForSelect", prefix="function")
+    fn_find = extract_function(UI, "_findModelInDropdown", prefix="function")
+    fn_apply = extract_function(UI, "_applyModelToDropdown", prefix="function")
+    fn_ensure = extract_function(UI, "_ensureModelOptionInDropdown", prefix="function")
+
+    harness = f"""
+const assert = require("assert");
+{_KANBAN_DOM_ELEMENT_JS}
+
+const elements = {{
+  kanbanTaskModalTitleInput: new Element("input"),
+  kanbanTaskModalBody: new Element("textarea"),
+  kanbanTaskModalStatus: new Element("select"),
+  kanbanTaskModalAssignee: new Element("select"),
+  kanbanTaskModalTenant: new Element("input"),
+  kanbanTaskModalPriority: new Element("input"),
+  kanbanTaskModalWorkspaceKind: new Element("select"),
+  kanbanTaskModalWorkspacePath: new Element("input"),
+  kanbanTaskModalWorkspacePathRow: new Element("div"),
+  kanbanTaskModalSkills: new Element("input"),
+  kanbanTaskModalMaxRuntimeSeconds: new Element("input"),
+  kanbanTaskModalParents: new Element("input"),
+  kanbanTaskModalModel: new Element("select"),
+  kanbanTaskModalModelChip: new Element("button"),
+  kanbanTaskModalModelDropdown: new Element("div"),
+  kanbanTaskModalError: new Element("div"),
+  kanbanTaskModalSubmit: new Element("button"),
+}};
+elements.kanbanTaskModalTitleInput.value = "Test Task";
+
+let capturedPayload = null;
+global.api = async (url, opts) => {{
+  if (opts && opts.body) capturedPayload = JSON.parse(opts.body);
+  return {{ task: {{ id: "t_test" }} }};
+}};
+global.document = {{
+  getElementById: (id) => elements[id] || null,
+  createElement: (tag) => new Element(tag),
+  baseURI: "http://localhost/",
+}};
+global.window = {{ _configuredModelBadges: {{}} }};
+function t(k) {{ return k; }}
+function getModelLabel(v) {{ return String(v || ""); }}
+function closeKanbanTaskModal() {{}}
+function showToast() {{}}
+function _kanbanBoardQuery() {{ return ""; }}
+function loadKanban() {{}}
+function loadKanbanTask() {{}}
+let _kanbanTaskModalMode = "edit";
+let _kanbanTaskModalEditingId = "t_test";
+let _kanbanTaskModalInitialDisplayedStatus = "todo";
+let _kanbanModelPopulateSeq = 0;
+
+const groups = [
+  {{ provider_id: "openai", name: "OpenAI", models: [{{ id: "gpt-5-mini", label: "GPT-5 Mini" }}] }},
+  {{ provider_id: "anthropic", name: "Anthropic", models: [{{ id: "claude-sonnet-4-6", label: "Claude Sonnet" }}] }},
+];
+global.fetch = async () => ({{ ok: true, json: async () => ({{ groups }}) }});
+
+{fn_value_provider}
+{fn_option_provider}
+{fn_model_state}
+{fn_find}
+{fn_apply}
+{fn_ensure}
+{fn_sync}
+{fn_close_dd}
+{fn_select}
+{fn_populate}
+{fn_refresh}
+{submit_src}
+
+(async () => {{
+  const sel = elements.kanbanTaskModalModel;
+
+  // 1. Populate task with model="gpt-5-mini", provider=null (unpinned)
+  await _kanbanPopulateModelSelect("gpt-5-mini", "");
+  assert.strictEqual(sel.value, "gpt-5-mini");
+  assert.strictEqual(sel.selectedOptions[0].dataset.provider, "");
+
+  // Unrelated edit: saving without touching picker preserves provider_override as null
+  await submitKanbanTaskModal();
+  assert.strictEqual(capturedPayload.model_override, "gpt-5-mini");
+  assert.strictEqual(capturedPayload.provider_override, null, "unrelated edit must not re-pin provider");
+
+  // 2. Explicit pick from picker: click OpenAI catalog row for gpt-5-mini
+  _kanbanSelectModelFromDropdown("gpt-5-mini", "openai");
+  assert.strictEqual(sel.selectedOptions[0].dataset.provider, "openai", "explicit pick must stamp provider");
+
+  // Save after explicit pick: provider_override must be "openai"
+  capturedPayload = null;
+  await submitKanbanTaskModal();
+  assert.strictEqual(capturedPayload.model_override, "gpt-5-mini");
+  assert.strictEqual(capturedPayload.provider_override, "openai", "explicit pick must persist chosen provider");
+
+  // 3. Clear override to Profile default
+  _kanbanSelectModelFromDropdown("", null);
+  capturedPayload = null;
+  await submitKanbanTaskModal();
+  assert.strictEqual(capturedPayload.model_override, null);
+  assert.strictEqual(capturedPayload.provider_override, null);
+
+  console.log(JSON.stringify({{ success: true }}));
+}})().catch(e => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
+"""
+    assert _run_node(harness)["success"] is True

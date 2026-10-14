@@ -2609,7 +2609,7 @@ function _kanbanCard(task, status){
     ? `<span class="kanban-badge model" title="${esc(t(modelHintKey, task.model_override))}">🧠 ${esc(task.model_override)}</span>`
     : '';
   return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, ${jsArg(task.id)})" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, ${jsArg(task.id)})" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask(${jsArg(task.id)})}">
-    <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}${toplineModel}</div>
+    <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant" title="${esc(task.tenant)}">${esc(task.tenant)}</span>` : ''}${toplineModel}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
@@ -3317,10 +3317,25 @@ function _kanbanSelectModelFromDropdown(value, preferredProviderId){
   // on a loaded catalog silently did nothing. Clear the select directly.
   if (!value) {
     sel.value = '';
+    const opt = sel.selectedOptions && sel.selectedOptions[0];
+    if (opt && opt.dataset) opt.dataset.provider = '';
   } else if (typeof _ensureModelOptionInDropdown === 'function') {
     _ensureModelOptionInDropdown(value, sel, provider);
   } else {
     sel.value = value;
+  }
+  // After an explicit pick, stamp the selected option's provider onto the draft.
+  // Edit mode sets opt.dataset.provider to '' on populate to preserve tasks that
+  // have no persisted provider pin; clicking a catalog row (e.g. an OpenAI row)
+  // must re-stamp that provider so saving the edit doesn't silently drop it (#6765).
+  if (value) {
+    const opt = sel.selectedOptions && sel.selectedOptions[0];
+    if (opt && opt.dataset) {
+      const chosenProvider = provider
+        || (opt.parentElement && opt.parentElement.tagName === 'OPTGROUP' && opt.parentElement.dataset && opt.parentElement.dataset.provider)
+        || '';
+      if (chosenProvider) opt.dataset.provider = chosenProvider;
+    }
   }
   _kanbanSyncModelChip();
   _kanbanCloseModelDropdown();
@@ -3901,9 +3916,11 @@ function _kanbanTaskModalKey(ev){
   // keydown handler and let the event keep bubbling, so by the time this
   // document listener runs the dropdown already reads as closed and Escape
   // took the whole modal down with it. Treat any key that originated inside
-  // the picker as the picker's.
+  // the dropdown popup as the picker's. But when the picker is closed, Escape
+  // on the chip button (which lives in .kanban-model-picker-wrap outside the
+  // popup) must close the modal rather than being swallowed (#6765).
   const isPickerTarget = !!(ev.target && typeof ev.target.closest === 'function'
-    && (ev.target.closest('#kanbanTaskModalModelDropdown') || ev.target.closest('.kanban-model-picker-wrap')));
+    && (ev.target.closest('#kanbanTaskModalModelDropdown') || (dropdownOpen && ev.target.closest('.kanban-model-picker-wrap'))));
   if (ev.key === 'Escape') {
     if (dropdownOpen || isPickerTarget) {
       ev.preventDefault();
