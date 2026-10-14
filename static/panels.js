@@ -3227,6 +3227,11 @@ let _kanbanTaskModalFocusCleanup = null;
 // review: editing a 'running' task without touching status was reclaiming
 // the worker and moving the task back to triage.
 let _kanbanTaskModalInitialDisplayedStatus = null;
+// Model/provider pair the edit modal opened with. Board/detail refreshes never
+// update the open editor, so this can go stale; a deliberate picker change
+// sends it as expected_* and _patch_task rejects the save (409) when the
+// task's routing changed underneath. null in create mode.
+let _kanbanTaskModalInitialModelPair = null;
 let _kanbanBoardModalFocusCleanup = null;
 
 async function _kanbanLoadProfileNames(){
@@ -3282,11 +3287,20 @@ function _kanbanSyncModelChip(){
   const chip = document.getElementById('kanbanTaskModalModelChip');
   if (!chip) return;
   const val = sel && sel.value ? String(sel.value) : '';
+  // The chip's static markup carries data-i18n="kanban_no_model_override", and
+  // applyLocaleToDOM() restamps every [data-i18n] element on a locale change —
+  // left in place, it repainted a chosen model as "Profile default" while the
+  // select (and the submitted override) stayed on that model (#6765). Only the
+  // empty selection owns the localized label; a model label is dynamic.
   if (!val) {
+    chip.setAttribute('data-i18n', 'kanban_no_model_override');
+    chip.setAttribute('data-i18n-title', 'kanban_no_model_override');
     chip.textContent = t('kanban_no_model_override') || 'Profile default';
     chip.title = t('kanban_no_model_override') || 'Profile default';
     return;
   }
+  chip.removeAttribute('data-i18n');
+  chip.removeAttribute('data-i18n-title');
   const opt = sel.selectedOptions && sel.selectedOptions[0];
   const label = (opt && opt.textContent) || (typeof getModelLabel === 'function' ? getModelLabel(val) : val);
   chip.textContent = label;
@@ -3300,6 +3314,15 @@ function _kanbanClearModelDirtyMark(){
   if (!sel || !sel.dataset) return;
   delete sel.dataset.dirtySeq;
   delete sel.dataset.userDirty;  // legacy flag from before the seq-scoped mark
+}
+
+function _kanbanModelPickerTouched(){
+  // True only when the user picked something (a model, a custom ID, or Profile
+  // default) during the CURRENT populate pass — the same seq-scoped mark the
+  // populate restore honours, so a mark left by an earlier modal never counts.
+  const sel = document.getElementById('kanbanTaskModalModel');
+  return !!(sel && sel.dataset && sel.dataset.dirtySeq !== undefined
+    && sel.dataset.dirtySeq === String(_kanbanModelPopulateSeq));
 }
 
 function _kanbanSelectModelFromDropdown(value, preferredProviderId){
@@ -3632,6 +3655,7 @@ function openKanbanCreate(){
   _kanbanTaskModalMode = 'create';
   _kanbanTaskModalEditingId = null;
   _kanbanTaskModalInitialDisplayedStatus = null;  // create mode: always send status
+  _kanbanTaskModalInitialModelPair = null;
   // Default new tasks to "ready" so they're immediately claimable by the
   // dispatcher (assuming the user picks an assignee).  Triage is for staging
   // tasks that need human review before being marked actionable; users who
@@ -3704,6 +3728,10 @@ async function openKanbanEdit(taskId){
   const initialDisplayedStatus = _kanbanEditableStatusFor(task.status);
   const originalStatus = task.status || initialDisplayedStatus;
   _kanbanTaskModalInitialDisplayedStatus = initialDisplayedStatus;
+  _kanbanTaskModalInitialModelPair = {
+    model: task.model_override || null,
+    provider: task.provider_override || null,
+  };
   _kanbanResetTaskModalFields({
     title: task.title || '',
     body: task.body || '',
@@ -3895,6 +3923,7 @@ function closeKanbanTaskModal(){
   _kanbanTaskModalMode = 'create';
   _kanbanTaskModalEditingId = null;
   _kanbanTaskModalInitialDisplayedStatus = null;
+  _kanbanTaskModalInitialModelPair = null;
   _kanbanSetTaskModalStatusHint(null, null);
   if (_kanbanTaskModalFocusCleanup) {
     _kanbanTaskModalFocusCleanup();
@@ -4050,10 +4079,19 @@ async function submitKanbanTaskModal(){
     }
     const n = parseInt(priorityRaw, 10);
     payload.priority = Number.isNaN(n) ? 0 : n;
-    // Send model fields on edit even when empty so users can clear an override
-    // back to the profile default (backend normalises empty → clear both).
-    payload.model_override = modelRaw || null;
-    payload.provider_override = providerRaw || null;
+    // Model routing is sent ONLY when the user touched the picker this session.
+    // The open editor is never refreshed, so re-sending its untouched pair
+    // replayed a stale routing over an external change on a title-only save.
+    // A deliberate pick sends both fields (null/null = explicit clear back to
+    // Profile default) plus the pair the modal opened with, so _patch_task can
+    // refuse the save if the task's routing changed underneath it.
+    if (_kanbanModelPickerTouched()) {
+      payload.model_override = modelRaw || null;
+      payload.provider_override = providerRaw || null;
+      const opened = _kanbanTaskModalInitialModelPair || {model: null, provider: null};
+      payload.expected_model_override = opened.model || null;
+      payload.expected_provider_override = opened.provider || null;
+    }
     // Note: workspace_kind and workspace_path are not sent on edit because
     // the backend _patch_task does not handle them (they are dropped).
   } else {

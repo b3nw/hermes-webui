@@ -1781,7 +1781,12 @@ def _run_kanban_submit_model_cases(cases):
     test is production code, not a test reimplementation.
 
     Each case: {mode, editingId?, options: [{value, model?, provider?}],
-    selected: <select value>}. Returns the captured request payloads."""
+    selected: <select value>, touched?, initialPair?, title?}. ``touched``
+    (default True) stamps the REAL seq-scoped dirty mark that
+    _kanbanSelectModelFromDropdown() leaves on a deliberate pick; False models an
+    edit where the picker was never opened. ``initialPair`` is the
+    {model, provider} the edit modal opened with. Returns the captured request
+    payloads."""
     import json
     import shutil
     import subprocess
@@ -1793,6 +1798,7 @@ def _run_kanban_submit_model_cases(cases):
         pytest.skip("node not available")
 
     submit_src = extract_function(PANELS, "submitKanbanTaskModal", prefix="async function")
+    touched_src = extract_function(PANELS, "_kanbanModelPickerTouched", prefix="function")
     state_src = extract_function(UI, "_modelStateForSelect")
     option_provider_src = extract_function(UI, "_getOptionProviderId")
     value_provider_src = extract_function(UI, "_providerFromModelValue")
@@ -1815,7 +1821,7 @@ def _run_kanban_submit_model_cases(cases):
         "function makeSelect(specs, selected) {\n"
         "  const options = specs.map(makeOption);\n"
         "  return {\n"
-        "    id: 'kanbanTaskModalModel', value: selected, options,\n"
+        "    id: 'kanbanTaskModalModel', value: selected, options, dataset: {},\n"
         "    get selectedOptions() {\n"
         "      const hit = options.find(o => String(o.value) === String(this.value));\n"
         "      return hit ? [hit] : [];\n"
@@ -1841,6 +1847,9 @@ def _run_kanban_submit_model_cases(cases):
         "let _kanbanTaskModalMode = 'create';\n"
         "let _kanbanTaskModalEditingId = null;\n"
         "let _kanbanTaskModalInitialDisplayedStatus = 'triage';\n"
+        "let _kanbanTaskModalInitialModelPair = null;\n"
+        "let _kanbanModelPopulateSeq = 7;\n"
+        + touched_src + "\n"
         + value_provider_src + "\n"
         + option_provider_src + "\n"
         + state_src + "\n"
@@ -1851,8 +1860,10 @@ def _run_kanban_submit_model_cases(cases):
         "    capturedPayload = null; capturedMethod = null;\n"
         "    _kanbanTaskModalMode = c.mode;\n"
         "    _kanbanTaskModalEditingId = c.editingId || null;\n"
+        "    _kanbanTaskModalInitialModelPair = c.mode === 'edit'\n"
+        "      ? (c.initialPair || {model: null, provider: null}) : null;\n"
         "    elements = {\n"
-        "      kanbanTaskModalTitleInput: field('Prefixed model task'),\n"
+        "      kanbanTaskModalTitleInput: field(c.title || 'Prefixed model task'),\n"
         "      kanbanTaskModalBody: field(''),\n"
         "      kanbanTaskModalStatus: field('triage'),\n"
         "      kanbanTaskModalAssignee: field('agent1'),\n"
@@ -1867,6 +1878,9 @@ def _run_kanban_submit_model_cases(cases):
         "      kanbanTaskModalError: {textContent: '', dataset: {}},\n"
         "      kanbanTaskModalSubmit: {disabled: false},\n"
         "    };\n"
+        "    if (c.touched !== false) {\n"
+        "      elements.kanbanTaskModalModel.dataset.dirtySeq = String(_kanbanModelPopulateSeq);\n"
+        "    }\n"
         "    await submitKanbanTaskModal();\n"
         "    out.push({payload: capturedPayload, method: capturedMethod,\n"
         "              error: elements.kanbanTaskModalError.textContent});\n"
@@ -2058,7 +2072,10 @@ class Element {
       contains: (c) => this._classes.has(c),
     };
   }
-  setAttribute(){}
+  setAttribute(name, value) { this._attrs = this._attrs || {}; this._attrs[name] = String(value); }
+  getAttribute(name) { return this._attrs && name in this._attrs ? this._attrs[name] : null; }
+  hasAttribute(name) { return !!this._attrs && name in this._attrs; }
+  removeAttribute(name) { if (this._attrs) delete this._attrs[name]; }
   get value() {
     if (this.tagName === "SELECT") {
       const opts = this.options;
@@ -3112,6 +3129,10 @@ class Elem {
     if (String(name).startsWith('data-')) return this.dataset[_camel(String(name).slice(5))];
     return this[name];
   }
+  removeAttribute(name) {
+    if (String(name).startsWith('data-')) { delete this.dataset[_camel(String(name).slice(5))]; return; }
+    delete this[name];
+  }
   addEventListener(type, handler) {
     if (!this._handlers[type]) this._handlers[type] = [];
     this._handlers[type].push(handler);
@@ -3805,6 +3826,7 @@ def test_kanban_explicit_model_pick_stamps_chosen_provider():
     fn_select = extract_function(PANELS, "_kanbanSelectModelFromDropdown", prefix="function")
     fn_populate = extract_function(PANELS, "_kanbanPopulateModelSelect", prefix="async function")
     fn_refresh = extract_function(PANELS, "_kanbanRefreshOpenModelDropdown", prefix="function")
+    fn_touched = extract_function(PANELS, "_kanbanModelPickerTouched", prefix="function")
     submit_src = extract_function(PANELS, "submitKanbanTaskModal", prefix="async function")
 
     fn_value_provider = extract_function(UI, "_providerFromModelValue", prefix="function")
@@ -3860,6 +3882,7 @@ function loadKanbanTask() {{}}
 let _kanbanTaskModalMode = "edit";
 let _kanbanTaskModalEditingId = "t_test";
 let _kanbanTaskModalInitialDisplayedStatus = "todo";
+let _kanbanTaskModalInitialModelPair = {{ model: "gpt-5-mini", provider: null }};
 let _kanbanModelPopulateSeq = 0;
 
 const groups = [
@@ -3879,6 +3902,7 @@ global.fetch = async () => ({{ ok: true, json: async () => ({{ groups }}) }});
 {fn_select}
 {fn_populate}
 {fn_refresh}
+{fn_touched}
 {submit_src}
 
 (async () => {{
@@ -3889,29 +3913,169 @@ global.fetch = async () => ({{ ok: true, json: async () => ({{ groups }}) }});
   assert.strictEqual(sel.value, "gpt-5-mini");
   assert.strictEqual(sel.selectedOptions[0].dataset.provider, "");
 
-  // Unrelated edit: saving without touching picker preserves provider_override as null
+  // Unrelated edit: saving without touching the picker sends NO routing at all,
+  // so it can neither re-pin a provider nor replay a stale pair.
   await submitKanbanTaskModal();
-  assert.strictEqual(capturedPayload.model_override, "gpt-5-mini");
-  assert.strictEqual(capturedPayload.provider_override, null, "unrelated edit must not re-pin provider");
+  assert.strictEqual(capturedPayload.title, "Test Task");
+  for (const k of ["model_override", "provider_override",
+                   "expected_model_override", "expected_provider_override"]) {{
+    assert.ok(!(k in capturedPayload), "untouched picker leaked " + k);
+  }}
 
   // 2. Explicit pick from picker: click OpenAI catalog row for gpt-5-mini
   _kanbanSelectModelFromDropdown("gpt-5-mini", "openai");
   assert.strictEqual(sel.selectedOptions[0].dataset.provider, "openai", "explicit pick must stamp provider");
 
-  // Save after explicit pick: provider_override must be "openai"
+  // Save after explicit pick: provider_override must be "openai", and the pair
+  // the modal opened with rides along for the bridge's compare-and-set.
   capturedPayload = null;
   await submitKanbanTaskModal();
   assert.strictEqual(capturedPayload.model_override, "gpt-5-mini");
   assert.strictEqual(capturedPayload.provider_override, "openai", "explicit pick must persist chosen provider");
+  assert.strictEqual(capturedPayload.expected_model_override, "gpt-5-mini");
+  assert.strictEqual(capturedPayload.expected_provider_override, null);
 
-  // 3. Clear override to Profile default
+  // 3. Clear override to Profile default: explicit null/null clear of both
   _kanbanSelectModelFromDropdown("", null);
   capturedPayload = null;
   await submitKanbanTaskModal();
+  assert.ok("model_override" in capturedPayload && "provider_override" in capturedPayload);
   assert.strictEqual(capturedPayload.model_override, null);
   assert.strictEqual(capturedPayload.provider_override, null);
+  assert.strictEqual(capturedPayload.expected_model_override, "gpt-5-mini");
 
   console.log(JSON.stringify({{ success: true }}));
 }})().catch(e => {{ process.stderr.write(String(e && e.stack || e)); process.exit(1); }});
+"""
+    assert _run_node(harness)["success"] is True
+
+
+# ── #6765: the open editor is never refreshed, so an untouched picker must not
+#    replay its stale routing pair, and a dynamic model label must survive a
+#    locale restamp ──
+
+
+def test_kanban_edit_submit_sends_model_routing_only_when_picker_touched():
+    """Open a task with pair A; its routing is changed externally to B while the
+    modal is open (board/detail refreshes never update the editor). A title-only
+    save must omit BOTH routing fields so the bridge keeps B. A deliberate pick
+    sends both fields plus the pair the modal opened with; a deliberate clear
+    sends an explicit null/null clear plus that same opened pair."""
+    pair_a = [
+        {"value": "model-a", "provider": "openai", "groupProvider": "openai"},
+        {"value": "model-c", "provider": "anthropic", "groupProvider": "anthropic"},
+    ]
+    opened_a = {"model": "model-a", "provider": "openai"}
+    title_only, picked, cleared, create_untouched = _run_kanban_submit_model_cases([
+        {"mode": "edit", "editingId": "t_1", "options": pair_a, "selected": "model-a",
+         "touched": False, "initialPair": opened_a, "title": "Renamed only"},
+        {"mode": "edit", "editingId": "t_1", "options": pair_a, "selected": "model-c",
+         "touched": True, "initialPair": opened_a},
+        {"mode": "edit", "editingId": "t_1", "options": pair_a, "selected": "",
+         "touched": True, "initialPair": opened_a},
+        # Create mode has no persisted pair to replay: a selection is still sent.
+        {"mode": "create", "options": pair_a, "selected": "model-c", "touched": False},
+    ])
+
+    routing_keys = ("model_override", "provider_override",
+                    "expected_model_override", "expected_provider_override")
+
+    # (a) untouched picker: the stale pair A is not on the wire at all.
+    assert title_only["method"] == "PATCH", title_only
+    assert title_only["payload"]["title"] == "Renamed only", title_only["payload"]
+    for key in routing_keys:
+        assert key not in title_only["payload"], (
+            f"title-only edit with an untouched picker sent {key}", title_only["payload"])
+
+    # (b) deliberate pick: both fields, plus the opened pair for compare-and-set.
+    assert picked["payload"]["model_override"] == "model-c", picked["payload"]
+    assert picked["payload"]["provider_override"] == "anthropic", picked["payload"]
+    assert picked["payload"]["expected_model_override"] == "model-a", picked["payload"]
+    assert picked["payload"]["expected_provider_override"] == "openai", picked["payload"]
+
+    # (c) deliberate clear: explicit clear of both fields (present, null).
+    assert "model_override" in cleared["payload"], cleared["payload"]
+    assert "provider_override" in cleared["payload"], cleared["payload"]
+    assert cleared["payload"]["model_override"] is None, cleared["payload"]
+    assert cleared["payload"]["provider_override"] is None, cleared["payload"]
+    assert cleared["payload"]["expected_model_override"] == "model-a", cleared["payload"]
+    assert cleared["payload"]["expected_provider_override"] == "openai", cleared["payload"]
+
+    assert create_untouched["method"] == "POST", create_untouched
+    assert create_untouched["payload"]["model_override"] == "model-c", create_untouched["payload"]
+    assert create_untouched["payload"]["provider_override"] == "anthropic", create_untouched["payload"]
+    assert "expected_model_override" not in create_untouched["payload"], create_untouched["payload"]
+
+
+def test_kanban_model_chip_survives_locale_restamp_and_default_still_translates():
+    """Run the REAL applyLocaleToDOM() from i18n.js over a chip driven by the
+    REAL _kanbanSyncModelChip(). The chip ships with
+    data-i18n="kanban_no_model_override" in index.html; if that survives a model
+    selection, a locale change repaints the chip as "Profile default" while the
+    select (and the submitted override) is still the model."""
+    fn_sync = extract_function(PANELS, "_kanbanSyncModelChip", prefix="function")
+    fn_locale = extract_function(I18N, "applyLocaleToDOM")
+
+    harness = f"""
+const assert = require("assert");
+{_KANBAN_DOM_ELEMENT_JS}
+
+const STRINGS = {{
+  en: {{ kanban_no_model_override: "Profile default" }},
+  de: {{ kanban_no_model_override: "Profilstandard" }},
+}};
+let locale = "en";
+function t(k) {{ return (STRINGS[locale] && STRINGS[locale][k]) || k; }}
+function getModelLabel(v) {{ return String(v || ""); }}
+
+const sel = new Element("select");
+const empty = new Element("option"); empty.value = ""; empty.textContent = "Profile default";
+const modelA = new Element("option"); modelA.value = "model-a"; modelA.textContent = "Model A";
+sel.appendChild(empty); sel.appendChild(modelA);
+// Exactly the static markup's attributes.
+const chip = new Element("button");
+chip.setAttribute("data-i18n", "kanban_no_model_override");
+chip.textContent = "Profile default";
+const elements = {{ kanbanTaskModalModel: sel, kanbanTaskModalModelChip: chip }};
+const all = [chip, sel, empty, modelA];
+global.document = {{
+  getElementById: (id) => elements[id] || null,
+  querySelectorAll: (q) => {{
+    const m = /^\\[([a-z0-9-]+)\\]$/.exec(q);
+    assert.ok(m, "unexpected selector " + q);
+    return all.filter(el => el.hasAttribute(m[1]));
+  }},
+}};
+
+{fn_sync}
+{fn_locale}
+
+// 1. A chosen model survives a locale restamp in either direction.
+sel.value = "model-a";
+_kanbanSyncModelChip();
+assert.strictEqual(chip.textContent, "Model A");
+locale = "de"; applyLocaleToDOM();
+assert.strictEqual(chip.textContent, "Model A", "locale restamp repainted a chosen model as the default");
+assert.strictEqual(chip.title, "model-a");
+assert.strictEqual(sel.value, "model-a");
+locale = "en"; applyLocaleToDOM();
+assert.strictEqual(chip.textContent, "Model A");
+
+// 2. The empty selection is still localized by the restamp (text + tooltip).
+sel.value = "";
+_kanbanSyncModelChip();
+assert.strictEqual(chip.textContent, "Profile default");
+locale = "de"; applyLocaleToDOM();
+assert.strictEqual(chip.textContent, "Profilstandard", "Profile default must follow the locale");
+assert.strictEqual(chip.title, "Profilstandard");
+
+// 3. Back to a model after the default was localized: the label stays dynamic.
+sel.value = "model-a";
+_kanbanSyncModelChip();
+locale = "en"; applyLocaleToDOM();
+assert.strictEqual(chip.textContent, "Model A");
+assert.strictEqual(chip.title, "model-a");
+
+console.log(JSON.stringify({{ success: true }}));
 """
     assert _run_node(harness)["success"] is True

@@ -430,6 +430,21 @@ def _patch_task(conn, task_id: str, body: dict):
             getattr(task, "model_override", None), getattr(task, "provider_override", None)
         )
         model_changed = (new_model != curr_model) or (new_provider != curr_provider)
+        # Compare-and-set: the edit modal is never refreshed while open, so a
+        # deliberate pick also sends the pair it opened with. If the task's
+        # routing changed underneath (and this save would change it again),
+        # refuse rather than silently overwrite the external change (#6765).
+        if model_changed and (
+            "expected_model_override" in body or "expected_provider_override" in body
+        ):
+            expected = _normalise_model_override(
+                body.get("expected_model_override"), body.get("expected_provider_override")
+            )
+            if expected != (curr_model, curr_provider):
+                raise RuntimeError(
+                    f"model override on task {task_id} changed since it was opened; "
+                    "reload the task and pick the model again"
+                )
         if model_changed and getattr(task, "status", None) == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
 

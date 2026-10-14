@@ -681,6 +681,150 @@ def test_patch_archived_task_rejects_model_change_without_committing_other_field
     assert bridge._task_detail_payload(task_id)["task"]["title"] == "Archived atomicity target"
 
 
+def test_patch_model_change_refuses_a_stale_expected_pair_without_committing(monkeypatch):
+    """#6765: the edit modal is never refreshed while open. A deliberate model
+    pick carries the pair the modal opened with (expected_*); if the task's
+    routing changed externally since, the save must be refused all-or-nothing
+    instead of silently overwriting the external change."""
+    bridge = _load_bridge(monkeypatch)
+    fake_kanban = sys.modules["hermes_cli.kanban_db"]
+
+    task_id = bridge._create_task_payload({
+        "title": "Opened with pair A",
+        "model_override": "model-a",
+        "provider_override": "openai",
+    })["task"]["id"]
+    # External routing change A → B after the modal opened.
+    bridge._patch_task_payload(task_id, {"model_override": "model-b", "provider_override": "anthropic"})
+    events_before = len(fake_kanban.events)
+
+    import pytest as _pytest
+    for requested in (
+        {"model_override": "model-c", "provider_override": "openai"},  # deliberate pick
+        {"model_override": None, "provider_override": None},            # deliberate clear
+    ):
+        with _pytest.raises(RuntimeError, match="changed since it was opened"):
+            bridge._patch_task_payload(task_id, {
+                "title": "Should not be applied",
+                **requested,
+                "expected_model_override": "model-a",
+                "expected_provider_override": "openai",
+            })
+        detail = bridge._task_detail_payload(task_id)["task"]
+        assert detail["title"] == "Opened with pair A", "title committed before the conflict"
+        assert (detail["model_override"], detail["provider_override"]) == ("model-b", "anthropic")
+        assert len(fake_kanban.events) == events_before, "a refused PATCH still emitted events"
+
+    # Picking exactly the pair the task already has is not a conflict: no write.
+    same = bridge._patch_task_payload(task_id, {
+        "title": "Same pair resaved",
+        "model_override": "model-b",
+        "provider_override": "anthropic",
+        "expected_model_override": "model-a",
+        "expected_provider_override": "openai",
+    })["task"]
+    assert same["title"] == "Same pair resaved"
+    assert (same["model_override"], same["provider_override"]) == ("model-b", "anthropic")
+
+
+def test_patch_model_change_applies_when_expected_pair_matches(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    task_id = bridge._create_task_payload({
+        "title": "Fresh editor",
+        "model_override": "model-a",
+        "provider_override": "openai",
+    })["task"]["id"]
+
+    changed = bridge._patch_task_payload(task_id, {
+        "model_override": "model-c",
+        "provider_override": "anthropic",
+        "expected_model_override": "model-a",
+        "expected_provider_override": "openai",
+    })["task"]
+    assert (changed["model_override"], changed["provider_override"]) == ("model-c", "anthropic")
+
+    cleared = bridge._patch_task_payload(task_id, {
+        "model_override": None,
+        "provider_override": None,
+        "expected_model_override": "model-c",
+        "expected_provider_override": "anthropic",
+    })["task"]
+    assert (cleared["model_override"], cleared["provider_override"]) == (None, None)
+
+    # A task that opened with no override sends a null expected pair.
+    pinned = bridge._patch_task_payload(task_id, {
+        "model_override": "model-d",
+        "provider_override": None,
+        "expected_model_override": None,
+        "expected_provider_override": None,
+    })["task"]
+    assert (pinned["model_override"], pinned["provider_override"]) == ("model-d", None)
+
+
+def test_patch_title_only_save_keeps_an_externally_changed_pair(monkeypatch):
+    """The untouched editor omits both routing fields, so a title-only save
+    leaves whatever pair the task currently has — including one changed
+    externally after the modal opened."""
+    bridge = _load_bridge(monkeypatch)
+
+    task_id = bridge._create_task_payload({
+        "title": "Before",
+        "model_override": "model-a",
+        "provider_override": "openai",
+    })["task"]["id"]
+    bridge._patch_task_payload(task_id, {"model_override": "model-b", "provider_override": "anthropic"})
+
+    saved = bridge._patch_task_payload(task_id, {"title": "After", "body": "", "priority": 0})["task"]
+    assert saved["title"] == "After"
+    assert (saved["model_override"], saved["provider_override"]) == ("model-b", "anthropic")
+
+
+def test_real_modal_payloads_against_an_externally_changed_pair(monkeypatch):
+    """End-to-end across the request boundary: the payloads the REAL
+    submitKanbanTaskModal() emits (captured by the node harness) are fed to
+    _patch_task_payload() after the task's routing changed A → B behind the
+    open editor. A title-only save keeps B; a deliberate pick or clear made
+    against stale A is refused without committing anything."""
+    from tests.test_kanban_ui_static import _run_kanban_submit_model_cases
+
+    bridge = _load_bridge(monkeypatch)
+    task_id = bridge._create_task_payload({
+        "title": "Opened with A",
+        "model_override": "model-a",
+        "provider_override": "openai",
+    })["task"]["id"]
+    bridge._patch_task_payload(task_id, {"model_override": "model-b", "provider_override": "anthropic"})
+
+    options = [
+        {"value": "model-a", "provider": "openai", "groupProvider": "openai"},
+        {"value": "model-c", "provider": "openai", "groupProvider": "openai"},
+    ]
+    opened_a = {"model": "model-a", "provider": "openai"}
+    title_only, picked, cleared = _run_kanban_submit_model_cases([
+        {"mode": "edit", "editingId": task_id, "options": options, "selected": "model-a",
+         "touched": False, "initialPair": opened_a, "title": "Renamed only"},
+        {"mode": "edit", "editingId": task_id, "options": options, "selected": "model-c",
+         "touched": True, "initialPair": opened_a, "title": "Picked against stale A"},
+        {"mode": "edit", "editingId": task_id, "options": options, "selected": "",
+         "touched": True, "initialPair": opened_a, "title": "Cleared against stale A"},
+    ])
+
+    saved = bridge._patch_task_payload(task_id, title_only["payload"])["task"]
+    assert saved["title"] == "Renamed only"
+    assert (saved["model_override"], saved["provider_override"]) == ("model-b", "anthropic"), (
+        "a title-only save replayed the editor's stale pair over the external change"
+    )
+
+    import pytest as _pytest
+    for case in (picked, cleared):
+        with _pytest.raises(RuntimeError, match="changed since it was opened"):
+            bridge._patch_task_payload(task_id, case["payload"])
+        detail = bridge._task_detail_payload(task_id)["task"]
+        assert detail["title"] == "Renamed only"
+        assert (detail["model_override"], detail["provider_override"]) == ("model-b", "anthropic")
+
+
 def test_kanban_link_payload_adds_parent_child_relationship(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 
